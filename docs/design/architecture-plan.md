@@ -1,8 +1,6 @@
 # tgdcfs: Architecture and Implementation Plan
 
-Status: phases 0 to 3 implemented (see "Progress" at the end); of
-phase 4 the runbook, the endpoints and the docs are in, the config
-generator and the manager UI are not. This document plans how to build tgdcfs as a new
+Status: phases 0 to 4 implemented (see "Progress" at the end). This document plans how to build tgdcfs as a new
 project: the tgfs code base as the main part, plus Discord as a second
 storage backend that can be configured next to Telegram, either as the
 primary store or as a mirror, in both directions.
@@ -664,12 +662,26 @@ messages (replicas with their own part layout).
 * A pinned metadata copy is skipped for a mirror whose messages cannot
   hold the blob (content and descriptors are still mirrored).
 
-### Phase 4 (partly done)
+### Phase 4 (done)
 
-Done: promotion runbook and mirroring docs in the README, `/stores`,
-`/filesystems` and replication endpoints, example configs, NOTICE.
-Not done: the config generator and the getting-started page in
-`tgdcfs-gh-pages` still describe the tgfs layout (Telegram only), and
-the manager UI has no view for the replication queue. Both are
-frontend work in the Next.js app and can follow independently of the
-server.
+* README: stores and file systems, Discord backend, mirroring with
+  replicas and background replication, promotion runbook; example
+  configs; NOTICE.
+* Manager API: `/stores`, `/filesystems`, `/replication/queue`,
+  `/replication/retry`, backfill kept.
+* Config generator (`tgdcfs-gh-pages/app/config-generator`): rebuilt
+  around the current layout. Stores (name, backend, channel) and file
+  systems (primary, mirrors, copy mode, sync, strict, shared-store
+  flag, metadata type) with the loader's validation rules mirrored in
+  the form; an optional Discord section (bot tokens, attachment limit
+  by boost tier); the Telegram block is left out of the YAML when no
+  store uses it. The old `ChannelField` is gone.
+* Getting-started page: stores and file systems explained, Discord bot
+  setup, bot admin rights on every Telegram store.
+* Mini app: a "Mirrors and replication" dialog (`replication-dialog.tsx`)
+  reachable from the explorer header shows every file system's stores,
+  the replication queue with failed attempts, and offers "Retry failed"
+  and "Backfill". `manager-client.ts` gained the matching calls.
+* Not done, deliberately: the mini app still imports messages by
+  Telegram channel id only (`/message`, `/import`), which is what the
+  Telegram Mini App is for.

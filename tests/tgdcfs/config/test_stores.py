@@ -233,11 +233,25 @@ class TestCurrentLayout:
         with pytest.raises(ValueError, match="too small"):
             Config.from_dict(data)
 
-    def test_missing_telegram_block(self):
+    def test_telegram_store_needs_the_telegram_block(self):
         data = current_layout()
         del data["backends"]
         with pytest.raises(ValueError, match="backends.telegram"):
             Config.from_dict(data)
+
+    def test_discord_only_deployment_needs_no_telegram_block(self):
+        data = current_layout()
+        data["backends"] = {"discord": {"bot_token": "t"}}
+        data["stores"] = {"dc": {"backend": "discord", "channel": "1"}}
+        data["filesystems"] = {"notes": {"primary": "dc"}}
+        config = Config.from_dict(data)
+        assert config.uses_backend == {"telegram": False, "discord": True}
+        assert config.telegram.api_hash == ""
+        assert config.telegram.delete_messages_on_remove is False
+
+    def test_legacy_layout_still_needs_the_telegram_block(self):
+        with pytest.raises(ValueError, match="backends.telegram"):
+            Config.from_dict({"tgdcfs": dict(APP)})
 
 
 class TestLegacyLayout:

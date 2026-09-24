@@ -23,33 +23,23 @@ import { useCallback, useEffect, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { BotTokenField } from "./components/BotTokenField";
-import { ChannelField } from "./components/ChannelField";
 import { ConfigTextField } from "./components/ConfigTextField";
 import {
   EncryptionConfig,
   EncryptionField,
 } from "./components/EncryptionField";
 import { FieldRow } from "./components/FieldRow";
+import { FilesystemField } from "./components/FilesystemField";
 import { FormSection } from "./components/FormSection";
+import { StoreField } from "./components/StoreField";
 import { UserField } from "./components/UserField";
-
-interface ChannelConfig {
-  id: string;
-  name: string;
-  type: "pinned_message" | "github_repo";
-  mirrors: string[];
-  github_repo?: {
-    repo: string;
-    commit: string;
-    access_token: string;
-  };
-}
-
-interface RedundancyConfig {
-  enabled: boolean;
-  mode: "forward" | "reupload";
-  strict: boolean;
-}
+import {
+  DiscordConfig,
+  FilesystemConfig,
+  StoreConfig,
+  isValidDirectoryName,
+  isValidStoreName,
+} from "./types";
 
 interface SftpConfig {
   enabled: boolean;
@@ -88,8 +78,10 @@ interface ConfigData {
       session_file: string;
       tokens: string[];
     };
-    channels: ChannelConfig[];
   };
+  discord: DiscordConfig;
+  stores: StoreConfig[];
+  filesystems: FilesystemConfig[];
   tgdcfs: {
     users: {
       username: string;
@@ -115,8 +107,10 @@ type ConfigUpdatePaths = {
   "telegram.api_id": string;
   "telegram.api_hash": string;
   "telegram.lib": "pyrogram" | "telethon";
-  "telegram.channels": ChannelConfig[];
   "telegram.bot.tokens": string[];
+  discord: DiscordConfig;
+  stores: StoreConfig[];
+  filesystems: FilesystemConfig[];
   "tgdcfs.users": { username: string; password: string }[];
   "tgdcfs.jwt.secret": string;
   "tgdcfs.jwt.algorithm": string;
@@ -138,14 +132,23 @@ const generateRandomSecret = (): string => {
   return result;
 };
 
+const newFilesystem = (name: string, primary: string): FilesystemConfig => ({
+  name,
+  primary,
+  mirrors: [],
+  mode: "auto",
+  sync: "inline",
+  strict: false,
+  allow_shared_store: false,
+  metadata: {
+    type: "pinned_message",
+    github_repo: { repo: "", commit: "master", access_token: "" },
+  },
+});
+
 export default function ConfigGenerator() {
   const [withUserAccountUpload, setWithUserAccountUpload] = useState(false);
   const [withUserAccountDownload, setWithUserAccountDownload] = useState(false);
-  const [redundancy, setRedundancy] = useState<RedundancyConfig>({
-    enabled: false,
-    mode: "forward",
-    strict: false,
-  });
 
   const [config, setConfig] = useState<ConfigData>({
     telegram: {
@@ -159,20 +162,15 @@ export default function ConfigGenerator() {
         session_file: "bot.session",
         tokens: [""],
       },
-      channels: [
-        {
-          id: "",
-          name: "default",
-          type: "pinned_message",
-          mirrors: [],
-          github_repo: {
-            repo: "",
-            commit: "master",
-            access_token: "",
-          },
-        },
-      ],
     },
+    discord: {
+      enabled: false,
+      bot_tokens: [""],
+      max_file_size_bytes: 10000000,
+      delete_messages_on_remove: false,
+    },
+    stores: [{ name: "tg-main", backend: "telegram", channel: "" }],
+    filesystems: [newFilesystem("default", "tg-main")],
     tgdcfs: {
       users: [
         {
@@ -236,10 +234,14 @@ export default function ConfigGenerator() {
         newConfig.telegram.api_hash = value as string;
       } else if (path === "telegram.lib") {
         newConfig.telegram.lib = value as "pyrogram" | "telethon";
-      } else if (path === "telegram.channels") {
-        newConfig.telegram.channels = value as ChannelConfig[];
       } else if (path === "telegram.bot.tokens") {
         newConfig.telegram.bot.tokens = value as string[];
+      } else if (path === "discord") {
+        newConfig.discord = value as DiscordConfig;
+      } else if (path === "stores") {
+        newConfig.stores = value as StoreConfig[];
+      } else if (path === "filesystems") {
+        newConfig.filesystems = value as FilesystemConfig[];
       } else if (path === "tgdcfs.users") {
         newConfig.tgdcfs.users = value as {
           username: string;
@@ -275,6 +277,8 @@ export default function ConfigGenerator() {
     }
   }, [config.tgdcfs.jwt.secret, updateConfig]);
 
+  const telegramUsed = config.stores.some((s) => s.backend === "telegram");
+
   const addBotToken = () => {
     const newTokens = [...config.telegram.bot.tokens, ""];
     updateConfig("telegram.bot.tokens", newTokens);
@@ -291,81 +295,310 @@ export default function ConfigGenerator() {
     updateConfig("telegram.bot.tokens", newTokens);
   };
 
+  const updateDiscord = <K extends keyof DiscordConfig>(
+    field: K,
+    value: DiscordConfig[K]
+  ) => {
+    updateConfig("discord", { ...config.discord, [field]: value });
+  };
+
+  const updateDiscordToken = (index: number, value: string) => {
+    const tokens = [...config.discord.bot_tokens];
+    tokens[index] = value;
+    updateDiscord("bot_tokens", tokens);
+  };
+
+  // -- stores ---------------------------------------------------------------
+
+  const addStore = () => {
+    updateConfig("stores", [
+      ...config.stores,
+      {
+        name: `store-${config.stores.length + 1}`,
+        backend: config.discord.enabled ? "discord" : "telegram",
+        channel: "",
+      },
+    ]);
+  };
+
+  const removeStore = (index: number) => {
+    const removed = config.stores[index].name;
+    const stores = config.stores.filter((_, i) => i !== index);
+    // Drop references to the removed store.
+    const filesystems = config.filesystems.map((fs) => ({
+      ...fs,
+      primary: fs.primary === removed ? "" : fs.primary,
+      mirrors: fs.mirrors.filter((m) => m !== removed),
+    }));
+    setConfig({ ...config, stores, filesystems });
+  };
+
+  const updateStore = (
+    index: number,
+    field: keyof StoreConfig,
+    value: string
+  ) => {
+    const stores = [...config.stores];
+    const oldName = stores[index].name;
+    stores[index] = { ...stores[index], [field]: value };
+    let filesystems = config.filesystems;
+    if (field === "name" && oldName !== value) {
+      // Keep file systems pointing at the renamed store.
+      filesystems = config.filesystems.map((fs) => ({
+        ...fs,
+        primary: fs.primary === oldName ? value : fs.primary,
+        mirrors: fs.mirrors.map((m) => (m === oldName ? value : m)),
+      }));
+    }
+    setConfig({ ...config, stores, filesystems });
+  };
+
+  const getStoreNameErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const name = config.stores[index].name.trim();
+    if (!name) {
+      errors.push("Store name is required");
+      return errors;
+    }
+    if (!isValidStoreName(name)) {
+      errors.push("Letters, digits, '-', '_' and '.' only");
+    }
+    if (
+      config.stores.findIndex((s, i) => i !== index && s.name.trim() === name) !==
+      -1
+    ) {
+      errors.push("Store names must be unique");
+    }
+    return errors;
+  };
+
+  const getStoreChannelErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const store = config.stores[index];
+    const channel = store.channel.trim();
+    if (!channel) {
+      errors.push("Channel ID is required");
+      return errors;
+    }
+    if (store.backend === "discord" && !/^\d+$/.test(channel)) {
+      errors.push("Discord channel ids are numeric");
+    }
+    if (store.backend === "discord" && !config.discord.enabled) {
+      errors.push("Enable the Discord backend below");
+    }
+    if (
+      config.stores.findIndex(
+        (s, i) =>
+          i !== index && s.backend === store.backend && s.channel.trim() === channel
+      ) !== -1
+    ) {
+      errors.push("Another store uses this channel");
+    }
+    return errors;
+  };
+
+  // -- file systems ----------------------------------------------------------
+
+  const addFilesystem = () => {
+    updateConfig("filesystems", [
+      ...config.filesystems,
+      newFilesystem(`filesystem-${config.filesystems.length + 1}`, ""),
+    ]);
+  };
+
+  const removeFilesystem = (index: number) => {
+    updateConfig(
+      "filesystems",
+      config.filesystems.filter((_, i) => i !== index)
+    );
+  };
+
+  const updateFilesystem = <K extends keyof FilesystemConfig>(
+    index: number,
+    field: K,
+    value: FilesystemConfig[K]
+  ) => {
+    const filesystems = [...config.filesystems];
+    const fs = { ...filesystems[index], [field]: value };
+    if (field === "primary") {
+      fs.mirrors = fs.mirrors.filter((m) => m !== value);
+    }
+    if (field === "sync" && value === "background") {
+      fs.strict = false;
+    }
+    filesystems[index] = fs;
+    updateConfig("filesystems", filesystems);
+  };
+
+  const updateFilesystemGitHubRepo = (
+    index: number,
+    field: keyof FilesystemConfig["metadata"]["github_repo"],
+    value: string
+  ) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = {
+      ...filesystems[index],
+      metadata: {
+        ...filesystems[index].metadata,
+        github_repo: {
+          ...filesystems[index].metadata.github_repo,
+          [field]: value,
+        },
+      },
+    };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const getFilesystemNameErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const name = config.filesystems[index].name;
+    if (!name.trim()) {
+      errors.push("Name is required");
+      return errors;
+    }
+    if (!isValidDirectoryName(name)) {
+      errors.push('Invalid characters. Cannot contain: / \\ : * ? " < > |');
+    }
+    if (
+      config.filesystems.findIndex(
+        (fs, i) =>
+          i !== index && fs.name.trim().toLowerCase() === name.trim().toLowerCase()
+      ) !== -1
+    ) {
+      errors.push("File system names must be unique");
+    }
+    return errors;
+  };
+
+  const primaryOwner = (storeName: string, exceptIndex: number) =>
+    config.filesystems.findIndex(
+      (fs, i) => i !== exceptIndex && fs.primary === storeName
+    );
+
+  const getFilesystemPrimaryErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    if (!fs.primary || !config.stores.some((s) => s.name === fs.primary)) {
+      return ["Pick a primary store"];
+    }
+    if (primaryOwner(fs.primary, index) !== -1) {
+      return ["This store is already the primary of another file system"];
+    }
+    return [];
+  };
+
+  const filesystemNeedsSharedStore = (index: number): boolean =>
+    config.filesystems[index].mirrors.some(
+      (m) => primaryOwner(m, index) !== -1
+    );
+
+  const getFilesystemMirrorErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    const errors: string[] = [];
+    if (filesystemNeedsSharedStore(index) && !fs.allow_shared_store) {
+      errors.push(
+        "A mirror is the primary of another file system; allow the shared store below or pick another mirror"
+      );
+    }
+    return errors;
+  };
+
   const generateYaml = () => {
-    // Build metadata object from channels
-    const metadata: {
-      [channelId: string]: {
-        name: string;
-        type: "pinned_message" | "github_repo";
-        github_repo?: {
-          repo: string;
-          commit: string;
-          access_token: string;
+    const stores: {
+      [name: string]: { backend: string; channel: string };
+    } = {};
+    config.stores
+      .filter((s) => s.name.trim() !== "" && s.channel.trim() !== "")
+      .forEach((s) => {
+        stores[s.name.trim()] = { backend: s.backend, channel: s.channel.trim() };
+      });
+
+    const filesystems: {
+      [name: string]: {
+        primary: string;
+        mirrors?: string[];
+        mode?: string;
+        sync?: string;
+        strict?: boolean;
+        allow_shared_store?: boolean;
+        metadata: {
+          type: string;
+          github_repo?: { repo: string; commit: string; access_token: string };
         };
       };
     } = {};
-    config.telegram.channels
-      .filter((channel) => channel.id.trim() !== "")
-      .forEach((channel) => {
-        metadata[channel.id] = {
-          name: channel.name,
-          type: channel.type,
-          ...(channel.type === "github_repo" && channel.github_repo
-            ? { github_repo: channel.github_repo }
+    config.filesystems
+      .filter((fs) => fs.name.trim() !== "" && fs.primary in stores)
+      .forEach((fs) => {
+        const mirrors = fs.mirrors.filter((m) => m in stores && m !== fs.primary);
+        filesystems[fs.name.trim()] = {
+          primary: fs.primary,
+          ...(mirrors.length > 0
+            ? {
+                mirrors,
+                mode: fs.mode,
+                sync: fs.sync,
+                strict: fs.strict,
+                ...(fs.allow_shared_store ? { allow_shared_store: true } : {}),
+              }
             : {}),
+          metadata: {
+            type: fs.metadata.type,
+            ...(fs.metadata.type === "github_repo"
+              ? { github_repo: fs.metadata.github_repo }
+              : {}),
+          },
         };
       });
 
+    const pinnedOnTelegram = config.filesystems.some(
+      (fs) =>
+        fs.metadata.type === "pinned_message" &&
+        config.stores.find((s) => s.name === fs.primary)?.backend === "telegram"
+    );
+
     const configForYaml = {
-      telegram: {
-        api_id: config.telegram.api_id,
-        api_hash: config.telegram.api_hash,
-        lib: config.telegram.lib,
-        ...(withUserAccountUpload ||
-          withUserAccountDownload ||
-          Object.values(metadata).some(
-            (channel) => channel.type === "pinned_message"
-          )
+      backends: {
+        ...(telegramUsed
           ? {
-            account: {
-              session_file: "account.session",
-              used_to_upload: withUserAccountUpload,
-              used_to_download: withUserAccountDownload,
-            },
-          }
+              telegram: {
+                api_id: config.telegram.api_id,
+                api_hash: config.telegram.api_hash,
+                lib: config.telegram.lib,
+                ...(withUserAccountUpload ||
+                withUserAccountDownload ||
+                pinnedOnTelegram
+                  ? {
+                      account: {
+                        session_file: "account.session",
+                        used_to_upload: withUserAccountUpload,
+                        used_to_download: withUserAccountDownload,
+                      },
+                    }
+                  : {}),
+                bot: {
+                  session_file: config.telegram.bot.session_file,
+                  tokens: config.telegram.bot.tokens.filter(
+                    (token) => token.trim() !== ""
+                  ),
+                },
+              },
+            }
           : {}),
-        bot: {
-          session_file: config.telegram.bot.session_file,
-          tokens: config.telegram.bot.tokens.filter(
-            (token) => token.trim() !== ""
-          ),
-        },
-        private_file_channel: config.telegram.channels
-          .filter((channel) => channel.id.trim() !== "")
-          .map((channel) => channel.id),
-        ...(() => {
-          if (!redundancy.enabled) return {};
-          const mirrors: { [channelId: string]: string[] } = {};
-          config.telegram.channels
-            .filter((channel) => channel.id.trim() !== "")
-            .forEach((channel) => {
-              const mirrorIds = (channel.mirrors || [])
-                .map((m) => m.trim())
-                .filter((m) => m !== "" && m !== channel.id.trim());
-              if (mirrorIds.length > 0) {
-                mirrors[channel.id] = mirrorIds;
-              }
-            });
-          if (Object.keys(mirrors).length === 0) return {};
-          return {
-            redundancy: {
-              mirrors,
-              mode: redundancy.mode,
-              strict: redundancy.strict,
-            },
-          };
-        })(),
+        ...(config.discord.enabled
+          ? {
+              discord: {
+                bot_tokens: config.discord.bot_tokens.filter(
+                  (token) => token.trim() !== ""
+                ),
+                max_file_size_bytes: config.discord.max_file_size_bytes,
+                delete_messages_on_remove:
+                  config.discord.delete_messages_on_remove,
+              },
+            }
+          : {}),
       },
+      stores,
+      filesystems,
       tgdcfs: {
         users: config.tgdcfs.users.reduce((acc, user) => {
           if (user.username.trim() !== "") {
@@ -374,7 +607,6 @@ export default function ConfigGenerator() {
           return acc;
         }, {} as { [key: string]: { password: string } }),
         jwt: config.tgdcfs.jwt,
-        metadata,
         server: config.tgdcfs.server,
         ...(() => {
           const sftp = config.tgdcfs.sftp;
@@ -481,157 +713,6 @@ export default function ConfigGenerator() {
     updateConfig("tgdcfs.users", newUsers);
   };
 
-  const addChannel = () => {
-    const newChannels = [
-      ...config.telegram.channels,
-      {
-        id: "",
-        name: `channel-${config.telegram.channels.length + 1}`,
-        type: "pinned_message" as const,
-        mirrors: [],
-        github_repo: {
-          repo: "",
-          commit: "master",
-          access_token: "",
-        },
-      },
-    ];
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  const addMirror = (channelIndex: number) => {
-    const newChannels = [...config.telegram.channels];
-    newChannels[channelIndex].mirrors = [
-      ...(newChannels[channelIndex].mirrors || []),
-      "",
-    ];
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  const removeMirror = (channelIndex: number, mirrorIndex: number) => {
-    const newChannels = [...config.telegram.channels];
-    newChannels[channelIndex].mirrors = newChannels[
-      channelIndex
-    ].mirrors.filter((_, i) => i !== mirrorIndex);
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  const updateMirror = (
-    channelIndex: number,
-    mirrorIndex: number,
-    value: string
-  ) => {
-    const newChannels = [...config.telegram.channels];
-    const mirrors = [...newChannels[channelIndex].mirrors];
-    mirrors[mirrorIndex] = value;
-    newChannels[channelIndex].mirrors = mirrors;
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  const getMirrorErrors = (channelIndex: number): string[][] => {
-    const channel = config.telegram.channels[channelIndex];
-    const primaryIds = config.telegram.channels
-      .map((c) => c.id.trim())
-      .filter((id) => id !== "");
-    return (channel.mirrors || []).map((mirror, mirrorIndex) => {
-      const errors: string[] = [];
-      const value = mirror.trim();
-      if (!value) {
-        errors.push("Mirror channel ID is required (or remove this row)");
-        return errors;
-      }
-      if (value === channel.id.trim()) {
-        errors.push("A channel cannot mirror itself");
-      }
-      if (
-        (channel.mirrors || []).findIndex(
-          (m, i) => i !== mirrorIndex && m.trim() === value
-        ) !== -1
-      ) {
-        errors.push("Duplicate mirror channel");
-      }
-      if (primaryIds.includes(value)) {
-        errors.push(
-          "This ID is also used as a primary file channel — a mirror " +
-          "should be a dedicated channel"
-        );
-      }
-      return errors;
-    });
-  };
-
-  const removeChannel = (index: number) => {
-    const newChannels = config.telegram.channels.filter((_, i) => i !== index);
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  // Validation functions
-  const isValidDirectoryName = (name: string): boolean => {
-    // Valid directory name: no / \ : * ? " < > | and not . or ..
-    const invalidChars = /[\/\\:*?"<>|]/;
-    return (
-      !invalidChars.test(name) &&
-      name !== "." &&
-      name !== ".." &&
-      name.trim().length > 0
-    );
-  };
-
-  const getChannelNameErrors = (index: number, name: string): string[] => {
-    const errors: string[] = [];
-
-    if (!name.trim()) {
-      errors.push("Display name is required");
-    } else {
-      if (!isValidDirectoryName(name)) {
-        errors.push('Invalid characters. Cannot contain: / \\ : * ? " < > |');
-      }
-
-      // Check for duplicates
-      const duplicateIndex = config.telegram.channels.findIndex(
-        (channel, i) =>
-          i !== index &&
-          channel.name.trim().toLowerCase() === name.trim().toLowerCase()
-      );
-      if (duplicateIndex !== -1) {
-        errors.push("Display name must be unique across channels");
-      }
-    }
-
-    return errors;
-  };
-
-  const updateChannel = (
-    index: number,
-    field: "id" | "name" | "type",
-    value: string
-  ) => {
-    const newChannels = [...config.telegram.channels];
-    if (field === "id" || field === "name") {
-      newChannels[index][field] = value;
-    } else if (field === "type") {
-      newChannels[index][field] = value as "pinned_message" | "github_repo";
-    }
-    updateConfig("telegram.channels", newChannels);
-  };
-
-  const updateChannelGitHubRepo = (
-    channelIndex: number,
-    field: keyof NonNullable<ChannelConfig["github_repo"]>,
-    value: string
-  ) => {
-    const newChannels = [...config.telegram.channels];
-    if (!newChannels[channelIndex].github_repo) {
-      newChannels[channelIndex].github_repo = {
-        repo: "",
-        commit: "master",
-        access_token: "",
-      };
-    }
-    newChannels[channelIndex].github_repo![field] = value;
-    updateConfig("telegram.channels", newChannels);
-  };
-
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Typography variant="h3" component="h1" gutterBottom align="center">
@@ -662,7 +743,89 @@ export default function ConfigGenerator() {
       >
         <Box sx={{ flex: 1 }}>
           <Paper sx={{ p: 3 }}>
-            <FormSection title="Telegram" showDivider={false}>
+            <FormSection title="Stores" showDivider={false}>
+              <Typography variant="body2" color="text.secondary">
+                A store is one channel of one backend: a private Telegram
+                channel or a Discord channel. Give each a short name; file
+                systems below refer to stores by that name, and the name never
+                reaches the stored metadata, so it can be changed later.
+              </Typography>
+              {config.stores.map((store, index) => (
+                <StoreField
+                  key={index}
+                  store={store}
+                  discordEnabled={config.discord.enabled}
+                  onUpdate={(field, value) => updateStore(index, field, value)}
+                  onDelete={
+                    config.stores.length > 1
+                      ? () => removeStore(index)
+                      : undefined
+                  }
+                  nameErrors={getStoreNameErrors(index)}
+                  channelErrors={getStoreChannelErrors(index)}
+                />
+              ))}
+              <Button
+                startIcon={<Add />}
+                onClick={addStore}
+                variant="outlined"
+                size="small"
+                sx={{ width: "fit-content" }}
+              >
+                Add Another Store
+              </Button>
+            </FormSection>
+
+            <FormSection title="File Systems">
+              <Typography variant="body2" color="text.secondary">
+                Each file system is a top-level directory over WebDAV and SFTP.
+                It has one primary store and any number of mirror stores;
+                primary and mirror can be swapped later with a config change.
+                Files that existed before a mirror was added are copied by the
+                backfill task (Manager API:{" "}
+                <code>POST /api/redundancy/backfill/&lt;file system&gt;</code>
+                ).
+              </Typography>
+              {config.filesystems.map((filesystem, index) => (
+                <FilesystemField
+                  key={index}
+                  filesystem={filesystem}
+                  stores={config.stores}
+                  onUpdate={(field, value) =>
+                    updateFilesystem(index, field, value)
+                  }
+                  onUpdateGitHubRepo={(field, value) =>
+                    updateFilesystemGitHubRepo(index, field, value)
+                  }
+                  onDelete={
+                    config.filesystems.length > 1
+                      ? () => removeFilesystem(index)
+                      : undefined
+                  }
+                  nameErrors={getFilesystemNameErrors(index)}
+                  primaryErrors={getFilesystemPrimaryErrors(index)}
+                  mirrorErrors={getFilesystemMirrorErrors(index)}
+                  needsSharedStore={filesystemNeedsSharedStore(index)}
+                />
+              ))}
+              <Button
+                startIcon={<Add />}
+                onClick={addFilesystem}
+                variant="outlined"
+                size="small"
+                sx={{ width: "fit-content" }}
+              >
+                Add Another File System
+              </Button>
+            </FormSection>
+
+            <FormSection title="Telegram">
+              {!telegramUsed && (
+                <Alert severity="info">
+                  No store uses Telegram; this block is left out of the
+                  config.
+                </Alert>
+              )}
               <Box
                 sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}
               >
@@ -687,7 +850,7 @@ export default function ConfigGenerator() {
                     updateConfig("telegram.api_id", e.target.value)
                   }
                   style={{ flex: 1 }}
-                  required
+                  required={telegramUsed}
                 />
                 <ConfigTextField
                   label="API Hash"
@@ -696,7 +859,7 @@ export default function ConfigGenerator() {
                     updateConfig("telegram.api_hash", e.target.value)
                   }
                   style={{ flex: 1 }}
-                  required
+                  required={telegramUsed}
                 />
                 <FormControl size="small" sx={{ minWidth: 200 }}>
                   <InputLabel>Telegram Library</InputLabel>
@@ -715,59 +878,6 @@ export default function ConfigGenerator() {
                   </Select>
                 </FormControl>
               </FieldRow>
-
-              <Box>
-                <Typography variant="h6" sx={{ mb: 2 }}>
-                  Private File Channels & Metadata
-                </Typography>
-                <Typography
-                  variant="body2"
-                  color="text.secondary"
-                  sx={{ mb: 2 }}
-                >
-                  Configure one or more private channels to store files. Each
-                  channel needs both a channel ID and metadata configuration to
-                  maintain the directory structure.
-                </Typography>
-                {config.telegram.channels.map((channel, index) => (
-                  <ChannelField
-                    key={index}
-                    index={index}
-                    channel={channel}
-                    onUpdate={(field, value) =>
-                      updateChannel(index, field, value)
-                    }
-                    onUpdateGitHubRepo={(field, value) =>
-                      updateChannelGitHubRepo(index, field, value)
-                    }
-                    onDelete={
-                      config.telegram.channels.length > 1
-                        ? () => removeChannel(index)
-                        : undefined
-                    }
-                    canDelete={config.telegram.channels.length > 1}
-                    nameErrors={getChannelNameErrors(index, channel.name)}
-                    redundancyEnabled={redundancy.enabled}
-                    mirrorErrors={getMirrorErrors(index)}
-                    onAddMirror={() => addMirror(index)}
-                    onRemoveMirror={(mirrorIndex) =>
-                      removeMirror(index, mirrorIndex)
-                    }
-                    onUpdateMirror={(mirrorIndex, value) =>
-                      updateMirror(index, mirrorIndex, value)
-                    }
-                  />
-                ))}
-                <Button
-                  startIcon={<Add />}
-                  onClick={addChannel}
-                  variant="outlined"
-                  size="small"
-                  sx={{ mt: 1 }}
-                >
-                  Add Another Channel
-                </Button>
-              </Box>
 
               <FormControlLabel
                 label="Use user account to upload files (No benefit unless you are a premium user)"
@@ -815,6 +925,12 @@ export default function ConfigGenerator() {
                     @BotFather
                   </Button>
                 </Box>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                  Every bot must be admin in every Telegram store, mirrors
+                  included. A primary channel with &quot;Restrict saving
+                  content&quot; enabled cannot be forwarded from; the auto copy
+                  mode then re-uploads.
+                </Typography>
                 {config.telegram.bot.tokens.map((token, index) => (
                   <BotTokenField
                     key={index}
@@ -836,6 +952,114 @@ export default function ConfigGenerator() {
                   Add Another Bot Token
                 </Button>
               </Box>
+            </FormSection>
+
+            <FormSection title="Discord (Optional)">
+              <Typography variant="body2" color="text.secondary">
+                Discord channels can be stores too, as primaries or as mirrors.
+                Create an application at{" "}
+                <a
+                  href="https://discord.com/developers/applications"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <u>discord.com/developers</u>
+                </a>
+                , add a bot, enable the Message Content intent and invite it
+                with View Channel, Send Messages, Manage Messages, Read Message
+                History, Attach Files and Pin Messages.
+              </Typography>
+              <FormControlLabel
+                label="Enable the Discord backend"
+                control={
+                  <Checkbox
+                    checked={config.discord.enabled}
+                    onChange={(e) => updateDiscord("enabled", e.target.checked)}
+                  />
+                }
+              />
+              {config.discord.enabled && (
+                <>
+                  {config.discord.bot_tokens.map((token, index) => (
+                    <BotTokenField
+                      key={index}
+                      index={index}
+                      value={token}
+                      onChange={(value) => updateDiscordToken(index, value)}
+                      onDelete={
+                        index > 0
+                          ? () =>
+                              updateDiscord(
+                                "bot_tokens",
+                                config.discord.bot_tokens.filter(
+                                  (_, i) => i !== index
+                                )
+                              )
+                          : undefined
+                      }
+                    />
+                  ))}
+                  <Button
+                    startIcon={<Add />}
+                    onClick={() =>
+                      updateDiscord("bot_tokens", [
+                        ...config.discord.bot_tokens,
+                        "",
+                      ])
+                    }
+                    variant="outlined"
+                    size="small"
+                    sx={{ width: "fit-content" }}
+                  >
+                    Add Another Bot Token
+                  </Button>
+                  <FieldRow>
+                    <FormControl size="small" sx={{ minWidth: 260 }}>
+                      <InputLabel>Attachment Limit</InputLabel>
+                      <Select
+                        value={config.discord.max_file_size_bytes}
+                        label="Attachment Limit"
+                        onChange={(e) =>
+                          updateDiscord(
+                            "max_file_size_bytes",
+                            Number(e.target.value)
+                          )
+                        }
+                      >
+                        <MenuItem value={10000000}>
+                          10 MB (safe everywhere)
+                        </MenuItem>
+                        <MenuItem value={20000000}>
+                          20 MB (unboosted server, since Aug 2026)
+                        </MenuItem>
+                        <MenuItem value={50000000}>50 MB (boost level 2)</MenuItem>
+                        <MenuItem value={100000000}>
+                          100 MB (boost level 3)
+                        </MenuItem>
+                      </Select>
+                    </FormControl>
+                  </FieldRow>
+                  <Typography variant="body2" color="text.secondary">
+                    Files are cut into attachments of this size. A value above
+                    what the server allows makes every upload fail, so pick the
+                    tier of the server the channels are in.
+                  </Typography>
+                  <FormControlLabel
+                    label="Delete Discord messages when a file is removed"
+                    control={
+                      <Checkbox
+                        checked={config.discord.delete_messages_on_remove}
+                        onChange={(e) =>
+                          updateDiscord(
+                            "delete_messages_on_remove",
+                            e.target.checked
+                          )
+                        }
+                      />
+                    }
+                  />
+                </>
+              )}
             </FormSection>
 
             <FormSection title="TGDCFS">
@@ -1039,89 +1263,6 @@ export default function ConfigGenerator() {
                     the usual <code>authorized_keys</code> format. The user
                     still has to be listed above so the readonly flag applies.
                   </Typography>
-                </>
-              )}
-            </FormSection>
-
-            <FormSection title="Redundancy (Optional)">
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                RAID-1-style mirroring: every file uploaded to a channel is
-                also copied to its mirror channel(s) via server-side message
-                forwarding, so your data survives a channel getting banned
-                or deleted. Configure the mirror channel IDs per channel
-                above once enabled. Enabling this later is fine — the
-                backfill task (Manager API:{" "}
-                <code>POST /redundancy/backfill/&lt;channel-name&gt;</code>)
-                mirrors all pre-existing files without re-uploading them.
-              </Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                Tip: with redundancy enabled, the GitHub Repository metadata
-                type is recommended — the directory structure then survives
-                even the loss of all channels.
-              </Typography>
-              <FormControlLabel
-                label="Enable channel redundancy"
-                control={
-                  <Checkbox
-                    checked={redundancy.enabled}
-                    onChange={(e) =>
-                      setRedundancy({
-                        ...redundancy,
-                        enabled: e.target.checked,
-                      })
-                    }
-                  />
-                }
-              />
-              {redundancy.enabled && (
-                <>
-                  <FieldRow>
-                    <FormControl size="small" sx={{ minWidth: 220 }}>
-                      <InputLabel>Mirroring Mode</InputLabel>
-                      <Select
-                        value={redundancy.mode}
-                        label="Mirroring Mode"
-                        onChange={(e) =>
-                          setRedundancy({
-                            ...redundancy,
-                            mode: e.target.value as "forward" | "reupload",
-                          })
-                        }
-                      >
-                        <MenuItem value="forward">
-                          Forward (server-side, recommended)
-                        </MenuItem>
-                        <MenuItem value="reupload">
-                          Re-upload (for restricted channels)
-                        </MenuItem>
-                      </Select>
-                    </FormControl>
-                  </FieldRow>
-                  <Typography
-                    variant="body2"
-                    color="text.secondary"
-                    sx={{ mb: 1 }}
-                  >
-                    &quot;Forward&quot; copies files on Telegram&apos;s
-                    servers without using your bandwidth, but requires the
-                    primary channel to allow forwarding (&quot;Restrict
-                    saving content&quot; must be off). &quot;Re-upload&quot;
-                    always works but downloads and uploads every byte again.
-                  </Typography>
-                  <FormControlLabel
-                    label="Strict mode (fail uploads when mirroring fails; default is log-and-continue)"
-                    control={
-                      <Checkbox
-                        checked={redundancy.strict}
-                        onChange={(e) =>
-                          setRedundancy({
-                            ...redundancy,
-                            strict: e.target.checked,
-                          })
-                        }
-                      />
-                    }
-                  />
                 </>
               )}
             </FormSection>

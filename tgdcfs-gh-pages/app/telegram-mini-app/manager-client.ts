@@ -20,6 +20,27 @@ export interface ChannelMessage {
   mime_type: string;
 }
 
+export interface ReplicationItem {
+  path: string;
+  queued_at: number;
+  attempts: number;
+  last_error: string | null;
+}
+
+// File system name -> files waiting for background replication.
+export type ReplicationQueue = { [filesystem: string]: ReplicationItem[] };
+
+export interface FilesystemInfo {
+  primary: string;
+  mirrors: string[];
+  mode: string;
+  sync: string;
+  strict: boolean;
+  read_preference: string[];
+  metadata: string;
+  primary_dead: boolean;
+}
+
 export default class ManagerClient {
   private baseUrl: string;
   private jwtToken: string;
@@ -94,6 +115,31 @@ export default class ManagerClient {
         name: asName,
       }),
     });
+  }
+
+  async getFilesystems(): Promise<{ [name: string]: FilesystemInfo }> {
+    return this.makeRequest<{ [name: string]: FilesystemInfo }>("/filesystems");
+  }
+
+  async getReplicationQueue(): Promise<ReplicationQueue> {
+    return this.makeRequest<ReplicationQueue>("/replication/queue");
+  }
+
+  async retryReplication(filesystem?: string): Promise<void> {
+    const query = filesystem
+      ? `?filesystem=${encodeURIComponent(filesystem)}`
+      : "";
+    await this.makeRequest<{ message: string }>(`/replication/retry${query}`, {
+      method: "POST",
+    });
+  }
+
+  async startBackfill(filesystem: string, verify = false): Promise<string> {
+    const result = await this.makeRequest<{ task_id: string }>(
+      `/redundancy/backfill/${encodeURIComponent(filesystem)}?verify=${verify}`,
+      { method: "POST" }
+    );
+    return result.task_id;
   }
 
   formatFileSize(bytes?: number): string {

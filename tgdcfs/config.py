@@ -570,6 +570,25 @@ class TelegramConfig:
     redundancy: Optional[RedundancyConfig]
 
     @classmethod
+    def disabled(cls) -> "TelegramConfig":
+        """Placeholder for a deployment without Telegram stores.
+
+        Code paths that consult the Telegram settings (the deletion gate,
+        the account options) keep working; logging in never happens
+        because no store asks for it.
+        """
+        return cls(
+            api_id=0,
+            api_hash="",
+            account=None,
+            bot=BotConfig(token="", session_file=expand_path("bot.session")),
+            private_file_channel=[],
+            lib="telethon",
+            delete_messages_on_remove=False,
+            redundancy=None,
+        )
+
+    @classmethod
     def from_dict(cls, data: dict) -> "TelegramConfig":
         # ``private_file_channel`` and ``redundancy`` belong to the legacy
         # (tgfs) layout, where the file channels were listed under the
@@ -910,12 +929,15 @@ class Config:
         # top-level ``telegram`` in the tgfs layout.
         backends = data.get("backends") or {}
         if "telegram" in backends:
-            telegram_data = backends["telegram"]
+            telegram = TelegramConfig.from_dict(backends["telegram"])
         elif "telegram" in data:
-            telegram_data = data["telegram"]
+            telegram = TelegramConfig.from_dict(data["telegram"])
+        elif "stores" in data or "filesystems" in data:
+            # Discord-only deployments have no Telegram block; the stores
+            # are checked below so a Telegram store cannot slip through.
+            telegram = TelegramConfig.disabled()
         else:
             raise ValueError("configuration block 'backends.telegram' is missing")
-        telegram = TelegramConfig.from_dict(telegram_data)
         discord = (
             DiscordConfig.from_dict(backends["discord"])
             if "discord" in backends
@@ -945,6 +967,11 @@ class Config:
                 raise ValueError(
                     f"stores.{store.name}: backend 'discord' needs the "
                     f"'backends.discord' block"
+                )
+            if store.backend == "telegram" and not telegram.api_hash:
+                raise ValueError(
+                    f"stores.{store.name}: backend 'telegram' needs the "
+                    f"'backends.telegram' block"
                 )
         _validate_filesystems(stores, filesystems)
         return cls(

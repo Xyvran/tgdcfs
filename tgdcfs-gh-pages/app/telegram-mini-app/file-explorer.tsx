@@ -11,6 +11,7 @@ import {
   InsertDriveFile,
   MoreVert,
   Refresh,
+  SyncAlt,
   Telegram,
 } from "@mui/icons-material";
 import {
@@ -37,6 +38,7 @@ import { SimpleTreeView } from "@mui/x-tree-view/SimpleTreeView";
 import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { useCallback, useEffect, useState } from "react";
 import ManagerClient, { Task } from "./manager-client";
+import ReplicationDialog from "./replication-dialog";
 import TelegramImportDialog from "./telegram-import-dialog";
 import WebDAVClient, { WebDAVItem } from "./webdav-client";
 
@@ -56,6 +58,7 @@ export default function FileExplorer({
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const [selectedItem, setSelectedItem] = useState<WebDAVItem | null>(null);
   const [createDirDialog, setCreateDirDialog] = useState(false);
+  const [replicationDialog, setReplicationDialog] = useState(false);
   const [newDirName, setNewDirName] = useState("");
   const [uploadDialog, setUploadDialog] = useState(false);
   const [telegramLinkDialog, setTelegramLinkDialog] = useState(false);
@@ -455,11 +458,28 @@ export default function FileExplorer({
           <Typography variant="h6" component="h2" sx={{ flexGrow: 1 }}>
             {items.length} items
           </Typography>
+          {managerClient && (
+            <IconButton
+              onClick={() => setReplicationDialog(true)}
+              size="small"
+              title="Mirrors and replication"
+            >
+              <SyncAlt sx={{ color: "text.primary" }} />
+            </IconButton>
+          )}
           <IconButton onClick={() => loadDirectory(currentPath)} size="small">
             <Refresh sx={{ color: "text.primary" }} />
           </IconButton>
         </Box>
       </Box>
+
+      {managerClient && (
+        <ReplicationDialog
+          open={replicationDialog}
+          onClose={() => setReplicationDialog(false)}
+          managerClient={managerClient}
+        />
+      )}
 
       {loading && (
         <Box

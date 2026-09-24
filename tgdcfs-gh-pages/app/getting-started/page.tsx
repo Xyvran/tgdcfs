@@ -60,7 +60,8 @@ export default function GettingStarted() {
             Getting Started with TGDCFS
           </h1>
           <p className="text-xl text-slate-300">
-            Follow these steps to set up your Telegram File System
+            Follow these steps to set up your file system on Telegram, Discord
+            or both
           </p>
         </header>
 
@@ -138,7 +139,32 @@ export default function GettingStarted() {
                   sx={{ marginBottom: 3 }}
                 >
                   Create a private Telegram channel where TGDCFS will store your
-                  files.
+                  files. In TGDCFS a channel is a <b>store</b>; a <b>file
+                  system</b> has one primary store and any number of mirror
+                  stores that receive a copy of every file. A second channel
+                  as a mirror protects you against losing the first one.
+                </Typography>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Discord channels are stores too. To use one, create an
+                  application at{" "}
+                  <a
+                    href="https://discord.com/developers/applications"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-500 hover:text-blue-600 underline"
+                  >
+                    discord.com/developers
+                  </a>
+                  , add a bot with the Message Content intent, invite it with
+                  View Channel, Send Messages, Manage Messages, Read Message
+                  History, Attach Files and Pin Messages, and copy the
+                  channel id (developer mode). Bots may attach 10 to 100 MB
+                  per message depending on the server&apos;s boost level, so
+                  Discord suits a mirror or a small library better than bulk
+                  media.
                 </Typography>
                 <div style={{ marginTop: "24px" }}>
                   <Button
@@ -195,8 +221,8 @@ export default function GettingStarted() {
                     to create a new bot
                   </li>
                   <li style={{ marginBottom: "12px" }}>
-                    Add your bot to the private channel you created in the
-                    previous step, and <b>make it an admin</b>.
+                    Add your bot to every Telegram channel you use as a store,
+                    mirrors included, and <b>make it an admin</b>.
                   </li>
                 </ol>
                 <div style={{ marginTop: "24px" }}>
@@ -229,7 +255,9 @@ export default function GettingStarted() {
                   sx={{ marginBottom: 3 }}
                 >
                   Use our config generator to create your TGDCFS configuration
-                  file.
+                  file: name your stores, define the file systems on top of
+                  them and pick where the directory metadata lives. A config
+                  written for tgfs also still loads.
                 </Typography>
                 <div style={{ marginBottom: "24px" }}>
                   <Link

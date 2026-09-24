@@ -566,6 +566,14 @@ raising anything else.
 `scripts/measure_transfer.py` shows what the piece-level parallelism is
 worth against a simulated link, without needing a channel.
 
+## Web frontend
+
+The Next.js app in `tgdcfs-gh-pages/` (published to GitHub Pages and as
+the `xyvran/tgdcfs-fe` image) has a config generator for the layout
+described above, a getting-started guide and the Telegram Mini App with
+a file explorer, background tasks and a "Mirrors and replication" view
+(queue, retry, backfill).
+
 ## Development
 
 Install the dependencies:
