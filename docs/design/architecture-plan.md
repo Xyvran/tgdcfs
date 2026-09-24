@@ -1,0 +1,545 @@
+# tgdcfs: Architecture and Implementation Plan
+
+Status: proposal (nothing implemented yet). This document plans how to
+build tgdcfs as a new project: the tgfs code base as the main part, plus
+Discord as a second storage backend that can be configured next to
+Telegram, either as the primary store or as a mirror, in both directions.
+
+Reference implementations:
+
+* [Xyvran/tgfs](https://github.com/Xyvran/tgfs): the base. Telegram
+  storage, WebDAV + SFTP, at-rest encryption, RAID-1-style channel
+  redundancy (`docs/design/channel-redundancy.md`, `tgfs/core/mirror.py`,
+  `tgfs/core/backfill.py`).
+* [VulcanoSoftware/dcfs](https://github.com/VulcanoSoftware/dcfs): a
+  fork of tgfs that replaced Telegram with Discord. Useful as a template
+  for the Discord client (`dcfs/discord/impl/discord_bot.py`), the
+  Discord-specific message API (`dcfs/core/api/message/__init__.py`), the
+  buffered uploader and the compact file-descriptor encoding. It is MIT
+  licensed, so code can be ported with attribution in `LICENSE`/`NOTICE`.
+
+## 1. Goals and non-goals
+
+Goals:
+
+1. One process serves one or more virtual file systems over WebDAV, SFTP
+   and the manager API, exactly like tgfs today.
+2. Every file system has one **primary store** and zero or more
+   **mirror stores**. A store is a Telegram channel or a Discord channel.
+   Primary and mirrors can be any mix: Telegram primary + Discord
+   mirror, Discord primary + Telegram mirror, Telegram + Telegram (the
+   current tgfs redundancy), Discord + Discord.
+3. Swapping primary and mirror is a config change only, as tgfs already
+   promises for Telegram mirrors.
+4. Everything that works in tgfs keeps working unchanged: encryption,
+   encrypted names, GitHub or pinned-message metadata, SFTP, transfer
+   tuning, the task store, the manager API, the mini app.
+5. An existing tgfs installation (config + metadata) must load without
+   migration and behave identically.
+
+Non-goals for the first release:
+
+* FTP and SMB interfaces from dcfs (can be ported later, see phase 5).
+* Erasure coding across stores; mirrors stay full copies (RAID-1), for
+  the reasons given in the tgfs redundancy design.
+* Other backends (archive.org, VK). The abstraction must allow them, the
+  first release ships Telegram and Discord only.
+
+## 2. What differs between Telegram and Discord
+
+These differences drive every design decision below. Values marked
+"verify" must be confirmed with a spike against the live API before
+phase 2 starts, they change over time.
+
+| Property | Telegram (tgfs) | Discord (dcfs) |
+|---|---|---|
+| Max bytes per message | 2 GiB per document (4 GiB with premium account upload) | 10 MB per attachment for bots on an unboosted server; 50 MB at boost level 2, 100 MB at level 3 (verify). dcfs defaults to 8 MB. Up to 10 attachments per message. |
+| Upload path | Chunked `saveBigFilePart`, parallel workers, streamable | One multipart HTTP POST per message, the whole part is buffered in memory first |
+| Download path | MTProto `getFile`, 1 MiB boundary rules, parallel pieces | HTTPS from the CDN with `Range` support. Attachment URLs are signed and expire (about 24 h), so the message must be fetched before each download (verify expiry) |
+| Server-side copy | `forwardMessages`: free, no bandwidth, blocked on `noforwards` channels | Message forwarding exists since 2024 (`Message.forward` in discord.py 2.5), but whether the forwarded attachment becomes an independent copy that survives deletion of the original is unknown (verify with a spike). Assume "no cheap copy" until proven otherwise. |
+| Text message limit | 4096 chars | 2000 chars for bots (dcfs assumes 4000; verify). dcfs solves overflow by sending the text as an `overflow.json` attachment. |
+| Message ids | Per-channel sequential ints, small | 64-bit snowflakes, globally unique, above 2^53 (JavaScript loses precision) |
+| Rate limits | Flood waits, tgfs limiter at 20 req/s | Per-channel send limit of about 5 messages per 5 s, global 50 req/s; bulk delete is limited to 100 ids and refuses messages older than 14 days (they need one request each) |
+| Edit media | `editMessageMedia` | `Message.edit(attachments=...)` |
+| Pinned messages | Unlimited in practice | 50 pins per channel |
+| Bot login | Multiple bot tokens, optional user account | One or more bot tokens, no user account; needs the message content intent |
+| Availability risk | Channel ban | Bot or server termination; storing large volumes of data through a bot is against the spirit of the terms of service, which is precisely why a mirror in another network is valuable |
+
+Consequences:
+
+* A Discord copy of a Telegram part cannot be "aligned" with it: one
+  2 GiB Telegram message becomes about 200 Discord messages. The
+  `mirrors: {channel: [ids aligned with messageIds]}` model of tgfs does
+  not fit cross-backend replication and has to be generalized (section
+  4.3).
+* Cross-backend mirroring is always a re-upload: the bytes have to leave
+  the process once more. It is bandwidth-bound and rate-limit-bound, and
+  it must not sit inside the WebDAV PUT request path (section 4.5).
+* File descriptors grow with Discord replicas (200 snowflakes per 2 GiB
+  version). Both stores need a transparent overflow path for long
+  descriptor texts (section 4.4).
+
+## 3. Project setup
+
+### 3.1 Repository
+
+* Create `tgdcfs` from the tgfs history, not from a file copy: `git clone
+  tgfs`, add the new origin, push. The full history keeps `git blame`
+  useful and lets future tgfs fixes be cherry-picked (`git remote add
+  upstream .../tgfs`).
+* Rename the Python package from `tgfs` to `tgdcfs` in one mechanical
+  commit right at the start (imports, `TGFS_*` environment variables,
+  `~/.tgfs` data dir, Docker user, `TGFS` realm strings, docs). Doing it
+  later means every branch in between conflicts with it. Keep the class
+  prefix `TGFS` in the model (`TGFSFileDesc`, ...) for now; renaming
+  those touches the serialized `type` tags in metadata and buys nothing.
+* Keep the module layout of tgfs so upstream patches still apply after a
+  path rewrite (`git format-patch` from tgfs, `sed 's#/tgfs/#/tgdcfs/#'`,
+  `git am`).
+* Environment variables become `TGDCFS_DATA_DIR`, `TGDCFS_CONFIG_FILE`,
+  `TGDCFS_MASTER_PASSPHRASE`. Accept the old `TGFS_*` names as fallback
+  for one release, with a deprecation log line.
+
+### 3.2 Build and CI
+
+* `pyproject.toml`: add `discord.py` and `aiohttp` as explicit
+  dependencies. Python 3.13 stays.
+* GitHub Actions: copy `test.yml`, `docker-publish.yml`,
+  `docker-preview.yml`, `gh-pages.yml`; image names `xyvran/tgdcfs` and
+  `xyvran/tgdcfs-fe`.
+* Dockerfile: identical to tgfs apart from the package name, the user
+  (`tgdcfs`) and the data dir.
+* Keep `docs/design/` and add this document, later one design doc per
+  phase where the phase changes a data format.
+
+### 3.3 Package layout (target state)
+
+```
+tgdcfs/
+  config.py                 # schema v2 + legacy tgfs loader
+  reqres.py                 # unchanged request/response dataclasses
+  backends/
+    __init__.py             # registry: backend name -> factory
+    base.py                 # IStoreClient, StoreCapabilities
+    telegram/               # moved from tgfs/telegram (interface, telethon, pyrogram)
+    discord/                # ported from dcfs/discord (interface, discord_bot)
+  core/
+    store.py                # Store = MessageApi bound to one channel of one backend
+    api/                    # DirectoryApi, FileApi, FileDescApi, MetaDataApi, MessageApi
+    mirror.py               # MirrorGroup -> replication engine (section 4.5)
+    replication/            # queue, replicators (forward / reupload), backfill
+    model/                  # TGFSFileVersion with replicas (section 4.3)
+    repository/             # fd / file_content / metadata repos, backend-agnostic
+  crypto/                   # unchanged
+  app/                      # webdav, sftp, manager: unchanged apart from new endpoints
+  tasks/                    # unchanged
+```
+
+## 4. Design
+
+### 4.1 Store abstraction
+
+Today tgfs has three layers that know about Telegram:
+
+1. `ITDLibClient` (`tgfs/telegram/interface.py`): low-level RPCs.
+2. `MessageApi` (`tgfs/core/api/message/__init__.py`): one channel,
+   batching, caching, rate limiting, parallel download.
+3. The repositories (`TGMsgFileContentRepository`, `TGMsgFDRepository`,
+   `TGMsgMetadataRepository`) and `FileUploader`.
+
+dcfs kept exactly this shape and swapped the implementations, so the
+seam is already known. tgdcfs introduces one explicit interface at layer
+2, the **store**, and makes the repositories depend on it only:
+
+```python
+class IStore(Protocol):
+    key: str                        # serialization key, section 4.2
+    caps: StoreCapabilities
+
+    async def send_text(self, text: str) -> int
+    async def edit_text(self, message_id: int, text: str) -> int
+    async def get_text(self, message_id: int) -> Optional[str]      # overflow-aware
+    async def get_messages(self, ids) -> list[Optional[MessageResp]]
+    async def upload(self, file_msg: UploadableFileMessage) -> list[SentFileMessage]
+    async def download(self, message_id: int, begin: int, end: int) -> DownloadFileResp
+    async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int
+    async def delete(self, ids, force: bool = False) -> None
+    async def pin(self, message_id: int) -> None
+    async def get_pinned(self) -> MessageRespWithDocument
+    async def copy_within(self, ids) -> list[int]                   # server-side, or reupload fallback
+    async def copy_from(self, other: "IStore", ids) -> Optional[list[int]]
+        # server-side copy from another store of the same backend; None when unsupported
+
+@dataclass(frozen=True)
+class StoreCapabilities:
+    max_part_bytes: int             # 2 GiB / 4 GiB Telegram, 10 MB Discord (config)
+    max_text_chars: int             # 4096 / 2000
+    supports_server_copy: bool      # Telegram forward
+    supports_edit_media: bool
+    supports_bulk_delete: bool
+    delete_age_limit_days: Optional[int]   # Discord: 14
+```
+
+`upload()` owns the partitioning: the Telegram store splits into 2 GiB
+parts and streams them with the existing `FileUploader`; the Discord
+store splits into `max_part_bytes` parts and buffers one part at a
+time (dcfs `FileUploader`). The caller no longer knows the part size,
+which is what allows a mirror in another backend to re-partition the
+same bytes.
+
+The existing `MessageApi` becomes the Telegram store implementation
+almost unchanged (`TelegramStore`). The Discord store is ported from
+dcfs: `DiscordBotAPI`, the overflow-aware `send_text`/`get_text`, the
+`_is_transient` retry classification, the buffered uploader, the CDN
+range download. Improvements to make while porting:
+
+* honour the per-channel send rate limit with a per-store limiter
+  instead of the global 20 req/s bucket;
+* fetch the message right before each download so the signed CDN URL
+  is fresh, and treat a 403/404 from the CDN as "refetch once, then
+  fail";
+* individual deletes for messages older than 14 days;
+* optionally pack up to 10 attachments into one message (10x fewer
+  messages per GiB). This changes the addressing to `(message_id,
+  attachment_index)`; keep it behind a capability flag and out of the
+  first release unless the message count turns out to be the bottleneck.
+
+### 4.2 Store keys
+
+Mirror maps in the metadata are keyed by a string that must be stable
+for the life of the data and unique across backends. tgfs uses the
+channel id as written in the config. tgdcfs uses
+
+```
+<backend>:<channel id as written in config>     e.g. tg:-1001234567890, dc:1234567890123456789
+```
+
+A key without a prefix is read as `tg:` so existing tgfs metadata loads
+unchanged, and keys are written with the prefix from the first write on.
+Config store names (section 5) are aliases for humans and never end up
+in the metadata, so renaming a store in the config is safe.
+
+### 4.3 Data model: replicas instead of aligned mirrors
+
+`TGFSFileVersion` today:
+
+```json
+{"type": "FV", "id": "...", "updatedAt": 0, "messageIds": [1, 2], "size": 123,
+ "mirrors": {"-1009876543210": [17, 18]}}
+```
+
+`mirrors` requires the copy to have the same number of parts as the
+primary. That holds for Telegram forwarding and breaks for everything
+else. tgdcfs adds a second, general map and keeps `mirrors` as the
+compact special case:
+
+```json
+{"type": "FV", "id": "...", "updatedAt": 0, "messageIds": [1, 2], "size": 123,
+ "mirrors":  {"tg:-1009876543210": [17, 18]},
+ "replicas": {"dc:1234567890123456789": {"m": [..200 snowflakes..], "p": [10000000, 4711]}}}
+```
+
+* `mirrors[key]`: part ids aligned with `messageIds`; part sizes equal
+  the primary's. Written by forward-mode replication.
+* `replicas[key]`: an independent part layout, `m` message ids and `p`
+  part sizes in the compact form dcfs uses (`[common, last]` when all
+  parts but the last have the same size; `mb` base64 for more than 100
+  ids). Written by reupload-mode replication.
+* In memory both collapse into one structure, `Replica(store_key,
+  message_ids, part_sizes)`, and the primary itself is just the replica
+  with `store_key == primary`. Every reader works on a list of replicas.
+
+`TGFSFileRef.mirrors` (descriptor copies per store) stays as it is: a
+descriptor is one text message in every store, so the map of one id per
+store fits both backends.
+
+Encryption is unaffected by re-partitioning. The encryption decorator
+wraps the content repository and works on the ciphertext byte stream;
+the store below it only sees bytes and may cut them wherever it likes.
+The inline 60-byte header stays at byte 0 of the stream, so a file is
+still decryptable from a Discord replica alone.
+
+### 4.4 Descriptor size and overflow
+
+A version with a Discord replica carries about 200 message ids per
+2 GiB. As JSON that is 4 KB per version, above the Telegram text limit
+and far above Discord's. Two measures, both from dcfs:
+
+1. Compact encoding of id lists (`mb` base64, 8 bytes per id, roughly
+   half the size) and compact part sizes. Applies to `replicas` only,
+   `messageIds` keeps its format for compatibility.
+2. Transparent overflow in `send_text`/`edit_text`/`get_text` of every
+   store: text longer than `caps.max_text_chars` is sent as a small
+   document (`fd.json`, caption `TGDCFS_OVERFLOW`) and read back through
+   `download`. The repositories never see the difference. Telegram
+   descriptors that fit stay plain text, so existing installations keep
+   their current on-channel format until a descriptor actually grows.
+
+The GitHub-repo metadata backend is not affected (no length limits) and
+remains the recommended choice when stores of different backends are
+mixed: the directory tree then survives the loss of both networks.
+
+### 4.5 Replication engine
+
+`MirrorGroup` becomes `ReplicationGroup` with the same responsibilities
+(mirror parts, mirror descriptors, mirror the pinned metadata, fan out
+deletes, mark the primary dead) but with pluggable replicators:
+
+* `ForwardReplicator`: used when primary and target are the same
+  backend and `copy_from` succeeds (Telegram forward). Writes `mirrors`.
+* `ReuploadReplicator`: streams the version from any healthy replica
+  (`IFileContentRepository.get` on the replica list) into
+  `target.upload()`, which re-partitions for the target. Writes
+  `replicas`. Used for every cross-backend pair, for `noforwards`
+  channels, and as the fallback when forwarding fails.
+* `mode: auto` (default) picks forward when possible and falls back to
+  reupload; `forward` and `reupload` force one and keep tgfs semantics.
+
+Timing. tgfs replicates synchronously inside `save()`, which is fine for
+a forward (one RPC) and unacceptable for a reupload into Discord (a
+2 GiB PUT would wait for 200 rate-limited uploads). tgdcfs therefore
+adds a replication queue:
+
+* `sync: inline | background` per file system, default `inline` for
+  forward-capable pairs and `background` otherwise. With `background`
+  the write path records the version with the primary only, enqueues
+  `(fs, file ref, version id, target store)` and returns.
+* The queue is persisted in the data dir (`replication.sqlite`, one row
+  per unit of work) so a restart does not lose pending copies. The
+  worker drains it with bounded concurrency per target store, honours
+  rate limits, retries transient errors with backoff and reports through
+  the existing task store (`TaskType.MIRROR_BACKFILL` gets a sibling
+  `REPLICATION`).
+* Commit point per unit of work is the descriptor edit that records the
+  replica, exactly as in the tgfs backfill design. Orphaned copies from
+  a crash between upload and commit are harmless and swept by the
+  verification pass.
+* `strict: true` remains available and implies `inline`.
+
+Backfill (`core/backfill.py`) is kept and generalized: it walks the
+tree, finds versions without a complete replica set for every configured
+target, and enqueues them. Newest first, idempotent, resumable.
+
+Deletion fans out per replica; for Discord the store handles the 14-day
+rule internally. Descriptor copies and pinned metadata copies follow the
+existing tgfs logic, they are text and small documents in every store.
+
+### 4.6 Read path and failover
+
+`_part_sources` in the content repository already tries the primary and
+then each mirror, with a circuit breaker on the primary. It changes in
+one way: it iterates replicas, and each replica maps the requested byte
+range onto its own part layout (`_get_file_parts_indexed` already takes
+the part sizes as input, it just needs to be called per replica). The
+existing parallel download, chunk cache and read-ahead stay in the
+Telegram store; the Discord store gets its CDN range download and the
+dcfs producer/consumer part streaming.
+
+Optional `read_preference: [store keys]` per file system lets a
+deployment read from a mirror by default (for example a Discord mirror
+close to the reader while the Telegram primary is far away). Default is
+primary first.
+
+### 4.7 Promotion
+
+Swapping primary and mirror is a config change, as in tgfs. Because
+every version knows its per-store ids and part layout, reads work
+immediately. New uploads go to the new primary, and the old primary
+becomes a mirror target: backfill then copies the versions the old
+primary never had (it was primary, it has everything) and, in the other
+direction, the versions that were only queued. A `promote` manager
+endpoint that rewrites nothing but validates the swap (both stores
+configured, metadata reachable) and prints the resulting config block
+is enough; editing the YAML stays a human step.
+
+### 4.8 Metadata backends
+
+* `github_repo`: unchanged, backend-agnostic. Recommended for mixed
+  deployments.
+* `pinned_message`: unchanged in shape; the pinned blob lives in the
+  primary store and is mirrored into each mirror store as today. Works
+  on Discord (50-pin limit is irrelevant with one pin). The Telegram
+  implementation needs a user account to read pins; the Discord one does
+  not.
+
+### 4.9 Manager API and UI
+
+New or changed endpoints, all under `/api`:
+
+* `GET /stores`: configured stores, backend, health (last error, dead
+  until), capabilities.
+* `GET /filesystems`: primary, mirrors, sync mode, queue depth.
+* `POST /replication/backfill/{fs}`: replaces
+  `/redundancy/backfill/{client_name}` (old path kept as alias).
+* `GET /replication/queue`, `POST /replication/retry`.
+* `GET /message/{store_key}/{message_id}`: currently keyed by channel
+  id, becomes store key.
+
+The mini app and the config generator in `tgfs-gh-pages` need a store
+type selector and Discord fields (bot token, guild id, channel id, max
+part size), plus JSON handling of snowflakes as strings (the manager API
+should serialize message ids as strings, JavaScript numbers cannot hold
+them).
+
+## 5. Configuration
+
+Schema v2. Everything under `tgdcfs:` is the old `tgfs:` block, renamed.
+The old `telegram:` block with `private_file_channel` and `redundancy` is
+still accepted and translated into stores and file systems on load, so
+a tgfs `config.yaml` works as is.
+
+```yaml
+backends:
+  telegram:
+    api_id: 12345
+    api_hash: "..."
+    lib: telethon
+    bot:
+      session_file: bot.session
+      tokens: ["..."]
+    # account: {session_file: account.session, used_to_upload: false, used_to_download: false}
+    delete_messages_on_remove: false
+  discord:
+    bot_tokens: ["..."]
+    guild_id: 123456789012345678
+    max_file_size_bytes: 10000000      # 10 MB unboosted, raise on boosted servers
+    delete_messages_on_remove: false
+
+stores:                                  # human names, never written to metadata
+  tg-main:   {backend: telegram, channel: "-1001234567890"}
+  tg-spare:  {backend: telegram, channel: "-1009876543210"}
+  dc-mirror: {backend: discord,  channel: "1234567890123456789"}
+
+filesystems:
+  media:
+    primary: tg-main
+    mirrors: [dc-mirror, tg-spare]
+    mode: auto               # auto | forward | reupload
+    sync: background         # inline | background (default derived from mode and backends)
+    strict: false
+    read_preference: []      # optional, store names
+    metadata:
+      type: github_repo
+      github_repo: {repo: owner/repo, commit: master, access_token: "..."}
+  notes:
+    primary: dc-mirror       # Discord as primary, Telegram as mirror: same shape
+    mirrors: [tg-main]
+    metadata: {type: pinned_message}
+
+tgdcfs:
+  users: {...}
+  jwt: {...}
+  server: {host: 0.0.0.0, port: 1900}
+  sftp: {...}
+  transfer: {...}            # Telegram tuning, unchanged
+  encryption: {...}          # unchanged, applies to every store
+```
+
+Validation on load: a store used as primary of one file system may be a
+mirror of another only with an explicit `allow_shared_store: true`
+(two trees writing into one channel invites id confusion); a file
+system must not list its primary as a mirror; every store referenced
+exists; backends referenced by stores are configured; `strict` implies
+`sync: inline`.
+
+The legacy translation: `telegram.private_file_channel[i]` becomes store
+`tg-<channel>` and file system `tgfs.metadata[channel].name`;
+`telegram.redundancy.mirrors[channel]` becomes that file system's
+`mirrors`; `mode` and `strict` carry over; `sync` is `inline`.
+
+## 6. Testing strategy
+
+* Keep all 57 tgfs test modules green after the rename (phase 0 exit
+  criterion).
+* `tests/fakes/store.py`: an in-memory `IStore` with configurable
+  capabilities (part size, text limit, server copy on/off, failure
+  injection). Every replication, failover, overflow and backfill test
+  runs against fakes in both roles, so cross-backend behaviour is tested
+  without network: Telegram-like primary with Discord-like mirror and
+  the reverse.
+* Port the dcfs unit tests for the Discord client, overflow, retry
+  classification and parallel download.
+* Round-trip tests for the serialized model: old tgfs JSON (no prefix
+  keys, `mirrors` only) loads and re-serializes byte-identically when no
+  replica was added; `replicas` in compact and plain form round-trip.
+* One opt-in integration test per backend behind environment variables
+  with real tokens (upload, range download, delete, overflow), run
+  manually and in the preview build, not in the default CI.
+* Extend `scripts/docker_smoke_check.py` to start with a Discord-only
+  config.
+
+## 7. Phases
+
+Each phase ends with green CI and a working Docker image; a phase may be
+released on its own.
+
+**Phase 0: bootstrap (small).** Repo from tgfs history, package rename,
+env var fallbacks, CI and Docker names, this document. No behaviour
+change.
+
+**Phase 1: store abstraction (medium).** `IStore` and
+`StoreCapabilities`; `MessageApi` becomes `TelegramStore`; repositories
+and `MirrorGroup` depend on `IStore`; store keys with the `tg:` prefix
+and prefix-less compatibility; config schema v2 with the legacy
+translation; `/stores` and `/filesystems` endpoints. Still Telegram
+only, all existing tests pass, a tgfs config runs unchanged.
+
+**Phase 2: Discord backend (medium).** Port and adapt the dcfs Discord
+client, store, uploader, overflow, retry; Discord-only file systems work
+end to end over WebDAV and SFTP with encryption and both metadata
+types; config generator gains Discord fields. Spikes at the start of
+this phase: attachment limits per boost level, bot text limit, CDN URL
+expiry, forward semantics.
+
+**Phase 3: cross-backend replication (large).** `replicas` in the model
+and descriptor overflow; `ReuploadReplicator`; the persistent background
+queue and worker; generalized backfill; failover reads across replicas
+with different part layouts; delete fan-out with the 14-day rule;
+replication endpoints. This is the phase that delivers "Telegram
+primary, Discord mirror" and the reverse.
+
+**Phase 4: operations and docs (small to medium).** Promotion runbook and
+validation endpoint; README sections for stores, file systems, Discord
+setup, limits and the promotion procedure; getting-started page; example
+configs; manager UI for queue and backfill progress.
+
+**Phase 5: optional.** FTP and SMB from dcfs; multi-attachment Discord
+messages; Discord forward as a `ForwardReplicator` if the spike shows
+copies are independent; further backends.
+
+## 8. Risks and open points
+
+* **Discord throughput.** Roughly one 10 MB message per second per
+  channel is the realistic ceiling, so about 30 GB per hour per channel.
+  Mirroring a terabyte-scale Telegram library into Discord takes days
+  and produces 100 000 messages. Discord is a good mirror for the
+  valuable subset and a poor one for bulk media; the plan supports
+  per-file-system choices for that reason. Several Discord channels as
+  parallel targets are not planned; one channel per store keeps the
+  model simple.
+* **Terms of service.** A bot that stores bulk data may be terminated.
+  Mirrors are the answer, but a Discord primary should be reserved for
+  data that is also mirrored elsewhere.
+* **Descriptor growth.** Overflow keeps it correct, but descriptors of
+  large files with Discord replicas become documents of tens of
+  kilobytes that are rewritten on every version. Acceptable; noted.
+* **Snowflakes in JavaScript.** Any JSON that reaches the browser must
+  carry message ids as strings.
+* **Memory per Discord upload.** One part (10 to 100 MB) per concurrent
+  upload is buffered in memory; bound the concurrency per store.
+* **Package rename vs. upstream tracking.** A renamed package makes
+  cherry-picks from tgfs a path rewrite away instead of a plain
+  cherry-pick. Accepted for a clean project; the alternative (keep the
+  `tgfs` package name inside tgdcfs) is cheaper for tracking but
+  confusing for users and Docker images.
+
+Decisions needed before phase 0:
+
+1. Rename the package to `tgdcfs` (recommended) or keep `tgfs` as the
+   package name for easier upstream tracking.
+2. Start from the tgfs history (recommended) or from a flat copy with
+   one initial commit.
+3. Default `sync` for cross-backend pairs: `background` (recommended)
+   or `inline` with `strict: false`.
+4. Whether phase 5 items (FTP, SMB) are wanted at all; they decide if
+   the dcfs `app/` code is worth keeping in sight while porting.
