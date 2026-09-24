@@ -1,7 +1,7 @@
 # tgdcfs: Architecture and Implementation Plan
 
-Status: phases 0 and 1 implemented (see "Progress" at the end), phases
-2 to 4 planned. This document plans how to build tgdcfs as a new
+Status: phases 0 to 2 implemented (see "Progress" at the end), phases
+3 and 4 planned. This document plans how to build tgdcfs as a new
 project: the tgfs code base as the main part, plus Discord as a second
 storage backend that can be configured next to Telegram, either as the
 primary store or as a mirror, in both directions.
@@ -602,3 +602,36 @@ Deviations from the plan, found while implementing:
   reader assumes a single-part document; that holds on Telegram (2 GiB)
   and needs attention before a Discord primary (10 MB parts) can carry
   `pinned_message` metadata for a large tree. Phase 2 item.
+
+### Phase 2 (done)
+
+Spike results, September 2026 (the Discord developer portal is not
+reachable from the build environment, so these come from discord.py
+2.7.1 and secondary sources; re-check against the live API when the
+first bot runs):
+
+| Question | Answer |
+|---|---|
+| Attachment limit per file | 20 MB unboosted (raised from 10 MB in August 2026), 50 MB at boost level 2, 100 MB at level 3; 10 attachments per message |
+| Bot text limit | 2000 characters, Nitro does not apply to bots |
+| CDN URL expiry | signed URLs (`ex`, `is`, `hm`), about a day; a freshly fetched message carries fresh URLs |
+| Forwarding | a forward is an immutable snapshot referring to the original attachment, not an independent copy; unusable as a replication primitive |
+| Bulk delete | at most 100 ids, none older than 14 days; older ones one by one |
+| Pins | `channel.pins()` is a paginated iterator since discord.py 2.6 |
+
+Implemented in `tgdcfs/backends/discord/`: `client.py` (discord.py
+wrapper: send, edit, fetch, pins, deletion split by message age, CDN
+range download that slices a 200 answer itself), `store.py`
+(`DiscordStore`: partitioning at `max_file_size_bytes`, descriptor
+overflow as an attachment resolved on read, retries on transient
+errors, bounded concurrency, no server-side copy) and `factory.py`.
+Config: `backends.discord` (`DiscordConfig`); a store with
+`backend: discord` requires it. The pinned metadata repository refuses
+a blob larger than one message of its store.
+
+What works: a Discord primary (with `github_repo` or small
+`pinned_message` metadata), Discord mirrors of a Discord primary, and
+a Telegram mirror of a Discord primary (a Discord part always fits a
+Telegram message). What waits for phase 3: a Discord mirror of a
+Telegram primary, because a 2 GiB part has to become many Discord
+messages (replicas with their own part layout).

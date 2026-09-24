@@ -18,6 +18,15 @@ backends:
     # "Delete Messages" permission for this to succeed.
     delete_messages_on_remove: false
 
+  # Discord: one or more bot tokens and the attachment limit of the
+  # server (20 MB unboosted since August 2026, 50 MB at boost level 2,
+  # 100 MB at level 3). Files are cut into parts of ``max_file_size_bytes``.
+  # discord:
+  #   bot_tokens:
+  #     - hidden
+  #   max_file_size_bytes: 10000000
+  #   delete_messages_on_remove: false
+
 # Stores: one channel of one backend, under a name of your choosing. The
 # name is only used in this file; the metadata refers to a store by
 # ``<backend prefix>:<channel>`` (here ``tg:tgdcfsdemo``), so renaming a
@@ -29,6 +38,9 @@ stores:
   # demo-mirror:
   #   backend: telegram
   #   channel: 'tgdcfsdemomirror'
+  # demo-discord:
+  #   backend: discord
+  #   channel: '123456789012345678'
 
 # File systems: one top-level directory each, backed by a primary store
 # and optional mirror stores. Swapping ``primary`` and a mirror promotes

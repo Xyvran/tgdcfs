@@ -13,8 +13,8 @@ file system has a primary store and optional mirror stores, and a store
 can be a Telegram channel or a Discord channel in either role. The
 design is described in
 [docs/design/architecture-plan.md](docs/design/architecture-plan.md);
-the Discord backend and cross-backend mirroring are not implemented
-yet, so today tgdcfs behaves exactly like tgfs.
+the Discord backend is in; mirroring a Telegram primary into Discord
+(which needs re-partitioned copies) is not yet.
 
 Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
 for creating the original tgfs project this repository is built upon.
@@ -120,8 +120,8 @@ and ignored so clients like `rsync` do not abort.
 
 ## Stores and file systems
 
-A **store** is one channel of one backend (Telegram today, Discord
-next), under a name of your choosing. A **file system** is what you see
+A **store** is one channel of one backend (Telegram or Discord), under
+a name of your choosing. A **file system** is what you see
 as a top-level directory over WebDAV and SFTP: it has one *primary*
 store and any number of *mirror* stores, and the same store can play
 either role. Swapping primary and mirror is a config change.
@@ -171,6 +171,73 @@ id confusion); `strict: true` requires `sync: inline`.
 The manager API describes the result: `GET /api/stores` lists the stores
 with their backend, key and capabilities, `GET /api/filesystems` the
 file systems with their primary, mirrors and mirroring settings.
+
+## Discord backend
+
+Discord channels can be stores too, as primaries or as mirrors. A
+Discord store partitions files into attachments of
+`max_file_size_bytes` (see the limits below), sends descriptors that
+exceed a bot's 2000 characters as a small JSON attachment, and streams
+downloads from the CDN with HTTP range requests.
+
+```yaml
+backends:
+  discord:
+    bot_tokens: ["..."]            # one or more bots, used round-robin
+    max_file_size_bytes: 10000000  # per attachment; raise to match the server
+    delete_messages_on_remove: false
+    # upload_max_retries: 10
+    # upload_retry_interval: 5
+    # max_concurrent_uploads: 3
+    # max_concurrent_downloads: 3
+
+stores:
+  dc-main: {backend: discord, channel: "123456789012345678"}
+
+filesystems:
+  notes:
+    primary: dc-main
+    mirrors: [tg-spare]            # a Telegram mirror of a Discord primary works
+    metadata: {type: github_repo, github_repo: {...}}
+```
+
+Setting up the bot: create an application at
+https://discord.com/developers/applications, add a bot, enable the
+*Message Content* intent, and invite it to your server with *View
+Channel*, *Send Messages*, *Manage Messages*, *Read Message History*,
+*Attach Files* and *Pin Messages* on the channels you use as stores.
+The channel id is the numeric id from *Copy Channel ID* (developer
+mode).
+
+Limits that shape a Discord store (as of September 2026):
+
+* A bot may attach 20 MB per file on an unboosted server (10 MB before
+  August 2026), 50 MB at boost level 2 and 100 MB at level 3. The
+  default `max_file_size_bytes` is a conservative 10 MB; a value above
+  the server's limit makes every upload fail.
+* Roughly one message per second per channel is the practical send
+  rate, so about 30 GB per hour per channel at 10 MB parts. Discord is
+  a fine mirror for the valuable part of a library and a slow home for
+  bulk media.
+* Attachment URLs are signed and expire after about a day; TGDCFS
+  fetches the message before every download, so this is invisible.
+* Messages older than 14 days cannot be bulk deleted; they are deleted
+  one by one, which is slow for large removals.
+* There is no server-side copy: mirroring *into* a Discord store always
+  re-uploads the bytes, and a Discord primary cannot be mirrored into
+  Telegram by forwarding either.
+* Mirroring a Telegram primary *into* Discord needs parts that fit a
+  Discord message; a 2 GiB Telegram part does not, so that direction
+  waits for replicas with their own part layout (phase 3 of the
+  architecture plan). The other direction (Discord primary, Telegram
+  mirror) works today.
+* `pinned_message` metadata must fit one attachment; use
+  `github_repo` metadata for anything but small trees on a Discord
+  primary.
+
+Storing large volumes of data through a bot is not what Discord is
+for, and a bot or server can be terminated. Treat a Discord primary as
+something that is mirrored elsewhere.
 
 ## Mirroring
 

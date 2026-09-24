@@ -15,8 +15,8 @@ from .base import (
     parse_store_key,
 )
 
-# Names accepted in ``stores.<name>.backend``. Discord is added in phase 2.
-BACKEND_NAMES = ("telegram",)
+# Names accepted in ``stores.<name>.backend``.
+BACKEND_NAMES = ("telegram", "discord")
 
 # Prefix of the serialization key per backend, see ``make_store_key``.
 BACKEND_PREFIXES = {"telegram": "tg", "discord": "dc"}

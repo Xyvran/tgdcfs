@@ -1,6 +1,7 @@
 import json
 import pytest
 
+from tgdcfs.backends.base import StoreCapabilities
 from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion, TGFSMetadata
 from tgdcfs.core.repository.impl.metadata.pinned_message import (
@@ -21,6 +22,9 @@ class TestPinnedMessageMetadataRepository:
     def mock_message_api(self, mocker):
         store = mocker.AsyncMock(spec=TelegramStore)
         store.key = "tg:111"
+        store.caps = StoreCapabilities(
+            max_part_bytes=1 << 30, max_text_chars=4096, supports_server_copy=True
+        )
         return store
 
     @pytest.fixture

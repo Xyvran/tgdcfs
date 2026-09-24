@@ -595,6 +595,61 @@ class TelegramConfig:
 
 
 @dataclass
+class DiscordConfig:
+    """Credentials and limits of the Discord backend.
+
+    ``max_file_size_bytes`` is the largest attachment the bot may send
+    in the channels it serves: 20 MB on an unboosted server (10 MB before
+    August 2026), 50 MB at boost level 2 and 100 MB at level 3. The
+    default is conservative; raise it to match the server, a too large
+    value makes every upload fail. Files are cut into parts of this size.
+    """
+
+    bot_tokens: List[str]
+    max_file_size_bytes: int
+    delete_messages_on_remove: bool
+    upload_max_retries: int
+    upload_retry_interval: float
+    max_concurrent_uploads: int
+    max_concurrent_downloads: int
+
+    DEFAULT_MAX_FILE_SIZE_BYTES = 10_000_000
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DiscordConfig":
+        tokens = list(data.get("bot_tokens") or [])
+        if token := data.get("bot_token"):
+            tokens.insert(0, token)
+        if not tokens:
+            raise ValueError("backends.discord: 'bot_tokens' is required")
+        max_file_size = int(
+            data.get("max_file_size_bytes", cls.DEFAULT_MAX_FILE_SIZE_BYTES)
+        )
+        if max_file_size < 1024:
+            raise ValueError(
+                f"backends.discord.max_file_size_bytes is too small: {max_file_size}"
+            )
+
+        def positive(key: str, default: int) -> int:
+            value = int(data.get(key, default))
+            if value < 1:
+                raise ValueError(f"backends.discord.{key} must be at least 1")
+            return value
+
+        return cls(
+            bot_tokens=[str(t) for t in tokens],
+            max_file_size_bytes=max_file_size,
+            delete_messages_on_remove=bool(
+                data.get("delete_messages_on_remove", False)
+            ),
+            upload_max_retries=positive("upload_max_retries", 10),
+            upload_retry_interval=float(data.get("upload_retry_interval", 5.0)),
+            max_concurrent_uploads=positive("max_concurrent_uploads", 3),
+            max_concurrent_downloads=positive("max_concurrent_downloads", 3),
+        )
+
+
+@dataclass
 class StoreConfig:
     """One channel of one backend, under a name of the user's choosing.
 
@@ -812,6 +867,7 @@ class Config:
     tgdcfs: TGFSConfig
     stores: Dict[str, StoreConfig] = field(default_factory=dict)
     filesystems: Dict[str, FilesystemConfig] = field(default_factory=dict)
+    discord: Optional[DiscordConfig] = None
 
     def filesystem_for_store(self, store_name: str) -> Optional[FilesystemConfig]:
         """The file system whose primary is ``store_name``."""
@@ -862,6 +918,11 @@ class Config:
         else:
             raise ValueError("configuration block 'backends.telegram' is missing")
         telegram = TelegramConfig.from_dict(telegram_data)
+        discord = (
+            DiscordConfig.from_dict(backends["discord"])
+            if "discord" in backends
+            else None
+        )
         app = TGFSConfig.from_dict(app_data)
 
         if "stores" in data or "filesystems" in data:
@@ -881,12 +942,19 @@ class Config:
         else:
             stores, filesystems = _legacy_stores_and_filesystems(telegram, app)
 
+        for store in stores.values():
+            if store.backend == "discord" and discord is None:
+                raise ValueError(
+                    f"stores.{store.name}: backend 'discord' needs the "
+                    f"'backends.discord' block"
+                )
         _validate_filesystems(stores, filesystems)
         return cls(
             telegram=telegram,
             tgdcfs=app,
             stores=stores,
             filesystems=filesystems,
+            discord=discord,
         )
 
 

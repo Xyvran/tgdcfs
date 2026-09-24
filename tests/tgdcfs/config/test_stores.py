@@ -51,10 +51,9 @@ class TestStoreConfig:
         with pytest.raises(ValueError, match="unknown backend"):
             StoreConfig.from_dict("main", {"backend": "carrier-pigeon", "channel": "x"})
 
-    def test_unavailable_backend_rejected(self):
-        # Known in the key scheme, not implemented yet.
-        with pytest.raises(ValueError, match="not available"):
-            StoreConfig.from_dict("main", {"backend": "discord", "channel": "1"})
+    def test_discord_store(self):
+        store = StoreConfig.from_dict("main", {"backend": "discord", "channel": 1234})
+        assert store.key == "dc:1234"
 
     def test_channel_required(self):
         with pytest.raises(ValueError, match="channel"):
@@ -191,6 +190,47 @@ class TestCurrentLayout:
         data = current_layout()
         data["backends"]["telegram"]["private_file_channel"] = ["-1001"]
         with pytest.raises(ValueError, match="private_file_channel"):
+            Config.from_dict(data)
+
+    def test_discord_store_needs_the_discord_backend(self):
+        data = current_layout()
+        data["stores"]["dc"] = {"backend": "discord", "channel": "1"}
+        with pytest.raises(ValueError, match="backends.discord"):
+            Config.from_dict(data)
+
+    def test_discord_backend(self):
+        data = current_layout()
+        data["backends"]["discord"] = {
+            "bot_tokens": ["t1", "t2"],
+            "max_file_size_bytes": 20_000_000,
+        }
+        data["stores"]["dc"] = {"backend": "discord", "channel": "1"}
+        data["filesystems"]["media"]["mirrors"].append("dc")
+        config = Config.from_dict(data)
+        assert config.discord is not None
+        assert config.discord.bot_tokens == ["t1", "t2"]
+        assert config.discord.max_file_size_bytes == 20_000_000
+        assert config.discord.upload_max_retries == 10
+        assert config.uses_backend == {"telegram": True, "discord": True}
+
+    def test_discord_backend_single_token(self):
+        data = current_layout()
+        data["backends"]["discord"] = {"bot_token": "t"}
+        config = Config.from_dict(data)
+        assert config.discord is not None
+        assert config.discord.bot_tokens == ["t"]
+        assert config.discord.max_file_size_bytes == 10_000_000
+
+    def test_discord_backend_needs_a_token(self):
+        data = current_layout()
+        data["backends"]["discord"] = {}
+        with pytest.raises(ValueError, match="bot_tokens"):
+            Config.from_dict(data)
+
+    def test_discord_backend_rejects_a_tiny_part_size(self):
+        data = current_layout()
+        data["backends"]["discord"] = {"bot_token": "t", "max_file_size_bytes": 10}
+        with pytest.raises(ValueError, match="too small"):
             Config.from_dict(data)
 
     def test_missing_telegram_block(self):

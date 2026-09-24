@@ -1,9 +1,11 @@
+from typing import Any, Dict
+
 import pytest
 
 from main import create_clients, create_store_factory, main, run_server
 from tgdcfs.config import Config
 
-CONFIG = {
+CONFIG: Dict[str, Any] = {
     "backends": {
         "telegram": {
             "api_id": 12345,
@@ -61,6 +63,35 @@ class TestMain:
         assert set(result) == {"media", "notes"}
         assert created["media"].key == "tg:-1001"
         assert created["notes"].key == "tg:-1002"
+
+    @pytest.mark.asyncio
+    async def test_store_factory_logs_in_to_discord_when_used(self, mocker):
+        config = Config.from_dict(
+            {
+                **CONFIG,
+                "backends": {
+                    **CONFIG["backends"],
+                    "discord": {"bot_token": "t"},
+                },
+                "stores": {
+                    **CONFIG["stores"],
+                    "dc-mirror": {"backend": "discord", "channel": "42"},
+                },
+            }
+        )
+        mocker.patch("main.telegram.login", mocker.AsyncMock())
+        bots = [mocker.Mock()]
+        login = mocker.patch("main.discord.login", mocker.AsyncMock(return_value=bots))
+        create = mocker.patch(
+            "main.discord.create_store", mocker.AsyncMock(return_value="store")
+        )
+
+        factory = await create_store_factory(config)
+        result = await factory(config.stores["dc-mirror"])
+
+        login.assert_awaited_once_with(config)
+        create.assert_awaited_once_with(config.stores["dc-mirror"], config, bots)
+        assert result == "store"
 
     @pytest.mark.asyncio
     async def test_store_factory_rejects_unknown_backend(self, mocker):

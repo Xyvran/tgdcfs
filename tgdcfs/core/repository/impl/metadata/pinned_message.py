@@ -8,6 +8,7 @@ from tgdcfs.core.repository.interface import IFileContentRepository, IMetaDataRe
 from tgdcfs.errors import (
     MetadataNotInitialized,
     NoPinnedMessage,
+    TechnicalError,
 )
 from tgdcfs.reqres import (
     FileMessageFromBuffer,
@@ -46,6 +47,16 @@ class PinnedMessageMetadataRepository(IMetaDataRepository):
             raise MetadataNotInitialized()
 
         buffer = json.dumps(self.metadata.to_dict()).encode()
+        # The reader below treats the pinned document as a single part, so
+        # the blob has to fit one message of the store. That is 2 GiB on
+        # Telegram and a few tens of megabytes on Discord.
+        if len(buffer) > self._message_api.caps.max_part_bytes:
+            raise TechnicalError(
+                f"The metadata blob ({len(buffer)} bytes) does not fit one message "
+                f"of store {self._message_api.key} "
+                f"({self._message_api.caps.max_part_bytes} bytes); use the "
+                f"github_repo metadata type for this file system"
+            )
         if self._message_id is not None:
             await self._fc_repo.update(
                 self._message_id,

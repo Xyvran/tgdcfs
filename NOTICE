@@ -1,0 +1,9 @@
+tgdcfs
+
+This product is a copy of tgfs (https://github.com/Xyvran/tgfs), itself a
+fork of tgfs by WheatCarrier (https://github.com/TheodoreKrypton/tgfs),
+both licensed under the Apache License, Version 2.0.
+
+The Discord backend (tgdcfs/backends/discord/) is adapted from dcfs
+(https://github.com/VulcanoSoftware/dcfs), a fork of tgfs that replaced
+Telegram with Discord, licensed under the Apache License, Version 2.0.

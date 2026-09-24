@@ -18,6 +18,7 @@ from uvicorn.server import Server
 from tgdcfs.app import create_app
 from tgdcfs.app.sftp import start_sftp_server
 from tgdcfs.backends.base import IStore
+from tgdcfs.backends.discord import factory as discord
 from tgdcfs.backends.telegram import factory as telegram
 from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
@@ -30,10 +31,15 @@ async def create_store_factory(config: Config) -> StoreFactory:
     tdlib_api = (
         await telegram.login(config) if config.uses_backend["telegram"] else None
     )
+    discord_bots = (
+        await discord.login(config) if config.uses_backend["discord"] else None
+    )
 
     async def create_store(store_cfg: StoreConfig) -> IStore:
         if store_cfg.backend == "telegram" and tdlib_api is not None:
             return await telegram.create_store(store_cfg, config, tdlib_api)
+        if store_cfg.backend == "discord" and discord_bots is not None:
+            return await discord.create_store(store_cfg, config, discord_bots)
         raise ValueError(f"Unsupported backend: {store_cfg.backend}")
 
     return create_store
