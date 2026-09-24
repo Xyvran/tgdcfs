@@ -34,6 +34,7 @@ class BackfillReport:
     files_scanned: int = 0
     versions_checked: int = 0
     versions_mirrored: int = 0
+    versions_promoted: int = 0
     fds_mirrored: int = 0
     failures: List[str] = field(default_factory=list)
 
@@ -42,6 +43,7 @@ class BackfillReport:
             "files_scanned": self.files_scanned,
             "versions_checked": self.versions_checked,
             "versions_mirrored": self.versions_mirrored,
+            "versions_promoted": self.versions_promoted,
             "fds_mirrored": self.fds_mirrored,
             "failures": self.failures,
         }
@@ -63,10 +65,15 @@ async def _verify_mirrors(client: "Client", fd: TGFSFileDesc) -> None:
     if (mirror_group := client.mirror_group) is None:
         return
     for version in fd.get_versions(exclude_invalid=True):
-        for store_key in list(version.mirrors.keys()):
+        copies = [(key, ids) for key, ids in version.mirrors.items()] + [
+            (key, replica.message_ids) for key, replica in version.replicas.items()
+        ]
+        for store_key, all_ids in copies:
+            if store_key == version.store:
+                continue
             if (api := mirror_group.store_for(store_key)) is None:
                 continue
-            ids = [mid for mid in version.mirrors[store_key] if mid > 0]
+            ids = [mid for mid in all_ids if mid > 0]
             if not ids:
                 continue
             try:
@@ -82,12 +89,15 @@ async def _verify_mirrors(client: "Client", fd: TGFSFileDesc) -> None:
                     f"Mirror copy of {fd.name}@{version.id} in store "
                     f"{store_key} is incomplete, scheduling re-mirror"
                 )
-                del version.mirrors[store_key]
+                version.mirrors.pop(store_key, None)
+                version.replicas.pop(store_key, None)
 
 
-async def _backfill_file(
+async def backfill_file(
     client: "Client", fr: TGFSFileRef, verify: bool, report: BackfillReport
 ) -> None:
+    """Bring one file's copies up to date: the unit of work of both the
+    backfill task and the replication queue."""
     mirror_group = client.mirror_group
     fd_repo = client.fd_repo
     if mirror_group is None or fd_repo is None:
@@ -105,17 +115,37 @@ async def _backfill_file(
     changed = False
     for version in fd.get_versions(exclude_invalid=True):
         report.versions_checked += 1
-        missing = mirror_group.missing_stores(version.mirrors, len(version.message_ids))
+
+        # A version that still lives in a former primary gets its copy in
+        # the current primary first; that copy becomes its primary layout.
+        if not version.owned_by(mirror_group.primary.key):
+            try:
+                if await mirror_group.copy_into_primary(version):
+                    report.versions_promoted += 1
+                    changed = True
+                else:
+                    report.failures.append(
+                        f"{fr.name}@{version.id}: could not copy into the primary"
+                    )
+            except Exception as ex:
+                report.failures.append(
+                    f"{fr.name}@{version.id}: could not copy into the primary ({ex})"
+                )
+
+        missing = mirror_group.missing_stores(version)
         if not missing:
             continue
-        mirrored = await mirror_group.mirror_parts(
-            version.message_ids, only_stores=missing
+        if not version.owned_by(mirror_group.primary.key):
+            # No primary copy to mirror from yet; the next run retries.
+            continue
+        copies = await mirror_group.mirror_parts(
+            version.message_ids, version.part_sizes or None, only_stores=missing
         )
-        if mirrored:
-            version.mirrors.update(mirrored)
+        if copies.store_keys:
+            copies.apply_to(version)
             report.versions_mirrored += 1
             changed = True
-        still_missing = [key for key in missing if key not in mirrored]
+        still_missing = [key for key in missing if key not in copies.store_keys]
         if still_missing:
             report.failures.append(
                 f"{fr.name}@{version.id}: could not mirror to "
@@ -180,7 +210,7 @@ async def backfill_mirrors(
     for fr, _ in dated:
         before = (fr.message_id, dict(fr.mirrors), fr.store)
         try:
-            await _backfill_file(client, fr, verify, report)
+            await backfill_file(client, fr, verify, report)
         except Exception as ex:
             report.failures.append(f"{fr.name}: {ex}")
             logger.error(f"Backfill failed for {fr.name}: {ex}")

@@ -1,19 +1,72 @@
+import base64
 import datetime
 import json
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 from uuid import uuid4 as uuid
 
 from tgdcfs.backends.base import normalize_store_key
-from tgdcfs.reqres import SentFileMessage
+from tgdcfs.reqres import Replica, SentFileMessage
 from tgdcfs.utils.time import FIRST_DAY_OF_EPOCH, ts
 
 from .common import validate_name
-from .serialized import TGFSFileDescSerialized, TGFSFileVersionSerialized
+from .serialized import (
+    ReplicaSerialized,
+    TGFSFileDescSerialized,
+    TGFSFileVersionSerialized,
+)
 
 EMPTY_FILE_MESSAGE = -1
 INVALID_FILE_SIZE = -1
 INVALID_VERSION_ID = ""
+
+# Replica id lists longer than this are stored base64-packed: 19-digit
+# Discord snowflakes as JSON cost 21 characters each, packed 11.
+_COMPACT_IDS_THRESHOLD = 100
+
+
+def _encode_ids(ids: List[int]) -> str:
+    """Pack message ids as big-endian uint64, base64url without padding."""
+    packed = b"".join(struct.pack(">Q", mid) for mid in ids)
+    return base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+def _decode_ids(encoded: str) -> List[int]:
+    padded = encoded + "=" * (-len(encoded) % 4)
+    packed = base64.urlsafe_b64decode(padded.encode("ascii"))
+    return [struct.unpack(">Q", packed[i : i + 8])[0] for i in range(0, len(packed), 8)]
+
+
+def replica_to_dict(replica: Replica) -> ReplicaSerialized:
+    """Serialize a replica compactly.
+
+    Part sizes collapse to ``[common, last]`` when every part but the last
+    has the same size, which is what every store's partitioning produces.
+    """
+    res: ReplicaSerialized = {}
+    if len(replica.message_ids) > _COMPACT_IDS_THRESHOLD:
+        res["mb"] = _encode_ids(replica.message_ids)
+    else:
+        res["m"] = list(replica.message_ids)
+    sizes = replica.part_sizes
+    if len(sizes) > 2 and len(set(sizes[:-1])) == 1:
+        res["p"] = [sizes[0], sizes[-1]]
+        res["n"] = len(sizes)
+    elif sizes:
+        res["p"] = list(sizes)
+    return res
+
+
+def replica_from_dict(data: ReplicaSerialized) -> Replica:
+    if (encoded := data.get("mb")) is not None:
+        ids = _decode_ids(encoded)
+    else:
+        ids = list(data.get("m") or [])
+    sizes = list(data.get("p") or [])
+    if (n := data.get("n")) and len(sizes) == 2 and n > 2:
+        sizes = [sizes[0]] * (n - 1) + [sizes[1]]
+    return Replica(message_ids=ids, part_sizes=sizes)
 
 
 @dataclass
@@ -31,6 +84,12 @@ class TGFSFileVersion:
     # copy in that store (yet)".
     mirrors: Dict[str, List[int]] = field(default_factory=dict)
 
+    # Store key -> copy of the whole version with the store's own part
+    # layout, for stores whose messages are smaller than the primary's
+    # parts (a Discord mirror of a Telegram primary). Unlike ``mirrors``
+    # the ids are not aligned with ``message_ids``.
+    replicas: Dict[str, Replica] = field(default_factory=dict)
+
     # Key of the store that ``message_ids`` belong to. ``None`` for
     # versions written before the field existed (tgfs), which always
     # belong to the configured primary. When the configured primary is a
@@ -46,6 +105,14 @@ class TGFSFileVersion:
     def size(self) -> int:
         if self._size == INVALID_FILE_SIZE and self.part_sizes:
             self._size = sum(self.part_sizes)
+        if self._size == INVALID_FILE_SIZE:
+            # No primary layout (its parts are gone or unverified): a
+            # verified replica knows the size too.
+            for replica in self.replicas.values():
+                if replica.part_sizes and len(replica.part_sizes) == len(
+                    replica.message_ids
+                ):
+                    return replica.size
         return self._size
 
     def to_dict(self) -> dict:
@@ -60,6 +127,10 @@ class TGFSFileVersion:
         # seeing the exact format they always did.
         if self.mirrors:
             res["mirrors"] = self.mirrors
+        if self.replicas:
+            res["replicas"] = {
+                key: replica_to_dict(replica) for key, replica in self.replicas.items()
+            }
         if self.store:
             res["store"] = self.store
         return res
@@ -79,12 +150,16 @@ class TGFSFileVersion:
         mirrors: Dict[str, List[int]] = {}
         for channel in {ch for msg in messages for ch in msg.mirrors}:
             mirrors[channel] = [msg.mirrors.get(channel, 0) for msg in messages]
+        replicas: Dict[str, Replica] = {}
+        for msg in messages:
+            replicas.update(msg.replicas)
         return TGFSFileVersion(
             id=str(uuid()),
             updated_at=datetime.datetime.now(),
             message_ids=[msg.message_id for msg in messages],
             part_sizes=[msg.size for msg in messages],
             mirrors=mirrors,
+            replicas=replicas,
             store=store,
         )
 
@@ -111,6 +186,10 @@ class TGFSFileVersion:
                 normalize_store_key(channel): list(ids)
                 for channel, ids in (data.get("mirrors") or {}).items()
             },
+            replicas={
+                normalize_store_key(key): replica_from_dict(replica)
+                for key, replica in (data.get("replicas") or {}).items()
+            },
             store=(normalize_store_key(data["store"]) if data.get("store") else None),
         )
 
@@ -118,7 +197,22 @@ class TGFSFileVersion:
         self.message_ids = []
         self.part_sizes = []
         self.mirrors = {}
+        self.replicas = {}
         self._size = INVALID_FILE_SIZE
+
+    def has_copy_in(self, store_key: str) -> bool:
+        """Whether ``store_key`` holds a complete copy of this version.
+
+        Ownership counts only when recorded: a version without a store
+        belongs to the primary, which is never asked about here.
+        """
+        if self.store == store_key and self.is_valid():
+            return True
+        ids = self.mirrors.get(store_key)
+        if ids and len(ids) == len(self.message_ids) and all(i > 0 for i in ids):
+            return True
+        replica = self.replicas.get(store_key)
+        return bool(replica and replica.message_ids)
 
     def is_valid(self) -> bool:
         return bool(self.message_ids)
@@ -149,6 +243,28 @@ class TGFSFileVersion:
         if ids and len(ids) == len(self.message_ids) and all(i > 0 for i in ids):
             del self.mirrors[primary_key]
             self.message_ids = list(ids)
+            self.store = primary_key
+            return
+        # The new primary may hold the version as a replica with its own
+        # part layout; that layout becomes the primary one and the old
+        # primary's parts turn into a replica (their sizes are learned on
+        # validation, when they are needed).
+        if (replica := self.replicas.pop(primary_key, None)) and replica.message_ids:
+            old_ids = self.mirrors.pop(self.store, list(self.message_ids))
+            self.replicas[self.store] = Replica(
+                message_ids=list(old_ids), part_sizes=list(self.part_sizes)
+            )
+            # Aligned mirrors were aligned with the old layout; they keep
+            # that layout as replicas too.
+            for key, aligned in list(self.mirrors.items()):
+                if len(aligned) == len(old_ids) and all(i > 0 for i in aligned):
+                    self.replicas[key] = Replica(
+                        message_ids=list(aligned), part_sizes=list(self.part_sizes)
+                    )
+                del self.mirrors[key]
+            self.message_ids = list(replica.message_ids)
+            self.part_sizes = list(replica.part_sizes)
+            self._size = INVALID_FILE_SIZE
             self.store = primary_key
 
 

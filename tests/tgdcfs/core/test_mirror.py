@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tgdcfs.backends.base import StoreCapabilities
 from tgdcfs.config import RedundancyConfig
 from tgdcfs.core.backfill import backfill_mirrors
 from tgdcfs.core.mirror import MirrorStore, MirrorGroup
@@ -12,7 +13,7 @@ from tgdcfs.core.repository.impl.fd.store_msg import StoreFDRepository
 from tgdcfs.core.repository.impl.file_content import StoreFileContentRepository
 from tgdcfs.core.repository.interface import FDRepositoryResp
 from tgdcfs.errors import MessageNotFound, TechnicalError
-from tgdcfs.reqres import Document, MessageResp, SentFileMessage
+from tgdcfs.reqres import Document, MessageResp, Replica, SentFileMessage
 
 
 class TestRedundancyConfig:
@@ -184,15 +185,25 @@ class TestModelMirrors:
         assert "mirrors" not in serialized["files"][0]
 
 
-def make_mirror_api(mocker, key="tg:999"):
+def make_mirror_api(mocker, key="tg:999", backend="telegram", max_part_bytes=1 << 31):
     api = mocker.AsyncMock()
     api.key = key
+    api.backend = backend
+    api.caps = StoreCapabilities(
+        max_part_bytes=max_part_bytes,
+        max_text_chars=4096,
+        supports_server_copy=backend == "telegram",
+    )
     return api
 
 
 def make_group(mocker, strict=False, mode="forward", channel_key="tg:999"):
     primary = mocker.AsyncMock()
     primary.key = "tg:111"
+    primary.backend = "telegram"
+    primary.caps = StoreCapabilities(
+        max_part_bytes=1 << 31, max_text_chars=4096, supports_server_copy=True
+    )
     mirror_api = make_mirror_api(mocker, channel_key)
     group = MirrorGroup(
         primary=primary,
@@ -209,20 +220,21 @@ class TestMirrorGroup:
         group, primary, mirror_api = make_group(mocker)
         mirror_api.copy_from.return_value = [11, 12]
 
-        res = await group.mirror_parts([1, 2])
+        res = await group.mirror_parts([1, 2], [5, 5])
 
         mirror_api.copy_from.assert_awaited_once_with(primary, [1, 2])
         mirror_api.upload.assert_not_awaited()
-        assert res == {"tg:999": [11, 12]}
+        assert res.mirrors == {"tg:999": [11, 12]}
+        assert res.replicas == {}
 
     @pytest.mark.asyncio
     async def test_mirror_parts_non_strict_swallows_errors(self, mocker):
         group, _, mirror_api = make_group(mocker, strict=False)
         mirror_api.copy_from.side_effect = Exception("boom")
 
-        res = await group.mirror_parts([1, 2])
+        res = await group.mirror_parts([1, 2], [5, 5])
 
-        assert res == {}
+        assert res.store_keys == []
 
     @pytest.mark.asyncio
     async def test_mirror_parts_strict_raises(self, mocker):
@@ -230,7 +242,7 @@ class TestMirrorGroup:
         mirror_api.copy_from.side_effect = Exception("boom")
 
         with pytest.raises(TechnicalError):
-            await group.mirror_parts([1, 2])
+            await group.mirror_parts([1, 2], [5, 5])
 
     @pytest.mark.asyncio
     async def test_forward_mode_refuses_a_store_without_server_copy(self, mocker):
@@ -238,7 +250,7 @@ class TestMirrorGroup:
         mirror_api.copy_from.return_value = None
 
         with pytest.raises(TechnicalError, match="server-side"):
-            await group.mirror_parts([1])
+            await group.mirror_parts([1], [4])
         mirror_api.upload.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -261,9 +273,9 @@ class TestMirrorGroup:
         primary.download_file.return_value = mocker.Mock(chunks=chunks())
         mirror_api.upload.return_value = [SentFileMessage(message_id=21, size=4)]
 
-        res = await group.mirror_parts([1])
+        res = await group.mirror_parts([1], [4])
 
-        assert res == {"tg:999": [21]}
+        assert res.mirrors == {"tg:999": [21]}
         primary.download_file.assert_awaited_once_with(1, 0, 3)
         uploaded = mirror_api.upload.call_args[0][0]
         assert uploaded.size == 4
@@ -288,7 +300,7 @@ class TestMirrorGroup:
         primary.download_file.return_value = mocker.Mock(chunks=chunks())
         mirror_api.upload.return_value = [SentFileMessage(message_id=21, size=4)]
 
-        assert await group.mirror_parts([1]) == {"tg:999": [21]}
+        assert (await group.mirror_parts([1], [4])).mirrors == {"tg:999": [21]}
 
     @pytest.mark.asyncio
     async def test_reupload_mode_never_asks_for_a_server_copy(self, mocker):
@@ -309,14 +321,13 @@ class TestMirrorGroup:
         primary.download_file.return_value = mocker.Mock(chunks=chunks())
         mirror_api.upload.return_value = [SentFileMessage(message_id=21, size=4)]
 
-        assert await group.mirror_parts([1]) == {"tg:999": [21]}
+        assert (await group.mirror_parts([1], [4])).mirrors == {"tg:999": [21]}
         mirror_api.copy_from.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_reupload_rejects_a_re_partitioned_copy(self, mocker):
-        # Until replicas carry their own part layout, a mirror that splits
-        # one part into several messages cannot be recorded.
-        group, primary, mirror_api = make_group(mocker, strict=True, mode="reupload")
+    async def test_part_sizes_are_looked_up_when_not_given(self, mocker):
+        group, primary, mirror_api = make_group(mocker, strict=True)
+        mirror_api.copy_from.return_value = [11]
         primary.get_messages.return_value = [
             MessageResp(
                 message_id=1,
@@ -327,17 +338,70 @@ class TestMirrorGroup:
             )
         ]
 
-        async def chunks():
-            yield b"data"
+        res = await group.mirror_parts([1])
 
-        primary.download_file.return_value = mocker.Mock(chunks=chunks())
-        mirror_api.upload.return_value = [
-            SentFileMessage(message_id=21, size=2),
-            SentFileMessage(message_id=22, size=2),
-        ]
+        assert res.mirrors == {"tg:999": [11]}
+        primary.get_messages.assert_awaited_once_with([1])
 
-        with pytest.raises(TechnicalError, match="part layout"):
-            await group.mirror_parts([1])
+    @pytest.mark.asyncio
+    async def test_small_parts_store_receives_a_replica(self, mocker):
+        # The mirror's messages are smaller than the primary's parts (a
+        # Discord mirror of a Telegram primary): the whole version is
+        # streamed through the mirror, which cuts it its own way.
+        group, primary, _ = make_group(mocker, strict=True, mode="auto")
+        small = make_mirror_api(mocker, "dc:9", backend="discord", max_part_bytes=3)
+        group = MirrorGroup(
+            primary=primary,
+            stores=[MirrorStore(key="dc:9", store=small)],
+            mode="auto",
+            strict=True,
+        )
+        downloads = []
+
+        async def download(mid, begin, end):
+            downloads.append((mid, begin, end))
+
+            async def chunks():
+                yield b"ab" if mid == 1 else b"cdef"
+
+            return mocker.Mock(chunks=chunks())
+
+        primary.download_file.side_effect = download
+        uploaded = []
+
+        async def upload(file_msg):
+            data = b""
+            while chunk := await file_msg.read(3):
+                data += chunk
+            uploaded.append(data)
+            return [
+                SentFileMessage(message_id=100 + i, size=len(data[i : i + 3]))
+                for i in range(0, len(data), 3)
+            ]
+
+        small.upload.side_effect = upload
+
+        res = await group.mirror_parts([1, 2], [2, 4])
+
+        assert res.mirrors == {}
+        assert res.replicas["dc:9"].message_ids == [100, 103]
+        assert res.replicas["dc:9"].part_sizes == [3, 3]
+        assert uploaded == [b"abcdef"]
+        assert downloads == [(1, 0, 1), (2, 0, 3)]
+        small.copy_from.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_backend_is_always_aligned(self, mocker):
+        # A server-side copy keeps the message whatever its size.
+        group, primary, mirror_api = make_group(mocker, strict=True, mode="auto")
+        mirror_api.caps = StoreCapabilities(
+            max_part_bytes=1, max_text_chars=4096, supports_server_copy=True
+        )
+        mirror_api.copy_from.return_value = [11]
+
+        res = await group.mirror_parts([1], [4000])
+
+        assert res.mirrors == {"tg:999": [11]}
 
     def test_rejects_unknown_mode(self, mocker):
         with pytest.raises(ValueError):
@@ -345,10 +409,26 @@ class TestMirrorGroup:
 
     def test_missing_stores(self, mocker):
         group, _, _ = make_group(mocker)
-        assert group.missing_stores({}, 2) == ["tg:999"]
-        assert group.missing_stores({"tg:999": [11]}, 2) == ["tg:999"]
-        assert group.missing_stores({"tg:999": [11, 0]}, 2) == ["tg:999"]
-        assert group.missing_stores({"tg:999": [11, 12]}, 2) == []
+
+        def version(mirrors=None, replicas=None):
+            return TGFSFileVersion(
+                id="v",
+                updated_at=datetime.datetime.now(),
+                message_ids=[1, 2],
+                mirrors=mirrors or {},
+                replicas=replicas or {},
+            )
+
+        assert group.missing_stores(version()) == ["tg:999"]
+        assert group.missing_stores(version({"tg:999": [11]})) == ["tg:999"]
+        assert group.missing_stores(version({"tg:999": [11, 0]})) == ["tg:999"]
+        assert group.missing_stores(version({"tg:999": [11, 12]})) == []
+        assert (
+            group.missing_stores(
+                version(replicas={"tg:999": Replica(message_ids=[5, 6, 7])})
+            )
+            == []
+        )
 
     @pytest.mark.asyncio
     async def test_mirror_fd_edits_existing(self, mocker):
@@ -539,6 +619,7 @@ class TestBackfill:
 
         assert report.files_scanned == 1
         assert report.versions_mirrored == 1
+        assert report.versions_promoted == 0
         assert report.failures == []
         assert fd.get_latest_version().mirrors == {"tg:999": [11]}
         assert fr.mirrors == {"tg:999": 15}

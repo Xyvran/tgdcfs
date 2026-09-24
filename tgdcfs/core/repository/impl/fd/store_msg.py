@@ -5,7 +5,8 @@ from typing import Dict, List, Optional, Tuple
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
-from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef
+from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
+from tgdcfs.core.model.file import INVALID_FILE_SIZE
 from tgdcfs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
@@ -131,6 +132,30 @@ class StoreFDRepository(IFDRepository):
                     res[(store_key, mid)] = message.document.size
         return res
 
+    async def _verify_replicas(self, version: TGFSFileVersion) -> bool:
+        """Whether some replica of ``version`` is complete; fills in the
+        replica's part sizes when they were not recorded."""
+        if not self._mirror_group:
+            return False
+        complete = False
+        for store_key, replica in version.replicas.items():
+            store = self._mirror_group.store_for(store_key)
+            if store is None or not replica.message_ids:
+                continue
+            try:
+                messages = await store.get_messages(replica.message_ids)
+            except Exception as ex:
+                logger.warning(
+                    f"Could not check replica in store {store_key} for "
+                    f"version {version.id}: {ex}"
+                )
+                continue
+            if any(m is None or m.document is None for m in messages):
+                continue
+            replica.part_sizes = [m.document.size for m in messages]  # type: ignore[union-attr]
+            complete = True
+        return complete
+
     async def _validate_fv(
         self, fd: TGFSFileDesc, include_all_versions: bool
     ) -> TGFSFileDesc:
@@ -171,6 +196,8 @@ class StoreFDRepository(IFDRepository):
 
         for i, version in enumerate(versions):
             owned = version.owned_by(self.key)
+            version.part_sizes = []
+            primary_layout_ok = True
             for j, message_id in enumerate(version.message_ids):
                 if (
                     owned
@@ -197,11 +224,26 @@ class StoreFDRepository(IFDRepository):
                     version.part_sizes.append(next(iter(mirror_sizes.values())))
                     continue
 
-                logger.warning(
-                    f"File message {message_id} for part {j + 1} of {fd.name}@{version.id} not found"
-                )
-                version.set_invalid()
+                primary_layout_ok = False
                 break
+
+            if not primary_layout_ok:
+                # Neither the primary nor an aligned mirror has every part.
+                # A replica with its own layout still makes the version
+                # readable; the primary layout is marked unusable by
+                # leaving its part sizes empty.
+                if await self._verify_replicas(version):
+                    logger.warning(
+                        f"{fd.name}@{version.id} has no complete aligned copy, "
+                        f"serving from a replica"
+                    )
+                    version.part_sizes = []
+                    version._size = INVALID_FILE_SIZE
+                else:
+                    logger.warning(
+                        f"File messages of {fd.name}@{version.id} not found in any store"
+                    )
+                    version.set_invalid()
             if version.is_valid():
                 has_valid_version = True
                 if not include_all_versions:

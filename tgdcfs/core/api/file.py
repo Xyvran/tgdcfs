@@ -1,5 +1,16 @@
 import logging
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 from uuid import uuid4 as uuid
 
 from tgdcfs.backends.base import IStore
@@ -35,11 +46,22 @@ class FileApi:
         file_desc_api: FileDescApi,
         message_api: IStore,
         mirror_group: Optional[MirrorGroup] = None,
+        inline_mirroring: bool = True,
+        on_written: Optional[Callable[[TGFSFileRef], Awaitable[None]]] = None,
     ):
         self._metadata_api = metadata_api
         self._file_desc_api = file_desc_api
         self._message_api = message_api
         self._mirror_group = mirror_group
+        self._inline_mirroring = inline_mirroring
+        # Called after a file's content changed and the metadata is
+        # pushed; the replication queue hooks in here for
+        # ``sync: background``.
+        self._on_written = on_written
+
+    async def _written(self, fr: TGFSFileRef) -> None:
+        if self._on_written is not None:
+            await self._on_written(fr)
 
     async def collect_message_ids(self, fr: TGFSFileRef) -> List[int]:
         """Return every primary-store message id backing ``fr``.
@@ -107,6 +129,13 @@ class FileApi:
             mirror_ids.setdefault(channel_key, []).extend(
                 mid for mid in version_mirror_ids if mid > 0
             )
+        for channel_key, replica in version.replicas.items():
+            target = (
+                ids
+                if channel_key == self._store_key
+                else (mirror_ids.setdefault(channel_key, []))
+            )
+            target.extend(mid for mid in replica.message_ids if mid > 0)
 
     async def _collect_version_message_ids(
         self, fr: TGFSFileRef, version_id: str
@@ -191,29 +220,27 @@ class FileApi:
         parts = [mid for version in versions for mid in version.message_ids]
         new_parts = await self._message_api.copy_within(parts)
 
-        mirrors: Dict[str, List[int]] = {}
-        if self._mirror_group and new_parts:
-            mirrors = await self._mirror_group.mirror_parts(new_parts)
-
         copied = TGFSFileDesc(name=fd.name)
         version_ids: Dict[str, str] = {}
         offset = 0
         for version in versions:
             n = len(version.message_ids)
             version_ids[version.id] = str(uuid())
-            copied.add_version(
-                TGFSFileVersion(
-                    id=version_ids[version.id],
-                    updated_at=version.updated_at,
-                    message_ids=new_parts[offset : offset + n],
-                    part_sizes=list(version.part_sizes),
-                    mirrors={
-                        channel_key: ids[offset : offset + n]
-                        for channel_key, ids in mirrors.items()
-                    },
-                    store=self._store_key,
-                )
+            new_version = TGFSFileVersion(
+                id=version_ids[version.id],
+                updated_at=version.updated_at,
+                message_ids=new_parts[offset : offset + n],
+                part_sizes=list(version.part_sizes),
+                store=self._store_key,
             )
+            # Copies are mirrored version by version: a replica covers one
+            # version's bytes, not the whole file's.
+            if self._mirror_group and self._inline_mirroring and n:
+                copies = await self._mirror_group.mirror_parts(
+                    new_version.message_ids, new_version.part_sizes or None
+                )
+                copies.apply_to(new_version)
+            copied.add_version(new_version)
             offset += n
         # add_version derives created_at from the versions it is given; the
         # copy should carry the original's creation date instead.
@@ -242,6 +269,7 @@ class FileApi:
         copied_fr.mirrors = dict(resp.mirrors)
         copied_fr.store = resp.store
         await self._metadata_api.push()
+        await self._written(copied_fr)
         return copied_fr
 
     async def _discard_orphans(
@@ -287,6 +315,7 @@ class FileApi:
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
         await self._metadata_api.push()
+        await self._written(fr)
         return resp.fd
 
     async def _sync_file_ref(self, fr: TGFSFileRef, resp: FDRepositoryResp) -> None:
@@ -316,6 +345,7 @@ class FileApi:
         else:
             resp = await self._file_desc_api.append_file_version(file_msg, fr)
         await self._sync_file_ref(fr, resp)
+        await self._written(fr)
         return resp.fd
 
     async def rm(self, fr: TGFSFileRef, version_id: Optional[str] = None) -> None:

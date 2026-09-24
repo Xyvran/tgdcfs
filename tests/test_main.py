@@ -49,7 +49,9 @@ class TestMain:
         mocker.patch("main.telegram.create_store", side_effect=fake_create_store)
         created = {}
 
-        async def fake_client_create(filesystem, cfg, factory, encryption_cfg=None):
+        async def fake_client_create(
+            filesystem, cfg, factory, encryption_cfg=None, replication=None
+        ):
             assert cfg is config
             assert encryption_cfg is config.tgdcfs.encryption
             created[filesystem.name] = await factory(cfg.stores[filesystem.primary])
@@ -153,9 +155,11 @@ class TestMain:
         mock_create_clients = mocker.patch("main.create_clients")
         mock_create_app = mocker.patch("main.create_app")
         mock_run_server = mocker.patch("main.run_server")
+        mocker.patch("main.start_replication_workers", return_value=[])
         mock_config = mocker.Mock()
         mock_config.tgdcfs.server.host = "0.0.0.0"
         mock_config.tgdcfs.server.port = 9000
+        mock_config.replication_queue_file = None
 
         mock_clients = mocker.Mock()
         mock_app = mocker.Mock()
@@ -170,6 +174,8 @@ class TestMain:
 
         # Assertions
         mock_get_config.assert_called_once()
-        mock_create_clients.assert_called_once_with(mock_config)
-        mock_create_app.assert_called_once_with(mock_clients, mock_config)
+        mock_create_clients.assert_called_once()
+        assert mock_create_clients.call_args.args[0] is mock_config
+        mock_create_app.assert_called_once()
+        assert mock_create_app.call_args.args[:2] == (mock_clients, mock_config)
         mock_run_server.assert_called_once_with(mock_app, "0.0.0.0", 9000, "TGDCFS")

@@ -2,7 +2,7 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from io import IOBase
-from typing import AsyncIterator, Dict, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 from tgdcfs.tasks.integrations import TaskTracker
 
@@ -13,11 +13,27 @@ class Message:
 
 
 @dataclass
+class Replica:
+    """A copy of a whole file version in one store, with that store's own
+    part layout. ``part_sizes`` may be empty until the copy is verified."""
+
+    message_ids: List[int] = field(default_factory=list)
+    part_sizes: List[int] = field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return sum(self.part_sizes)
+
+
+@dataclass
 class SentFileMessage(Message):
     size: int
-    # Message ids of copies of this part in mirror channels, keyed by the
-    # mirror channel id as configured (string). Empty when redundancy is off.
+    # Message ids of copies of this part in mirror stores, keyed by store
+    # key. Empty when redundancy is off.
     mirrors: Dict[str, int] = field(default_factory=dict)
+    # Copies of the whole version in stores that re-partitioned it, keyed
+    # by store key. Carried by the first part's message only.
+    replicas: Dict[str, "Replica"] = field(default_factory=dict)
 
 
 @dataclass

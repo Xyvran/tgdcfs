@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import List, Optional
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -23,6 +24,7 @@ from tgdcfs.backends.telegram import factory as telegram
 from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
 from tgdcfs.core.client import StoreFactory
+from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 
 
 async def create_store_factory(config: Config) -> StoreFactory:
@@ -45,7 +47,9 @@ async def create_store_factory(config: Config) -> StoreFactory:
     return create_store
 
 
-async def create_clients(config: Config) -> Clients:
+async def create_clients(
+    config: Config, replication: Optional[ReplicationQueue] = None
+) -> Clients:
     store_factory = await create_store_factory(config)
 
     clients: Clients = {}
@@ -55,8 +59,24 @@ async def create_clients(config: Config) -> Clients:
             config,
             store_factory,
             encryption_cfg=config.tgdcfs.encryption,
+            replication=replication,
         )
     return clients
+
+
+def start_replication_workers(
+    clients: Clients, config: Config, replication: ReplicationQueue
+) -> List[ReplicationWorker]:
+    """One background worker per file system with ``sync: background``."""
+    workers: List[ReplicationWorker] = []
+    for filesystem in config.filesystems.values():
+        client = clients.get(filesystem.name)
+        if client is None or filesystem.sync != "background" or not filesystem.mirrors:
+            continue
+        worker = ReplicationWorker(client, replication)
+        worker.start()
+        workers.append(worker)
+    return workers
 
 
 async def run_server(app, host: str, port: int, name: str):
@@ -79,9 +99,11 @@ async def main():
     logger = logging.getLogger(__name__)
     config = get_config()
 
-    clients = await create_clients(config)
+    replication = ReplicationQueue(config.replication_queue_file)
+    clients = await create_clients(config, replication)
+    workers = start_replication_workers(clients, config, replication)
 
-    app = create_app(clients, config)
+    app = create_app(clients, config, replication=replication)
 
     try:
         sftp_acceptor = await start_sftp_server(clients, config)
@@ -96,6 +118,8 @@ async def main():
             app, config.tgdcfs.server.host, config.tgdcfs.server.port, "TGDCFS"
         )
     finally:
+        for worker in workers:
+            await worker.stop()
         if sftp_acceptor:
             sftp_acceptor.close()
             await sftp_acceptor.wait_closed()

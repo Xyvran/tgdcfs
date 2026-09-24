@@ -13,8 +13,8 @@ file system has a primary store and optional mirror stores, and a store
 can be a Telegram channel or a Discord channel in either role. The
 design is described in
 [docs/design/architecture-plan.md](docs/design/architecture-plan.md);
-the Discord backend is in; mirroring a Telegram primary into Discord
-(which needs re-partitioned copies) is not yet.
+the Discord backend, cross-backend mirroring in both directions and
+background replication are in.
 
 Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
 for creating the original tgfs project this repository is built upon.
@@ -226,11 +226,10 @@ Limits that shape a Discord store (as of September 2026):
 * There is no server-side copy: mirroring *into* a Discord store always
   re-uploads the bytes, and a Discord primary cannot be mirrored into
   Telegram by forwarding either.
-* Mirroring a Telegram primary *into* Discord needs parts that fit a
-  Discord message; a 2 GiB Telegram part does not, so that direction
-  waits for replicas with their own part layout (phase 3 of the
-  architecture plan). The other direction (Discord primary, Telegram
-  mirror) works today.
+* Mirroring a Telegram primary *into* Discord re-partitions every
+  version into Discord-sized messages (a replica, see Mirroring) and
+  re-uploads the bytes; use `sync: background` for such a mirror so
+  uploads do not wait for it.
 * `pinned_message` metadata must fit one attachment; use
   `github_repo` metadata for anything but small trees on a Discord
   primary.
@@ -248,10 +247,26 @@ in each of them:
 * **Copies are server-side where possible.** Between two Telegram stores
   new uploads are copied via message forwarding — no re-upload, one API
   call per file part. Where a server-side copy is impossible (a channel
-  with "Restrict saving content", or, later, a mirror on another
-  backend) the part is streamed down and up again. `mode: auto` picks
-  the cheap path and falls back; `forward` insists on the server-side
-  copy; `reupload` never asks for one.
+  with "Restrict saving content", or a mirror on another backend) the
+  bytes are streamed down and up again. `mode: auto` picks the cheap
+  path and falls back; `forward` insists on the server-side copy;
+  `reupload` never asks for one.
+* **Mirrors with smaller messages get replicas.** A store whose messages
+  can hold the primary's parts receives an aligned copy, one message per
+  part. A store whose messages are smaller (a Discord mirror of a
+  Telegram primary: 2 GiB parts, 10 MB messages) receives a *replica*:
+  the whole version streamed through the mirror, which cuts it its own
+  way. Reads use whichever copy is available, switching layouts at the
+  byte where the previous one stopped.
+* **Slow mirrors run in the background.** With `sync: background` a
+  write records the primary copy only and queues the file; a worker per
+  file system copies it to the mirrors afterwards and commits the result
+  into the descriptor. The queue lives in `replication_queue.json` in
+  the data directory, so nothing is lost on a restart; failed items back
+  off and retry. `GET /api/replication/queue` shows what is pending,
+  `POST /api/replication/retry` retries failed items now. Use
+  `background` for any mirror that has to re-upload (Discord); `inline`
+  is fine for Telegram-to-Telegram forwarding.
 * **Reads fail over automatically.** If a part (or the whole primary
   store) becomes unavailable, downloads are served from a mirror.
 * **File descriptors are mirrored too**, and in `pinned_message` metadata
@@ -260,11 +275,14 @@ in each of them:
 * **Promotion is a config change.** Every descriptor and version written
   by TGDCFS records which store its ids belong to. When the primary is
   lost, make the mirror the `primary` and the old primary a mirror (or
-  drop it): versions the new primary holds are served from it, versions
-  it never received stay readable from the old store, and new uploads go
-  to the new primary. Metadata written by tgfs carries no store
-  information and is assumed to belong to the configured primary, so
-  run the backfill task once under TGDCFS before relying on a swap.
+  drop it): versions the new primary holds, aligned or as replicas, are
+  served from it, versions it never received stay readable from the old
+  store, and new uploads go to the new primary. The backfill task then
+  copies the versions the new primary lacks into it and re-mirrors
+  everything. Metadata written by tgfs carries no store information and
+  is assumed to belong to the configured primary, so run the backfill
+  task once under TGDCFS before relying on a swap. The runbook below has
+  the steps.
 * **Pre-existing files are covered by the backfill task**
   (`POST /api/redundancy/backfill/<filesystem>`, progress via the
   regular `/api/tasks` endpoints; add `?verify=true` to also re-mirror
@@ -280,7 +298,30 @@ Requirements: the bot(s) must be admin in every mirror channel. With
 are logged and can be closed by re-running the backfill task.
 
 When redundancy matters to you, prefer the `github_repo` metadata type:
-the directory tree then survives even the loss of *all* stores.
+the directory tree then survives even the loss of *all* stores. With
+`pinned_message` metadata a mirror only holds a pinned copy when the
+metadata blob fits one of its messages; a Discord mirror of a large
+Telegram tree does not, and promotion to it then needs `github_repo`.
+
+**Promotion runbook.** The primary store of `media` is gone (banned,
+deleted) and `tg-spare` is its mirror:
+
+1. Stop TGDCFS. Reads were already failing over to the mirror; writes
+   need the new primary.
+2. In `config.yaml` swap the roles: `primary: tg-spare`, and either keep
+   the old store in `mirrors` (if it may come back) or remove it.
+3. Start TGDCFS. Every file whose descriptor or versions live in the old
+   store is re-expressed against the new primary on first access.
+4. Run `POST /api/redundancy/backfill/media`. It copies versions the new
+   primary never received into it (when the old store is still
+   reachable and configured), mirrors everything into the remaining
+   mirrors and rewrites the descriptors. `versions_promoted` in the
+   report counts the copies made into the primary.
+5. Add a fresh mirror store and run the backfill again to restore
+   redundancy.
+
+Verify with `GET /api/filesystems` (primary, mirrors) and
+`GET /api/replication/queue` (nothing pending).
 
 **Metadata keys.** Mirror entries in the metadata are keyed by the
 store's key, `<backend prefix>:<channel id as configured>`, for example

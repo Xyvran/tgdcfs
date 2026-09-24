@@ -4,10 +4,17 @@ A :class:`MirrorGroup` binds the primary :class:`IStore` to one store
 per mirror and provides the write-side primitives used by the
 repositories:
 
-* ``mirror_parts`` copies content part messages into every mirror
-  store -- server-side when the pair of stores supports it (Telegram
-  forwarding, no re-upload bandwidth) or, otherwise, by streaming the
-  part down from the primary and uploading it into the mirror.
+* ``mirror_parts`` copies a version's content into every mirror store.
+  A store whose messages can hold the primary's parts receives an
+  *aligned* copy (one message per part, recorded in ``mirrors``):
+  server-side when the pair of stores supports it (Telegram forwarding,
+  no re-upload bandwidth), otherwise by streaming each part down and up
+  again. A store whose messages are smaller than the primary's parts (a
+  Discord mirror of a Telegram primary) receives a *replica*: the whole
+  version streamed through the store's own partitioning, recorded in
+  ``replicas`` with its own part layout.
+* ``copy_into_primary`` gives a version that still lives in a former
+  primary (the mirror was promoted) a copy in the current primary.
 * ``mirror_fd`` keeps a copy of a file descriptor (JSON text message)
   in each mirror store. Descriptors are *sent* rather than copied
   because a forwarded message cannot be edited later, and descriptors
@@ -22,20 +29,24 @@ with "restrict saving content", where forwarding is refused).
 
 Failure policy: with ``strict=False`` (default) a failing mirror write
 is logged and the affected store is simply omitted from the result --
-the primary write has already succeeded and the backfill task can close
-the gap later. With ``strict=True`` the error propagates.
+the primary write has already succeeded and the backfill task or the
+replication queue can close the gap later. With ``strict=True`` the
+error propagates.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.errors import MessageNotFound, TechnicalError
-from tgdcfs.reqres import FileMessageFromStream
+from tgdcfs.reqres import FileMessageFromStream, Replica
+
+if TYPE_CHECKING:
+    from tgdcfs.core.model import TGFSFileVersion
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +64,24 @@ class MirrorStore:
     # name, which may be renamed.
     key: str
     store: IStore
+
+
+@dataclass
+class MirrorResult:
+    """Copies made by one ``mirror_parts`` call, per store key."""
+
+    # Aligned copies: ids in the same order as the source parts.
+    mirrors: Dict[str, List[int]] = field(default_factory=dict)
+    # Re-partitioned copies with their own layout.
+    replicas: Dict[str, Replica] = field(default_factory=dict)
+
+    @property
+    def store_keys(self) -> List[str]:
+        return list(self.mirrors) + list(self.replicas)
+
+    def apply_to(self, version: "TGFSFileVersion") -> None:
+        version.mirrors.update(self.mirrors)
+        version.replicas.update(self.replicas)
 
 
 class MirrorGroup:
@@ -73,6 +102,10 @@ class MirrorGroup:
         self._primary_dead_until = 0.0
 
     @property
+    def primary(self) -> IStore:
+        return self._primary
+
+    @property
     def mode(self) -> MirrorMode:
         return self._mode
 
@@ -85,6 +118,9 @@ class MirrorGroup:
         return [ch.key for ch in self._stores]
 
     def store_for(self, key: str) -> Optional[IStore]:
+        """The store behind ``key``: a mirror, or the primary itself."""
+        if key == self._primary.key:
+            return self._primary
         ch = self._by_key.get(key)
         return ch.store if ch else None
 
@@ -98,42 +134,107 @@ class MirrorGroup:
 
     # -- content parts -----------------------------------------------------
 
-    def missing_stores(self, mirrors: Dict[str, List[int]], n_parts: int) -> List[str]:
-        """Mirror stores for which a version has no complete copy."""
-        res = []
-        for key in self.store_keys:
-            ids = mirrors.get(key)
-            if not ids or len(ids) != n_parts or any(mid <= 0 for mid in ids):
-                res.append(key)
-        return res
+    def missing_stores(self, version: "TGFSFileVersion") -> List[str]:
+        """Mirror stores that hold no complete copy of ``version``."""
+        return [key for key in self.store_keys if not version.has_copy_in(key)]
 
     async def mirror_parts(
         self,
         message_ids: List[int],
+        part_sizes: Optional[List[int]] = None,
         only_stores: Optional[List[str]] = None,
-    ) -> Dict[str, List[int]]:
-        """Copy the given primary part messages into the mirror stores.
+        source: Optional[IStore] = None,
+    ) -> MirrorResult:
+        """Copy the given parts into the mirror stores.
 
-        Returns ``{store_key: [mirror message ids]}`` for every store
-        that succeeded, aligned with ``message_ids``.
+        ``message_ids`` name messages of ``source`` (the primary unless
+        given). ``part_sizes`` decide whether a store gets an aligned copy
+        or a replica; when omitted they are looked up from the source.
+        Returns the copies per store that succeeded.
         """
-        res: Dict[str, List[int]] = {}
+        res = MirrorResult()
+        if not message_ids:
+            return res
+        source = source or self._primary
+        sizes = part_sizes
         for ch in self._stores:
             if only_stores is not None and ch.key not in only_stores:
                 continue
+            if ch.store is source:
+                continue
             try:
-                res[ch.key] = await self._copy_to(ch, message_ids)
+                if sizes is None or len(sizes) != len(message_ids):
+                    sizes = await self._part_sizes(source, message_ids)
+                if self._fits_aligned(ch.store, source, sizes):
+                    res.mirrors[ch.key] = await self._copy_to(ch, source, message_ids)
+                else:
+                    res.replicas[ch.key] = await self._replicate(
+                        ch, source, message_ids, sizes
+                    )
             except Exception as ex:
                 self._handle_write_error(ch.key, "content parts", ex)
         return res
 
-    async def _copy_to(self, target: MirrorStore, message_ids: List[int]) -> List[int]:
-        """Copy primary messages into ``target`` according to ``mode``."""
+    async def copy_into_primary(self, version: "TGFSFileVersion") -> bool:
+        """Copy a version that lives in a former primary into the current one.
+
+        Returns whether the version now has its primary layout in the
+        current primary. Nothing happens for versions the primary already
+        owns or whose old store is not configured anymore.
+        """
+        if version.owned_by(self._primary.key) or version.store is None:
+            return version.owned_by(self._primary.key)
+        source = self.store_for(version.store)
+        if source is None:
+            logger.warning(
+                f"Cannot copy version {version.id} into the primary: its store "
+                f"{version.store} is not configured"
+            )
+            return False
+        sizes = version.part_sizes
+        if len(sizes) != len(version.message_ids):
+            sizes = await self._part_sizes(source, version.message_ids)
+        target = MirrorStore(key=self._primary.key, store=self._primary)
+        if self._fits_aligned(self._primary, source, sizes):
+            ids = await self._copy_to(target, source, version.message_ids)
+            version.mirrors[self._primary.key] = ids
+        else:
+            version.replicas[self._primary.key] = await self._replicate(
+                target, source, version.message_ids, sizes
+            )
+        version.part_sizes = list(sizes)
+        version.relocate(self._primary.key)
+        return version.owned_by(self._primary.key)
+
+    @staticmethod
+    def _fits_aligned(target: IStore, source: IStore, part_sizes: List[int]) -> bool:
+        """Whether every source part fits one message of ``target``.
+
+        Same-backend copies are always aligned (a server-side copy keeps
+        the message as it is); otherwise the target's part limit decides.
+        """
+        if target.backend == source.backend:
+            return True
+        return max(part_sizes, default=0) <= target.caps.max_part_bytes
+
+    async def _part_sizes(self, source: IStore, message_ids: List[int]) -> List[int]:
+        messages = await source.get_messages(message_ids)
+        sizes: List[int] = []
+        for mid, message in zip(message_ids, messages):
+            if not message or not message.document:
+                raise MessageNotFound(message_id=mid)
+            sizes.append(message.document.size)
+        return sizes
+
+    async def _copy_to(
+        self, target: MirrorStore, source: IStore, message_ids: List[int]
+    ) -> List[int]:
+        """Aligned copy of ``source`` messages into ``target`` per ``mode``."""
         if not message_ids:
             return []
         if self._mode != "reupload":
             try:
-                ids = await target.store.copy_from(self._primary, message_ids)
+                ids = await target.store.copy_from(source, message_ids)
             except Exception as ex:
                 if self._mode == "forward":
                     raise
@@ -147,25 +248,24 @@ class MirrorGroup:
             if self._mode == "forward":
                 raise TechnicalError(
                     f"Store {target.key} cannot receive server-side copies from "
-                    f"{self._primary.key}; use mode 'auto' or 'reupload'"
+                    f"{source.key}; use mode 'auto' or 'reupload'"
                 )
-        return [await self._reupload_one(target, mid) for mid in message_ids]
+        return [await self._reupload_one(target, source, mid) for mid in message_ids]
 
-    async def _reupload_one(self, target: MirrorStore, message_id: int) -> int:
-        """Bandwidth-bound fallback: stream a part down and up again.
+    async def _reupload_one(
+        self, target: MirrorStore, source: IStore, message_id: int
+    ) -> int:
+        """Bandwidth-bound aligned copy: stream one part down and up again.
 
         Bytes are copied verbatim -- this sits below the encryption
-        decorator, so ciphertext stays ciphertext. The target partitions
-        the bytes itself; until replicas with their own part layout exist
-        (see the architecture plan), a part must land in exactly one
-        message of the target, which holds whenever the target's part
-        limit is at least the primary's.
+        decorator, so ciphertext stays ciphertext. The caller has checked
+        that the part fits one message of the target.
         """
-        message = (await self._primary.get_messages([message_id]))[0]
+        message = (await source.get_messages([message_id]))[0]
         if not message or not message.document:
             raise MessageNotFound(message_id=message_id)
         size = message.document.size
-        resp = await self._primary.download_file(message_id, 0, size - 1)
+        resp = await source.download_file(message_id, 0, size - 1)
         sent = await target.store.upload(
             FileMessageFromStream.new(
                 stream=resp.chunks, size=size, name=f"part-{message_id}"
@@ -174,10 +274,51 @@ class MirrorGroup:
         if len(sent) != 1:
             raise TechnicalError(
                 f"Store {target.key} split the {size}-byte part {message_id} into "
-                f"{len(sent)} messages; mirrors with a different part layout are "
-                f"not supported yet"
+                f"{len(sent)} messages although it reported room for it"
             )
         return sent[0].message_id
+
+    async def _replicate(
+        self,
+        target: MirrorStore,
+        source: IStore,
+        message_ids: List[int],
+        part_sizes: List[int],
+    ) -> Replica:
+        """Re-partitioned copy: stream the whole version through the target.
+
+        The target cuts the byte stream at its own part size; the result
+        is a replica with the target's layout.
+        """
+        total = sum(part_sizes)
+
+        async def content() -> AsyncGenerator[bytes, None]:
+            for mid, size in zip(message_ids, part_sizes):
+                if size <= 0:
+                    continue
+                resp = await source.download_file(mid, 0, size - 1)
+                try:
+                    async for chunk in resp.chunks:
+                        yield chunk
+                finally:
+                    if (aclose := getattr(resp.chunks, "aclose", None)) is not None:
+                        await aclose()
+
+        stream = content()
+        try:
+            sent = await target.store.upload(
+                FileMessageFromStream.new(
+                    stream=stream, size=total, name=f"replica-{message_ids[0]}"
+                )
+            )
+        finally:
+            # The target reads exactly ``total`` bytes and leaves the
+            # generator suspended; close it so its downloads are released.
+            await stream.aclose()
+        return Replica(
+            message_ids=[m.message_id for m in sent],
+            part_sizes=[m.size for m in sent],
+        )
 
     # -- file descriptors --------------------------------------------------
 
@@ -219,11 +360,30 @@ class MirrorGroup:
         The metadata blob is copied (preserving encryption), pinned, and
         the previous copy is deleted. ``state`` maps store key to the
         current metadata message id in that store and is updated in
-        place.
+        place. The blob fits one message of every store, the metadata
+        repository checks that before writing it.
         """
+        size: Optional[int] = None
         for ch in self._stores:
             try:
-                new_id = (await self._copy_to(ch, [primary_message_id]))[0]
+                if ch.store.backend != self._primary.backend:
+                    if size is None:
+                        size = (
+                            await self._part_sizes(self._primary, [primary_message_id])
+                        )[0]
+                    if size > ch.store.caps.max_part_bytes:
+                        # A pinned copy has to be one message; a store with
+                        # smaller messages cannot hold it. Content and
+                        # descriptors are still mirrored, only promotion
+                        # needs the github_repo metadata type then.
+                        logger.warning(
+                            f"The metadata blob ({size} bytes) does not fit one "
+                            f"message of mirror store {ch.key}; no pinned copy there"
+                        )
+                        continue
+                new_id = (await self._copy_to(ch, self._primary, [primary_message_id]))[
+                    0
+                ]
                 await ch.store.pin_message(new_id)
                 if (old := state.get(ch.key)) and old != new_id:
                     await ch.store.delete_messages([old], force=True)

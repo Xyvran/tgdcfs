@@ -696,10 +696,10 @@ class FilesystemConfig:
     when the pair of stores allows it and re-uploads otherwise,
     ``forward`` insists on the server-side copy, ``reupload`` never asks
     for one. ``sync`` says whether mirroring happens inside the write
-    (``inline``) or from a background queue (``background``; accepted
-    already, but it behaves like ``inline`` until the replication queue
-    exists). ``strict`` fails the write when a mirror write fails and
-    therefore requires ``inline``.
+    (``inline``) or from a persistent background queue (``background``,
+    the right choice when a mirror has to re-upload, e.g. into Discord).
+    ``strict`` fails the write when a mirror write fails and therefore
+    requires ``inline``.
     """
 
     name: str
@@ -741,12 +741,6 @@ class FilesystemConfig:
             raise ValueError(
                 f"filesystems.{name}: 'strict: true' requires 'sync: inline'"
             )
-        if sync == "background":
-            logger.warning(
-                f"filesystems.{name}: 'sync: background' is not implemented yet, "
-                f"mirroring runs inline"
-            )
-
         metadata_data: MetadataConfigDict = {
             "name": name,
             "type": MetadataType.PINNED_MESSAGE.value,
@@ -885,6 +879,10 @@ class Config:
                 if fs := self.filesystem_for_store(store.name):
                     return fs
         return None
+
+    @property
+    def replication_queue_file(self) -> str:
+        return expand_path("replication_queue.json")
 
     @property
     def uses_backend(self) -> Dict[str, bool]:

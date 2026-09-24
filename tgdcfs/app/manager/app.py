@@ -12,13 +12,16 @@ from tgdcfs.config import Config
 from tgdcfs.core import Clients
 from tgdcfs.core.backfill import backfill_mirrors, count_files, create_backfill_task
 from tgdcfs.core.ops import Ops
+from tgdcfs.core.replication import ReplicationQueue
 from tgdcfs.reqres import MessageRespWithDocument
 from tgdcfs.tasks import task_store
 
 logger = logging.getLogger(__name__)
 
 
-def create_manager_app(clients: Clients, config: Config) -> FastAPI:
+def create_manager_app(
+    clients: Clients, config: Config, replication: Optional[ReplicationQueue] = None
+) -> FastAPI:
     ops = {name: Ops(client) for name, client in clients.items()}
 
     def get_name_by_channel_id(channel_id: int) -> Optional[str]:
@@ -119,6 +122,27 @@ def create_manager_app(clients: Clients, config: Config) -> FastAPI:
         if not await task_store.remove_task(task_id):
             raise HTTPException(status_code=404, detail="Task not found")
         return {"message": "Task deleted successfully"}
+
+    @app.get("/replication/queue")
+    async def get_replication_queue():
+        """Files waiting for background replication, per file system."""
+        if replication is None:
+            return {}
+        return replication.to_dict()
+
+    @app.post("/replication/retry")
+    async def retry_replication(
+        filesystem: Optional[str] = Query(
+            None, description="Retry only this file system's queue"
+        )
+    ):
+        """Clear the backoff of failed items so the workers retry them now."""
+        if replication is None:
+            raise HTTPException(status_code=400, detail="No replication queue")
+        if filesystem is not None and filesystem not in clients:
+            raise HTTPException(status_code=404, detail="Unknown file system")
+        replication.retry_now(filesystem)
+        return {"message": "Retry scheduled"}
 
     @app.get("/redundancy")
     async def get_redundancy():

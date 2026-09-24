@@ -1,6 +1,15 @@
 from typing import Dict, List, Literal, TypedDict
 
 
+class ReplicaSerialized(TypedDict, total=False):
+    # Message ids as a JSON list, or packed (``mb``) when there are many.
+    m: List[int]
+    mb: str
+    # Part sizes: the full list, or ``[common, last]`` with ``n`` parts.
+    p: List[int]
+    n: int
+
+
 class TGFSFileVersionSerialized(TypedDict, total=False):
     type: Literal["FV"]
     id: str
@@ -13,6 +22,9 @@ class TGFSFileVersionSerialized(TypedDict, total=False):
     # the same order as messageIds. Absent when redundancy is not in use,
     # so pre-redundancy metadata parses unchanged.
     mirrors: Dict[str, List[int]]
+    # Store key -> copy of the version with that store's own part layout.
+    # Absent when no such copy exists.
+    replicas: Dict[str, ReplicaSerialized]
     # Store key that messageIds belong to. Absent for versions written by
     # tgfs (they belong to the configured primary).
     store: str

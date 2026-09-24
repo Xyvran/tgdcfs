@@ -10,6 +10,8 @@ from tgdcfs.config import (
 )
 from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
+from tgdcfs.core.model import TGFSFileRef
+from tgdcfs.core.replication import ReplicationQueue, file_path
 from tgdcfs.core.repository.impl import (
     PinnedMessageMetadataRepository,
     StoreFDRepository,
@@ -64,8 +66,13 @@ class Client:
         config: Config,
         store_factory: StoreFactory,
         encryption_cfg: Optional[EncryptionConfig] = None,
+        replication: Optional[ReplicationQueue] = None,
     ) -> "Client":
         store = await store_factory(config.stores[filesystem.primary])
+        inline = filesystem.sync == "inline" or replication is None
+        read_preference = [
+            config.stores[name].key for name in filesystem.read_preference
+        ]
 
         # One store per mirror; the serialization key is the store's key
         # (backend prefix + channel id as configured), stable across
@@ -88,7 +95,10 @@ class Client:
             )
 
         fc_repo: IFileContentRepository = StoreFileContentRepository(
-            store, mirror_group=mirror_group
+            store,
+            mirror_group=mirror_group,
+            inline_mirroring=inline,
+            read_preference=read_preference,
         )
 
         # Wrap the file-content repository in an encryption decorator if
@@ -143,7 +153,24 @@ class Client:
         metadata_api = MetaDataApi(metadata_repo)
         await metadata_api.init()
 
-        file_api = FileApi(metadata_api, fd_api, store, mirror_group=mirror_group)
+        on_written = None
+        if not inline and mirror_group is not None and replication is not None:
+            queue = replication
+            name = filesystem.name
+
+            async def enqueue(fr: TGFSFileRef) -> None:
+                queue.enqueue(name, file_path(fr))
+
+            on_written = enqueue
+
+        file_api = FileApi(
+            metadata_api,
+            fd_api,
+            store,
+            mirror_group=mirror_group,
+            inline_mirroring=inline,
+            on_written=on_written,
+        )
         dir_api = DirectoryApi(metadata_api, file_api, store)
 
         return cls(

@@ -1,7 +1,8 @@
 # tgdcfs: Architecture and Implementation Plan
 
-Status: phases 0 to 2 implemented (see "Progress" at the end), phases
-3 and 4 planned. This document plans how to build tgdcfs as a new
+Status: phases 0 to 3 implemented (see "Progress" at the end); of
+phase 4 the runbook, the endpoints and the docs are in, the config
+generator and the manager UI are not. This document plans how to build tgdcfs as a new
 project: the tgfs code base as the main part, plus Discord as a second
 storage backend that can be configured next to Telegram, either as the
 primary store or as a mirror, in both directions.
@@ -635,3 +636,40 @@ a Telegram mirror of a Discord primary (a Discord part always fits a
 Telegram message). What waits for phase 3: a Discord mirror of a
 Telegram primary, because a 2 GiB part has to become many Discord
 messages (replicas with their own part layout).
+
+### Phase 3 (done)
+
+* `TGFSFileVersion.replicas`: copies with their own part layout,
+  serialized compactly (`m`/`mb`, `p` as `[common, last]` plus `n`).
+  `mirrors` stays the aligned case. Relocation after a promotion turns
+  a replica in the new primary into the primary layout and the old
+  layout into a replica.
+* `MirrorGroup.mirror_parts` decides per store: same backend or parts
+  that fit one message give an aligned copy, otherwise the whole
+  version is streamed through the target (`_replicate`).
+  `copy_into_primary` gives a version of a former primary a copy in the
+  current one; the backfill calls it and counts `versions_promoted`.
+* Reads (`StoreFileContentRepository.get`) work on layouts: the
+  primary layout with per-part failover across aligned copies, then
+  every replica, resuming at the byte where the previous layout
+  stopped. `read_preference` reorders them. Validation
+  (`StoreFDRepository._validate_fv`) accepts a version whose aligned
+  copies are gone when a replica is complete.
+* `tgdcfs/core/replication.py`: persistent `ReplicationQueue`
+  (`replication_queue.json`) and one `ReplicationWorker` per file
+  system with `sync: background`; the write path records the primary
+  copy and queues the file, the worker runs the backfill's per-file
+  unit of work. Manager: `GET /replication/queue`,
+  `POST /replication/retry`.
+* A pinned metadata copy is skipped for a mirror whose messages cannot
+  hold the blob (content and descriptors are still mirrored).
+
+### Phase 4 (partly done)
+
+Done: promotion runbook and mirroring docs in the README, `/stores`,
+`/filesystems` and replication endpoints, example configs, NOTICE.
+Not done: the config generator and the getting-started page in
+`tgdcfs-gh-pages` still describe the tgfs layout (Telegram only), and
+the manager UI has no view for the replication queue. Both are
+frontend work in the Next.js app and can follow independently of the
+server.

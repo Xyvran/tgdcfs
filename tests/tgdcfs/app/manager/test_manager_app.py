@@ -87,6 +87,33 @@ class TestManagerApp:
             }
         }
 
+    def test_replication_queue_endpoints(self, mock_clients, mock_config):
+        from tgdcfs.core.replication import ReplicationQueue
+
+        queue = ReplicationQueue(None)
+        queue.enqueue("Test-Channel", "/a.bin")
+        queue.failed("Test-Channel", "/a.bin", "boom")
+        client = TestClient(
+            create_manager_app(mock_clients, mock_config, replication=queue)
+        )
+
+        response = client.get("/replication/queue")
+        assert response.status_code == 200
+        [item] = response.json()["Test-Channel"]
+        assert item["path"] == "/a.bin" and item["attempts"] == 1
+
+        assert queue.ready("Test-Channel") == []
+        assert (
+            client.post("/replication/retry?filesystem=Test-Channel").status_code == 200
+        )
+        assert [i.path for i in queue.ready("Test-Channel")] == ["/a.bin"]
+        assert client.post("/replication/retry?filesystem=nope").status_code == 404
+
+    def test_replication_endpoints_without_a_queue(self, mock_clients, mock_config):
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+        assert client.get("/replication/queue").json() == {}
+        assert client.post("/replication/retry").status_code == 400
+
     def test_get_redundancy_without_mirrors(self, mock_clients, mock_config):
         client = TestClient(create_manager_app(mock_clients, mock_config))
 
