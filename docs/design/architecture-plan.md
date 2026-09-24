@@ -83,19 +83,20 @@ Consequences:
 
 ### 3.1 Repository
 
-* Create `tgdcfs` from the tgfs history, not from a file copy: `git clone
-  tgfs`, add the new origin, push. The full history keeps `git blame`
-  useful and lets future tgfs fixes be cherry-picked (`git remote add
-  upstream .../tgfs`).
-* Rename the Python package from `tgfs` to `tgdcfs` in one mechanical
-  commit right at the start (imports, `TGFS_*` environment variables,
-  `~/.tgfs` data dir, Docker user, `TGFS` realm strings, docs). Doing it
-  later means every branch in between conflicts with it. Keep the class
+* Create `tgdcfs` as a flat copy of the tgfs working tree (master at
+  the time of the copy) with one initial commit. The tgfs history is
+  not carried over; the initial commit message records the tgfs commit
+  hash the copy was taken from, so later tgfs fixes can be ported as
+  patches (`git format-patch` from tgfs, `sed 's#/tgfs/#/tgdcfs/#'`,
+  `git am`). Keep the module layout of tgfs so those patches apply.
+* Rename the Python package from `tgfs` to `tgdcfs` in the same
+  initial step (imports, `TGFS_*` environment variables, `~/.tgfs`
+  data dir, Docker user, `TGFS` realm strings, docs). Keep the class
   prefix `TGFS` in the model (`TGFSFileDesc`, ...) for now; renaming
   those touches the serialized `type` tags in metadata and buys nothing.
-* Keep the module layout of tgfs so upstream patches still apply after a
-  path rewrite (`git format-patch` from tgfs, `sed 's#/tgfs/#/tgdcfs/#'`,
-  `git am`).
+* Not copied: `tgfs.png`, the tgfs-specific badges and the GitHub Pages
+  URL in the README; the `tgfs-gh-pages` frontend is copied as
+  `tgdcfs-gh-pages` and gets its own Pages deployment in phase 4.
 * Environment variables become `TGDCFS_DATA_DIR`, `TGDCFS_CONFIG_FILE`,
   `TGDCFS_MASTER_PASSPHRASE`. Accept the old `TGFS_*` names as fallback
   for one release, with a deprecation log line.
@@ -107,6 +108,14 @@ Consequences:
 * GitHub Actions: copy `test.yml`, `docker-publish.yml`,
   `docker-preview.yml`, `gh-pages.yml`; image names `xyvran/tgdcfs` and
   `xyvran/tgdcfs-fe`.
+* The build pipeline has to be set up again for the new repository,
+  nothing carries over from tgfs: create the Docker Hub repositories
+  `xyvran/tgdcfs` and `xyvran/tgdcfs-fe`, add the `DOCKERHUB_USERNAME`
+  and `DOCKERHUB_TOKEN` secrets, enable GitHub Pages for the frontend,
+  and run the multi-arch build (linux/amd64 + linux/arm64) once by hand
+  (`workflow_dispatch`) before the first tag. Existing tgfs deployments
+  (web1, Jellyfin on Hetzner, the home PVE server) keep the `xyvran/tgfs`
+  image until they are switched to `xyvran/tgdcfs` deliberately.
 * Dockerfile: identical to tgfs apart from the package name, the user
   (`tgdcfs`) and the data dir.
 * Keep `docs/design/` and add this document, later one design doc per
@@ -503,9 +512,10 @@ validation endpoint; README sections for stores, file systems, Discord
 setup, limits and the promotion procedure; getting-started page; example
 configs; manager UI for queue and backfill progress.
 
-**Phase 5: optional.** FTP and SMB from dcfs; multi-attachment Discord
-messages; Discord forward as a `ForwardReplicator` if the spike shows
-copies are independent; further backends.
+**Phase 5: optional, not planned.** Multi-attachment Discord messages;
+Discord forward as a `ForwardReplicator` if the spike shows copies are
+independent; further backends. FTP and SMB from dcfs are explicitly out
+of scope for now.
 
 ## 8. Risks and open points
 
@@ -527,19 +537,16 @@ copies are independent; further backends.
   carry message ids as strings.
 * **Memory per Discord upload.** One part (10 to 100 MB) per concurrent
   upload is buffered in memory; bound the concurrency per store.
-* **Package rename vs. upstream tracking.** A renamed package makes
-  cherry-picks from tgfs a path rewrite away instead of a plain
-  cherry-pick. Accepted for a clean project; the alternative (keep the
-  `tgfs` package name inside tgdcfs) is cheaper for tracking but
-  confusing for users and Docker images.
+* **Package rename and flat copy vs. upstream tracking.** A renamed
+  package in a repository without the tgfs history means tgfs fixes are
+  ported as patches with a path rewrite instead of cherry-picks.
+  Accepted for a clean project.
 
-Decisions needed before phase 0:
+Decisions taken (2026-09-24):
 
-1. Rename the package to `tgdcfs` (recommended) or keep `tgfs` as the
-   package name for easier upstream tracking.
-2. Start from the tgfs history (recommended) or from a flat copy with
-   one initial commit.
-3. Default `sync` for cross-backend pairs: `background` (recommended)
-   or `inline` with `strict: false`.
-4. Whether phase 5 items (FTP, SMB) are wanted at all; they decide if
-   the dcfs `app/` code is worth keeping in sight while porting.
+1. The package is named `tgdcfs`.
+2. The repository starts from a flat copy of tgfs with one initial
+   commit, not from the tgfs history. Build artefacts (Docker images,
+   Pages) are set up fresh for the new repository, see section 3.2.
+3. Cross-backend replication defaults to `sync: background`.
+4. FTP and SMB from dcfs are not ported for now.
