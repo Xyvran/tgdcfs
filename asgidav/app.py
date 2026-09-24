@@ -1,0 +1,336 @@
+import asyncio
+import logging
+from collections.abc import Awaitable
+from http import HTTPStatus
+from typing import Callable, Optional
+from urllib.parse import unquote, urlparse
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
+
+from .folder import Folder
+from .member import Member
+from .reqres import PropfindRequest, propfind
+from .resource import Resource
+
+logger = logging.getLogger(__name__)
+
+
+def split_path(path: str) -> tuple[str, str]:
+    path = path.strip("/")
+    parts = path.rsplit("/", 1)
+    if len(parts) == 1:
+        return "/", parts[0]
+    return parts[0], parts[1]
+
+
+def extract_path_from_destination(destination: str) -> str:
+    if destination.startswith(("http://", "https://")):
+        parsed = urlparse(destination)
+        path = parsed.path
+    else:
+        path = destination
+    return unquote(path)
+
+
+METHODS = frozenset(
+    {
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "OPTIONS",
+        "PROPFIND",
+        "COPY",
+        "MOVE",
+        "MKCOL",
+        "LOCK",
+        "UNLOCK",
+    }
+)
+
+
+def create_app(
+    get_member: Callable[[str], Awaitable[Optional[Member]]],
+    base_path: str = "",
+) -> FastAPI:
+    async def root() -> Folder:
+        res = await get_member("/")
+        if not res or not isinstance(res, Folder):
+            raise ValueError("/ is not a Folder")
+        return res
+
+    common_headers = {
+        "DAV": "1, 2",
+        "MS-Author-Via": "DAV",
+    }
+
+    NOT_FOUND = Response(status_code=HTTPStatus.NOT_FOUND, headers=common_headers)
+    CREATED = Response(status_code=HTTPStatus.CREATED.value, headers=common_headers)
+    NO_CONTENT = Response(status_code=HTTPStatus.NO_CONTENT, headers=common_headers)
+
+    def CONFLICT(detail: str) -> Response:
+        return Response(status_code=HTTPStatus.CONFLICT, content=detail)
+
+    def BAD_REQUEST(detail: str) -> Response:
+        return Response(status_code=HTTPStatus.BAD_REQUEST, content=detail)
+
+    def FORBIDDEN(detail: str) -> Response:
+        return Response(status_code=HTTPStatus.FORBIDDEN, content=detail)
+
+    def PRECONDITION_FAILED(detail: str) -> Response:
+        return Response(status_code=HTTPStatus.PRECONDITION_FAILED, content=detail)
+
+    def mount_relative(server_path: str) -> str:
+        """Map a server path (e.g. from ``Destination``) onto a route path.
+
+        The routes see paths relative to where this app is mounted, while a
+        ``Destination`` header carries the whole server path.
+        """
+        base = base_path.rstrip("/")
+        if base and (server_path == base or server_path.startswith(f"{base}/")):
+            server_path = server_path[len(base) :]
+        return server_path.strip("/")
+
+    def is_within(path: str, other: str) -> bool:
+        """True when ``path`` is ``other`` or lives somewhere below it."""
+        return path == other or path.startswith(f"{other}/")
+
+    app = FastAPI()
+
+    @app.options(path="/{path:path}")
+    async def options():
+        return Response(
+            status_code=HTTPStatus.OK,
+            headers=common_headers
+            | {
+                "Allow": ", ".join(METHODS),
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    @app.api_route("/{path:path}", methods=["PROPFIND"])
+    async def handle_propfind(request: Request, path: str):
+        r = await PropfindRequest.from_request(request)
+        if member := await get_member(path):
+            resp = await propfind((member,), r.depth, r.props, base_path)
+            return Response(
+                resp,
+                status_code=HTTPStatus.MULTI_STATUS,
+                media_type="application/xml; charset=utf-8",
+                headers=common_headers
+                | {"Content-Type": "application/xml; charset=utf-8"},
+            )
+        return NOT_FOUND
+
+    @app.head("/{path:path}")
+    async def head(request: Request, path: str):
+        if member := await get_member(path):
+            if isinstance(member, Folder):
+                return Response(
+                    status_code=HTTPStatus.OK,
+                    headers=common_headers
+                    | {
+                        "Content-Type": "httpd/unix-directory",
+                        "Last-Modified": str(await member.last_modified()),
+                        "Accept-Ranges": "none",
+                    },
+                )
+            content_length, content_type, last_modified = await asyncio.gather(
+                member.content_length(),
+                member.content_type(),
+                member.last_modified(),
+            )
+            return Response(
+                status_code=HTTPStatus.OK,
+                headers=common_headers
+                | {
+                    "Content-Type": content_type,
+                    "Content-Length": str(content_length),
+                    "Last-Modified": str(last_modified),
+                },
+            )
+        return NOT_FOUND
+
+    @app.get("/{path:path}")
+    async def get(request: Request, path: str):
+        begin, end = 0, -1
+        is_range_request = False
+
+        if "Range" in request.headers:
+            range_header = request.headers["Range"]
+            if range_header.startswith("bytes="):
+                is_range_request = True
+                range_value = range_header[len("bytes=") :]
+                if "-" in range_value:
+                    begin_str, end_str = range_value.split("-", 1)
+                    if begin_str:
+                        begin = int(begin_str.strip())
+                    if end_str:
+                        end = int(end_str.strip())
+                else:
+                    begin = int(range_value)
+
+        if member := await get_member(path):
+            if isinstance(member, Resource):
+                content, media_type, last_modified, content_length = (
+                    await asyncio.gather(
+                        member.get_content(begin, end),
+                        member.content_type(),
+                        member.last_modified(),
+                        member.content_length(),
+                    )
+                )
+
+                headers = {
+                    "Last-Modified": str(last_modified),
+                    "Accept-Ranges": "bytes",
+                }
+
+                if is_range_request:
+                    # Clients do ask past the end of a file; the body stops
+                    # at the last byte that exists, so the headers have to
+                    # describe that and not what was asked for.
+                    actual_end = min(
+                        end if end != -1 else content_length - 1,
+                        content_length - 1,
+                    )
+                    headers["Content-Range"] = (
+                        f"bytes {begin}-{actual_end}/{content_length}"
+                    )
+                    headers["Content-Length"] = str(max(0, actual_end - begin + 1))
+                    status_code = HTTPStatus.PARTIAL_CONTENT
+                else:
+                    # Without a length, a client cannot tell a finished
+                    # download from a truncated one -- and tools that open
+                    # several ranges at once need it to plan them.
+                    headers["Content-Length"] = str(content_length)
+                    status_code = HTTPStatus.OK
+
+                return StreamingResponse(
+                    content=content,
+                    status_code=status_code,
+                    media_type=media_type,
+                    headers=headers,
+                )
+
+            raise ValueError("Expected a Resource, got a Folder")
+
+        return NOT_FOUND
+
+    @app.put("/{path:path}")
+    async def put(request: Request, path: str):
+        content_length = request.headers.get("Content-Length", "0")
+        size = int(content_length)
+        if not (member := await get_member(path)):
+            member = await (await root()).create_empty_resource(path)
+        if isinstance(member, Resource):
+            if size > 0:
+                await member.overwrite(request.stream(), size=size)
+            return CREATED
+        return CONFLICT("Cannot PUT to a directory")
+
+    @app.delete("/{path:path}")
+    async def delete(request: Request, path: str):
+        if member := await get_member(path):
+            await member.remove()
+            return NO_CONTENT
+        return NOT_FOUND
+
+    @app.api_route("/{path:path}", methods=["MKCOL"])
+    async def mkcol(request: Request, path: str):
+        parent_path, folder_name = split_path(path)
+        if parent := await get_member(parent_path):
+            if not isinstance(parent, Folder):
+                return CONFLICT(f"Parent {parent_path} is not a folder.")
+            if member := await parent.member(folder_name):
+                if isinstance(member, Folder):
+                    return CREATED
+                return CONFLICT(f"Resource {path} is a file.")
+            await parent.create_folder(folder_name)
+            return CREATED
+        return CONFLICT(f"Parent folder {parent_path} does not exist.")
+
+    async def transfer(request: Request, path: str, verb: str) -> Response:
+        """Shared body of COPY and MOVE (RFC 4918 9.8 and 9.9).
+
+        Both create ``Destination``, so both answer the same way when
+        something stands in its way; they only differ in what happens to
+        the source afterwards.
+        """
+        destination = request.headers.get("Destination")
+        if not destination:
+            return BAD_REQUEST(f"Destination header is required for {verb}.")
+        if not (member := await get_member(path)):
+            return NOT_FOUND
+
+        dest_path = extract_path_from_destination(destination)
+        source, target = path.strip("/"), mount_relative(dest_path)
+        if source == target:
+            return FORBIDDEN("Source and destination are the same.")
+        if is_within(target, source):
+            done = "moved" if verb == "MOVE" else "copied"
+            return CONFLICT(f"{path} cannot be {done} into itself.")
+        if is_within(source, target):
+            # Overwriting an ancestor would delete the source along with it.
+            return CONFLICT(f"{path} cannot replace one of its own parents.")
+
+        parent_path, _ = split_path(target)
+        if not isinstance(await get_member(parent_path), Folder):
+            return CONFLICT(f"Parent folder {parent_path} does not exist.")
+
+        # An existing destination is replaced unless the client sent
+        # "Overwrite: F". Clients that save by writing a temporary file and
+        # renaming it over the original rely on this.
+        existing = await get_member(target)
+        if existing is not None:
+            if request.headers.get("Overwrite", "T").strip().upper() == "F":
+                return PRECONDITION_FAILED(f"{target} already exists.")
+            await existing.remove()
+
+        if verb == "MOVE":
+            await member.move_to(dest_path)
+        else:
+            await member.copy_to(dest_path)
+        return NO_CONTENT if existing is not None else CREATED
+
+    @app.api_route("/{path:path}", methods=["COPY"])
+    async def copy(request: Request, path: str):
+        return await transfer(request, path, "COPY")
+
+    @app.api_route("/{path:path}", methods=["MOVE"])
+    async def move(request: Request, path: str):
+        return await transfer(request, path, "MOVE")
+
+    @app.api_route("/{full_path:path}", methods=["LOCK"])
+    async def lock_handler(full_path: str):
+        LOCK_TOKEN = "opaquelocktoken:dummy-lock-id"  # noqa: S105
+
+        return Response(
+            status_code=200,
+            headers={
+                "Content-Type": "application/xml",
+                "Lock-Token": f"<{LOCK_TOKEN}>",
+            },
+            content=f"""
+            <D:prop xmlns:D="DAV:">
+                <D:lockdiscovery>
+                    <D:activelock>
+                        <D:locktype><D:write/></D:locktype>
+                        <D:lockscope><D:exclusive/></D:lockscope>
+                        <D:depth>Infinity</D:depth>
+                        <D:owner><D:href>/</D:href></D:owner>
+                        <D:timeout>Second-3600</D:timeout>
+                        <D:locktoken><D:href>{LOCK_TOKEN}</D:href></D:locktoken>
+                    </D:activelock>
+                </D:lockdiscovery>
+            </D:prop>
+            """.strip(),
+        )
+
+    @app.api_route("/{full_path:path}", methods=["UNLOCK"])
+    async def unlock_handler(full_path: str):
+        return Response(status_code=204)
+
+    return app

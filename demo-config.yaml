@@ -1,0 +1,162 @@
+telegram:
+  api_id: hidden
+  api_hash: hidden
+  bot:
+    session_file: bot.session
+    tokens:
+      - hidden
+  private_file_channel: 'tgdcfsdemo'
+  lib: pyrogram
+  # When ``true``, removing a file (or directory) through TGDCFS also issues
+  # ``messages.deleteMessages`` for every backing message in the channel:
+  # the JSON file-descriptor message and every content message of every
+  # version. Default is ``false`` -- metadata is updated but the original
+  # messages stay in the channel, matching historical behavior.
+  # The bot account must be an admin of ``private_file_channel`` with the
+  # "Delete Messages" permission for this to succeed.
+  delete_messages_on_remove: false
+  # ---------------------------------------------------------------------------
+  # Optional channel redundancy (RAID-1-style mirroring).
+  #
+  # ``mirrors`` maps a primary channel id (one of ``private_file_channel``)
+  # to one or more mirror channel ids. Every file part uploaded to the
+  # primary is also copied to each mirror -- server-side via message
+  # forwarding, so no upload bandwidth is spent. If the primary channel is
+  # ever banned or deleted, reads fail over to the mirrors automatically,
+  # and the mirror can be promoted to primary with a pure config change.
+  #
+  # Requirements:
+  #   * your bot(s) must be admin in every mirror channel;
+  #   * the primary channel must not have "Restrict saving content"
+  #     enabled (otherwise use ``mode: reupload``, which is
+  #     bandwidth-bound).
+  #
+  # ``strict: false`` (default): a failed mirror write is logged and the
+  # upload still succeeds; run the backfill task to close gaps later
+  # (Manager API: POST /redundancy/backfill/<channel-name>).
+  # The backfill task also mirrors all files that existed before
+  # redundancy was enabled.
+  #
+  # redundancy:
+  #   mirrors:
+  #     'tgdcfsdemo':
+  #       - 'tgdcfsdemomirror'
+  #   mode: forward     # forward (default) | reupload
+  #   strict: false
+tgdcfs:
+  users:
+  jwt:
+    secret: hidden
+    algorithm: HS256
+    life: 604800
+  metadata:
+    type: github_repo
+    github_repo:
+      repo: 'tgdcfs-demo/tgdcfs-demo'
+      commit: 'master'
+      access_token: hidden
+  server:
+    host: 0.0.0.0
+    port: 1900
+  # ---------------------------------------------------------------------------
+  # Optional SFTP interface, served next to WebDAV.
+  #
+  # It exposes the same file tree and reuses the `users` above, so a readonly
+  # user stays readonly here too. It needs a port of its own -- SSH cannot
+  # share the HTTP port.
+  #
+  # `host_key_file` is created on first start (ed25519, mode 0600) when it is
+  # missing. Back it up: without it every restart presents a new host key and
+  # clients refuse to connect until their known_hosts entry is cleared.
+  #
+  # `authorized_keys_dir` (optional) additionally enables public key login:
+  # one file <dir>/<username> per user, in the usual authorized_keys format.
+  # The user must still be listed under `users` so the readonly flag applies.
+  #
+  # `upload_buffer_size_mb` (default 64) is how much of an incoming upload is
+  # held in memory before it spills to `upload_buffer_dir` (system temp when
+  # empty). SFTP does not announce the file size up front while Telegram
+  # uploads need it, so a whole file has to be buffered before it is sent.
+  # ---------------------------------------------------------------------------
+  sftp:
+    enabled: false
+    host: 0.0.0.0
+    port: 2222
+    host_key_file: sftp_host_key
+    # authorized_keys_dir: sftp_authorized_keys
+    # upload_buffer_size_mb: 64
+    # upload_buffer_dir: ''
+  # ---------------------------------------------------------------------------
+  # Optional transfer tuning.
+  #
+  # Every value below has a default that matches the behaviour you get
+  # without this block, so it can be left out entirely.
+  #
+  # Downloads are cut into pieces of ``download_piece_size_kb`` and
+  # ``download_pieces_in_flight`` of them are fetched at the same time.
+  # Bytes have to be handed out in order, so a piece that arrives early
+  # waits for its turn: peak buffering per download is the two multiplied
+  # together -- 16 MiB with the defaults. Raising either speeds up a single
+  # large download and costs memory for every concurrent reader.
+  #
+  # ``connection_pool_size`` is how many MTProto connections each bot
+  # opens. A single connection sends its requests one after another, so a
+  # deployment with only one bot token gains the most here. With several
+  # bot tokens the pieces already spread across them.
+  #
+  # ``chunk_cache_mb`` caches downloaded blocks in memory, which is what
+  # makes overlapping reads -- video seeking, SFTP clients walking a file
+  # in small reads -- stop re-fetching the same bytes. 0 disables it.
+  # ``chunk_cache_readahead`` additionally pulls that many blocks past
+  # each request, so the next sequential read is already there, and
+  # ``chunk_cache_block_kb`` is the unit it caches in -- a read of a few
+  # kilobytes pulls a whole block.
+  # ---------------------------------------------------------------------------
+  # transfer:
+  #   upload_workers_small: 3
+  #   upload_workers_big: 8
+  #   upload_part_size_kb: 512      # must divide 512; Telegram caps it there
+  #   download_piece_size_kb: 4096
+  #   download_pieces_in_flight: 4
+  #   parallel_download_threshold_mb: 10
+  #   connection_pool_size: 1
+  #   chunk_cache_mb: 0
+  #   chunk_cache_readahead: 2
+  #   chunk_cache_block_kb: 1024
+
+  # ---------------------------------------------------------------------------
+  # Optional at-rest encryption.
+  #
+  # When ``enabled: true``, every file uploaded through TGDCFS is encrypted with
+  # AES-256-GCM in 64 KiB chunks *before* it leaves this process. The Telegram
+  # channel never sees plaintext, so a compromised channel reveals only
+  # ciphertext + a public salt per file.
+  #
+  # Three ways to supply the passphrase, pick exactly one:
+  #   * passphrase       -- inline string (NOT recommended outside dev)
+  #   * passphrase_env   -- read from an environment variable
+  #   * passphrase_file  -- read from a file (use systemd ``LoadCredential=``)
+  #
+  # ``master_salt_file`` is created on first run (16 random bytes) and MUST be
+  # backed up. Without it the master key cannot be re-derived.
+  #
+  # ``chunk_size`` defaults to 65536 (64 KiB). Larger -> less overhead, worse
+  # random-access granularity; smaller -> more per-chunk auth-tag cost.
+  #
+  # ``encrypt_names`` (default ``false``) additionally replaces every
+  # Telegram-visible document name -- including the pinned metadata blob --
+  # with an AES-GCM ciphertext token, so a passive observer of the channel
+  # cannot read file or directory names from document metadata. The
+  # plaintext names continue to live inside the (also encrypted)
+  # metadata.json, so WebDAV and the manager UI are unaffected.
+  # Note: only new uploads are affected; previously uploaded files keep
+  # their original Telegram document name.
+  # ---------------------------------------------------------------------------
+  encryption:
+    enabled: false
+    encrypt_names: false
+    # passphrase: "change-me-or-use-a-file"
+    passphrase_env: TGDCFS_MASTER_PASSPHRASE
+    # passphrase_file: secrets/master.passphrase
+    master_salt_file: master.salt
+    chunk_size: 65536

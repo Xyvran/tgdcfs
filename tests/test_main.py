@@ -1,0 +1,178 @@
+import pytest
+from main import create_clients, run_server, main
+
+
+class TestMain:
+    @pytest.mark.asyncio
+    async def test_create_clients_with_account(self, mocker):
+        # Setup mocks
+        mock_pyrogram_login_account = mocker.AsyncMock()
+        mock_pyrogram_login_bots = mocker.AsyncMock()
+        mock_telethon_login_account = mocker.AsyncMock()
+        mock_telethon_login_bots = mocker.AsyncMock()
+
+        # Mock the imported modules
+        mocker.patch("main.pyrogram.login_as_account", mock_pyrogram_login_account)
+        mocker.patch("main.pyrogram.login_as_bots", mock_pyrogram_login_bots)
+        mocker.patch("main.telethon.login_as_account", mock_telethon_login_account)
+        mocker.patch("main.telethon.login_as_bots", mock_telethon_login_bots)
+
+        mock_client_create = mocker.patch("main.Client.create")
+        mock_tdlib_api = mocker.patch("main.TDLibApi")
+        mock_pyrogram_api = mocker.patch("main.PyrogramAPI")
+        mock_telethon_api = mocker.patch("main.TelethonAPI")
+
+        mock_config = mocker.Mock()
+        mock_config.telegram.account = mocker.Mock()  # Account is configured
+        mock_config.telegram.account.used_to_upload = True  # Account used for upload
+        mock_config.telegram.lib = "pyrogram"  # Using pyrogram
+        mock_config.telegram.private_file_channel = [12345]
+
+        # Mock metadata config
+        mock_metadata_cfg = mocker.Mock()
+        mock_metadata_cfg.name = "test_client"
+        mock_config.tgdcfs.metadata = {12345: mock_metadata_cfg}
+
+        mock_account = mocker.Mock()
+        mock_bots = [mocker.Mock()]
+        mock_client = mocker.Mock()
+        mock_tdlib_instance = mocker.Mock()
+        mock_pyrogram_api_instance = mocker.Mock()
+
+        mock_pyrogram_login_account.return_value = mock_account
+        mock_pyrogram_login_bots.return_value = mock_bots
+        mock_client_create.return_value = mock_client
+        mock_tdlib_api.return_value = mock_tdlib_instance
+        mock_pyrogram_api.return_value = mock_pyrogram_api_instance
+
+        # Call function
+        result = await create_clients(mock_config)
+
+        # Assertions
+        mock_pyrogram_login_account.assert_called_once_with(mock_config)
+        mock_pyrogram_login_bots.assert_called_once_with(mock_config)
+        mock_client_create.assert_called_once_with(
+            12345,
+            mock_metadata_cfg,
+            mock_tdlib_instance,
+            mock_config.telegram.account.used_to_upload,
+            encryption_cfg=mock_config.tgdcfs.encryption,
+            redundancy_cfg=mock_config.telegram.redundancy,
+        )
+        assert result == {"test_client": mock_client}
+
+    @pytest.mark.asyncio
+    async def test_create_clients_without_account(self, mocker):
+        # Setup mocks
+        mock_telethon_login_account = mocker.AsyncMock()
+        mock_telethon_login_bots = mocker.AsyncMock()
+        mock_pyrogram_login_account = mocker.AsyncMock()
+        mock_pyrogram_login_bots = mocker.AsyncMock()
+
+        # Mock the imported modules
+        mocker.patch("main.pyrogram.login_as_account", mock_pyrogram_login_account)
+        mocker.patch("main.pyrogram.login_as_bots", mock_pyrogram_login_bots)
+        mocker.patch("main.telethon.login_as_account", mock_telethon_login_account)
+        mocker.patch("main.telethon.login_as_bots", mock_telethon_login_bots)
+
+        mock_client_create = mocker.patch("main.Client.create")
+        mock_tdlib_api = mocker.patch("main.TDLibApi")
+        mock_pyrogram_api = mocker.patch("main.PyrogramAPI")
+        mock_telethon_api = mocker.patch("main.TelethonAPI")
+
+        mock_config = mocker.Mock()
+        mock_config.telegram.account = None  # No account configured
+        mock_config.telegram.lib = "telethon"  # Using telethon
+        mock_config.telegram.private_file_channel = [67890]
+
+        # Mock metadata config
+        mock_metadata_cfg = mocker.Mock()
+        mock_metadata_cfg.name = "test_client"
+        mock_config.tgdcfs.metadata = {67890: mock_metadata_cfg}
+
+        mock_bots = [mocker.Mock()]
+        mock_client = mocker.Mock()
+        mock_tdlib_instance = mocker.Mock()
+        mock_telethon_api_instance = mocker.Mock()
+
+        mock_telethon_login_bots.return_value = mock_bots
+        mock_client_create.return_value = mock_client
+        mock_tdlib_api.return_value = mock_tdlib_instance
+        mock_telethon_api.return_value = mock_telethon_api_instance
+
+        # Call function
+        result = await create_clients(mock_config)
+
+        # Assertions
+        mock_telethon_login_account.assert_not_called()
+        mock_telethon_login_bots.assert_called_once_with(mock_config)
+        mock_client_create.assert_called_once_with(
+            67890,
+            mock_metadata_cfg,
+            mock_tdlib_instance,
+            False,
+            encryption_cfg=mock_config.tgdcfs.encryption,
+            redundancy_cfg=mock_config.telegram.redundancy,
+        )
+        assert result == {"test_client": mock_client}
+
+    @pytest.mark.asyncio
+    async def test_run_server(self, mocker):
+        # Setup mocks
+        mock_get_logger = mocker.patch("main.logging.getLogger")
+        mock_uvicorn_config = mocker.patch("main.UvicornConfig")
+        mock_server_class = mocker.patch("main.Server")
+        mock_app = mocker.Mock()
+        mock_logger = mocker.Mock()
+        mock_config = mocker.Mock()
+        mock_server = mocker.Mock()
+        mock_server.serve = mocker.AsyncMock()
+
+        mock_get_logger.return_value = mock_logger
+        mock_uvicorn_config.return_value = mock_config
+        mock_server_class.return_value = mock_server
+
+        # Call function
+        await run_server(mock_app, "localhost", 8080, "Test Server")
+
+        # Assertions
+        mock_logger.info.assert_called_once_with(
+            "Starting Test Server server on localhost:8080"
+        )
+        mock_uvicorn_config.assert_called_once_with(
+            mock_app,
+            host="localhost",
+            port=8080,
+            loop="none",
+            log_level="info",
+        )
+        mock_server_class.assert_called_once_with(config=mock_config)
+        mock_server.serve.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_main(self, mocker):
+        # Setup mocks
+        mock_get_config = mocker.patch("main.get_config")
+        mock_create_clients = mocker.patch("main.create_clients")
+        mock_create_app = mocker.patch("main.create_app")
+        mock_run_server = mocker.patch("main.run_server")
+        mock_config = mocker.Mock()
+        mock_config.tgdcfs.server.host = "0.0.0.0"
+        mock_config.tgdcfs.server.port = 9000
+
+        mock_clients = mocker.Mock()
+        mock_app = mocker.Mock()
+
+        mock_get_config.return_value = mock_config
+        mock_create_clients.return_value = mock_clients
+        mock_create_app.return_value = mock_app
+        mock_run_server.return_value = None
+
+        # Call function
+        await main()
+
+        # Assertions
+        mock_get_config.assert_called_once()
+        mock_create_clients.assert_called_once_with(mock_config)
+        mock_create_app.assert_called_once_with(mock_clients, mock_config)
+        mock_run_server.assert_called_once_with(mock_app, "0.0.0.0", 9000, "TGDCFS")

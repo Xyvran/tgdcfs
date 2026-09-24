@@ -1,8 +1,456 @@
+[![Tests](https://img.shields.io/github/actions/workflow/status/Xyvran/tgdcfs/test.yml?branch=master&style=for-the-badge&label=tests)](https://github.com/Xyvran/tgdcfs/actions/workflows/test.yml)
+[![Docker build](https://img.shields.io/github/actions/workflow/status/Xyvran/tgdcfs/docker-publish.yml?branch=master&style=for-the-badge&label=docker%20build)](https://github.com/Xyvran/tgdcfs/actions/workflows/docker-publish.yml)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/xyvran/tgdcfs)
+
 # tgdcfs
 
-Telegram and Discord as storage backends behind one WebDAV/SFTP server.
-Based on [tgfs](https://github.com/Xyvran/tgfs); every file system has a
-primary store and optional mirror stores, and a store can be a Telegram
-channel or a Discord channel in either role.
+Telegram and Discord as storage backends behind one WebDAV and SFTP
+server.
 
-Status: planning. See [docs/design/architecture-plan.md](docs/design/architecture-plan.md).
+tgdcfs is a copy of [tgfs](https://github.com/Xyvran/tgfs) (taken at
+commit `7464666`) that grows a second storage backend, Discord. Every
+file system has a primary store and optional mirror stores, and a store
+can be a Telegram channel or a Discord channel in either role. The
+design is described in
+[docs/design/architecture-plan.md](docs/design/architecture-plan.md);
+the Discord backend and cross-backend mirroring are not implemented
+yet, so today tgdcfs behaves exactly like tgfs.
+
+Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
+for creating the original tgfs project this repository is built upon.
+
+## Coming from tgfs
+
+* The Python package, the Docker image (`xyvran/tgdcfs`) and the
+  environment variables are renamed. `TGFS_DATA_DIR` and
+  `TGFS_CONFIG_FILE` still work with a deprecation warning; the new
+  names are `TGDCFS_DATA_DIR` and `TGDCFS_CONFIG_FILE`.
+* The data directory inside the image is `/home/tgdcfs/.tgdcfs`
+  (was `/home/tgfs/.tgfs`), so adjust the volume mount when switching
+  images.
+* A `config.yaml` written for tgfs loads unchanged: the top-level
+  `tgfs:` block is read as `tgdcfs:` with a deprecation warning.
+* The metadata format is unchanged; a channel written by tgfs is served
+  by tgdcfs as is.
+
+## Tested Clients
+* [rclone](https://rclone.org/)
+* [Cyberduck](https://cyberduck.io/)
+* [WinSCP](https://winscp.net/)
+* [Documents](https://readdle.com/documents) by Readdle
+* [VidHub](https://okaapps.com/product/1659622164)
+
+WinSCP, Cyberduck and rclone speak both protocols; the OpenSSH `sftp`
+command line and `sshfs` work against the SFTP interface as well.
+
+## Features
+* Upload and download files to/from a private Telegram channel via WebDAV
+* **Optional SFTP interface** serving the same tree next to WebDAV (see below)
+* Group files on Telegram channels into folders
+* Infinite versioning of files and folders (Folder versioning is only available when Metadata is maintained on Github repository)
+* Importing files that are already on Telegram (Only via the Telegram Mini App)
+* File size is unlimited (larger files are chunked into parts but appear as a single file to the user)
+* Live streaming of videos
+* **Optional at-rest encryption** (AES-256-GCM, see below)
+* **Optional channel redundancy** (RAID-1-style mirroring to extra channels, see below)
+
+
+## SFTP interface
+
+Next to the HTTP surface (WebDAV under `/webdav`, manager API under `/api`)
+TGDCFS can serve the very same file tree over SFTP. It is off by default;
+switch it on with an `sftp` block in `config.yaml`:
+
+```yaml
+tgdcfs:
+  sftp:
+    enabled: true
+    host: 0.0.0.0
+    port: 2222
+    host_key_file: sftp_host_key
+    # authorized_keys_dir: sftp_authorized_keys
+    # upload_buffer_size_mb: 64
+    # upload_buffer_dir: ''
+```
+
+Both interfaces run in the same process and go through the same core, so
+what you see over SFTP is what you see over WebDAV — including at-rest
+encryption, channel redundancy and the manager UI's task list. SSH cannot
+share a socket with HTTP, hence the separate port.
+
+**Layout and accounts.** The root lists one directory per configured
+channel, exactly like `/webdav` does, and everything below it is that
+channel's tree. Accounts are the `tgdcfs.users` from the same config: a user
+with `readonly: true` can list and download but gets "permission denied" on
+uploads, deletes, renames and directory creation. With no users configured
+at all, SFTP allows anonymous read-only access — the same deal the HTTP
+side offers.
+
+```bash
+sftp -P 2222 <user>@<host>          # interactive
+sshfs -p 2222 <user>@<host>:/ /mnt  # mount it
+rclone config create tgdcfs sftp host=<host> port=2222 user=<user> pass=<pass>
+```
+
+**Host key.** On the first start an ed25519 key is generated at
+`host_key_file` (relative paths resolve against the TGDCFS data directory)
+with mode 0600, and its fingerprint is logged. Back it up together with the
+rest of that directory: without it every restart presents a new host key
+and clients refuse to connect until their `known_hosts` entry is cleared.
+
+**Public keys** are optional. Point `authorized_keys_dir` at a directory
+holding one file per user — named after the username, in the usual
+`authorized_keys` format — and those users may log in with a key. They
+still have to be listed under `tgdcfs.users` so the readonly flag keeps
+applying; everyone else falls back to password authentication.
+
+**Uploads are buffered.** Telegram needs a file's total size before the
+first byte goes out and SFTP never announces it, so an incoming upload is
+held in memory up to `upload_buffer_size_mb` (default 64) and spills to
+`upload_buffer_dir` (the system temp directory when unset) beyond that.
+Plan for that much scratch space when pushing large files. A transfer that
+is cut off mid-flight is discarded rather than committed, so an interrupted
+upload never truncates an existing file.
+
+**Known limits**, all of them shared with the WebDAV interface: files
+cannot be appended to or partially updated (every write stores a new
+version), moving between two channels is refused, and there are no symlinks
+or real POSIX permissions — `chmod`, `chown` and `touch -t` are accepted
+and ignored so clients like `rsync` do not abort.
+
+## Channel redundancy
+
+Telegram channels can be banned or deleted, taking every stored file with
+them. With redundancy enabled, TGDCFS keeps a full copy of everything in one
+or more *mirror channels*:
+
+* **Mirroring is server-side.** New uploads are copied to the mirrors via
+  Telegram's message forwarding — no re-upload, one API call per file part.
+* **Reads fail over automatically.** If a part (or the whole primary
+  channel) becomes unavailable, downloads are served from a mirror.
+* **File descriptors are mirrored too**, and in `pinned_message` metadata
+  mode a pinned copy of the metadata blob is maintained in every mirror,
+  so a mirror channel is self-sufficient: if the primary is banned, swap
+  the mirror in as `private_file_channel` in the config and keep going.
+* **Pre-existing files are covered by the backfill task**
+  (`POST /redundancy/backfill/<channel-name>` on the manager API, progress
+  via the regular `/tasks` endpoints; add `?verify=true` to also re-mirror
+  copies that were manually deleted). Backfill forwards server-side as
+  well, so mirroring a multi-terabyte library costs API calls, not
+  bandwidth.
+* **Works with encryption**: mirrors receive the ciphertext messages
+  including the inline header, so files remain decryptable from a mirror
+  alone.
+
+Set up:
+
+```yaml
+telegram:
+  private_file_channel:
+    - '1234567890'
+  redundancy:
+    mirrors:
+      '1234567890':      # primary channel id
+        - '9876543210'   # mirror channel id(s)
+    mode: forward        # forward (default) | reupload
+    strict: false        # true: uploads fail when mirroring fails
+```
+
+Requirements: the bot(s) must be admin in every mirror channel, and the
+primary channel must not have "Restrict saving content" enabled —
+otherwise set `mode: reupload` (bandwidth-bound). With `strict: false`
+(default) a failing mirror never fails the upload; gaps are logged and can
+be closed by re-running the backfill task.
+
+When redundancy matters to you, prefer the `github_repo` metadata type:
+the directory tree then survives even the loss of *all* channels.
+
+## At-rest encryption
+
+When ``encryption.enabled: true`` is set in ``config.yaml``, every byte
+TGDCFS uploads to Telegram is encrypted client-side. The Telegram channel and
+the metadata repository never see plaintext.
+
+* **Cipher:** AES-256-GCM in 64 KiB chunks, each with its own nonce + auth tag.
+  Random-access decryption (HTTP Range requests, video streaming) keeps working.
+* **Keys:** the master key is derived from a passphrase via Argon2id at startup.
+  Per-file keys are derived via HKDF-SHA256 from the master key and a 32-byte
+  random salt stored in the file header.
+* **Header:** each encrypted file starts with a self-describing 60-byte header
+  embedded *inline* in the first Telegram message, so a file can be decrypted
+  from the channel even if the TGDCFS metadata store is lost.
+* **Tamper detection:** every chunk has its own GCM tag plus an HMAC on the
+  header, so flipped bits or chunk reordering are caught before plaintext is
+  returned.
+* **Optional name obfuscation:** with ``encrypt_names: true`` the Telegram
+  document name of every new upload (and the pinned metadata blob) is
+  replaced with an AES-GCM ciphertext token. The plaintext names stay
+  inside the (already encrypted) metadata, so WebDAV and the manager UI
+  are unaffected. Only new uploads are obfuscated; pre-existing files keep
+  their original document name in Telegram.
+
+Set up:
+
+```yaml
+tgdcfs:
+  encryption:
+    enabled: true
+    encrypt_names: true  # optional, hide file/dir names from channel observers
+    passphrase_env: TGDCFS_MASTER_PASSPHRASE
+    master_salt_file: master.salt
+    chunk_size: 65536
+```
+
+### Master salt
+
+The Argon2 master salt is the value referenced by ``master_salt_file``. It is
+**not** secret, but it is required to re-derive the master key from your
+passphrase, so it must survive container/host rebuilds.
+
+* **Auto-generated on first start.** If ``master_salt_file`` does not exist
+  when TGDCFS boots, 16 random bytes are written there via
+  ``secrets.token_bytes`` and the file is ``chmod 0600``'d. No manual step is
+  required.
+* **Path resolution.** The value is resolved relative to ``TGDCFS_DATA_DIR``
+  (defaults to ``~/.tgdcfs``), so ``master_salt_file: master.salt`` lands at
+  ``~/.tgdcfs/master.salt`` unless you override the data dir.
+* **Manual creation (optional).** If you prefer to seed the salt yourself --
+  e.g. to push it into a secret manager before the first start -- generate at
+  least 8 bytes (16 recommended) and drop them at the configured path:
+
+  ```bash
+  mkdir -p ~/.tgdcfs
+  head -c 16 /dev/urandom > ~/.tgdcfs/master.salt
+  chmod 600 ~/.tgdcfs/master.salt
+  ```
+
+* **Back it up, never rotate it in place.** Losing the salt (or replacing it
+  with fresh random bytes) makes every previously uploaded file unreadable,
+  even with the correct passphrase. Back ``master.salt`` up alongside your
+  passphrase and your metadata.
+
+See ``demo-config.yaml`` for the full set of options.
+
+### Master passphrase
+
+The master passphrase is the only secret an attacker needs to decrypt
+every file in your channel, so treat it like a long-lived database
+credential: never commit it, never log it, and back it up to the same
+place you keep your other production secrets.
+
+TGDCFS reads the passphrase from exactly one of three sources, checked in
+this order:
+
+1. ``passphrase_env`` -- the name of an environment variable to read
+   (recommended for container deployments)
+2. ``passphrase_file`` -- a path to a file containing just the
+   passphrase (recommended for systemd via ``LoadCredential=``)
+3. ``passphrase`` -- the literal passphrase inlined in ``config.yaml``
+   (development only; the value ends up on disk in cleartext)
+
+The recipes below all assume the default ``passphrase_env:
+TGDCFS_MASTER_PASSPHRASE`` from ``demo-config.yaml``. Replace the variable
+name if you picked a different one.
+
+**Generate a strong passphrase** (only needed once -- store the output
+in your password manager):
+
+```bash
+# 32 random base64 characters; ~190 bits of entropy.
+python -c "import secrets; print(secrets.token_urlsafe(24))"
+```
+
+**Docker / docker-compose.** Pass the variable through to the
+container -- never hard-code it into the image:
+
+```bash
+docker run -e TGDCFS_MASTER_PASSPHRASE \
+  -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs \
+  xyvran/tgdcfs
+```
+
+```yaml
+# docker-compose.yml
+services:
+  tgdcfs:
+    image: xyvran/tgdcfs
+    environment:
+      TGDCFS_MASTER_PASSPHRASE: ${TGDCFS_MASTER_PASSPHRASE}
+    volumes:
+      - ~/.tgdcfs:/home/tgdcfs/.tgdcfs
+```
+
+Keep the actual value in a ``.env`` file next to ``docker-compose.yml``
+(and add ``.env`` to ``.gitignore``):
+
+```
+TGDCFS_MASTER_PASSPHRASE=your-long-random-passphrase-here
+```
+
+**systemd.** Prefer a credential file managed by systemd so the secret
+is mode-0400 and only visible to the unit:
+
+```ini
+# /etc/systemd/system/tgdcfs.service
+[Service]
+LoadCredential=master_passphrase:/etc/tgdcfs/master.passphrase
+Environment=TGDCFS_MASTER_PASSPHRASE_FILE=%d/master_passphrase
+ExecStart=/usr/local/bin/tgdcfs
+```
+
+Then set ``passphrase_file: ${TGDCFS_MASTER_PASSPHRASE_FILE}`` in
+``config.yaml`` (or read the variable in a wrapper script). Make sure
+``/etc/tgdcfs/master.passphrase`` is ``chmod 0400`` and owned by
+``root:root``.
+
+**Plain shell / development.** Export it in your current shell only;
+do **not** persist it in ``~/.bashrc`` or ``~/.zshrc``:
+
+```bash
+read -rs TGDCFS_MASTER_PASSPHRASE && export TGDCFS_MASTER_PASSPHRASE
+poetry run python main.py
+```
+
+**Kubernetes.** Store the passphrase in a Secret and project it as an
+env var:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tgdcfs-master-passphrase
+type: Opaque
+stringData:
+  passphrase: your-long-random-passphrase-here
+---
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: tgdcfs
+          image: xyvran/tgdcfs
+          env:
+            - name: TGDCFS_MASTER_PASSPHRASE
+              valueFrom:
+                secretKeyRef:
+                  name: tgdcfs-master-passphrase
+                  key: passphrase
+```
+
+**Operational notes.**
+
+* **Never change the passphrase in place.** TGDCFS has no built-in key
+  rotation: changing the passphrase makes every previously uploaded
+  file unreadable. Decrypt everything to a staging location and
+  re-upload under a fresh passphrase if you really need to rotate.
+* **Pair with the master salt.** Backups MUST include both the
+  passphrase and ``master.salt`` -- either one missing is equivalent
+  to a total key loss.
+* **Forgetting the passphrase is fatal.** There is no recovery
+  mechanism (that's the entire point of the design). Keep a copy in
+  your password manager.
+
+
+## Transfer performance
+
+Uploads and downloads are tuned through an optional `transfer` block. Every
+value has a default matching the behaviour you get without the block, so
+existing configurations keep working untouched.
+
+```yaml
+tgdcfs:
+  transfer:
+    upload_workers_small: 3
+    upload_workers_big: 8
+    upload_part_size_kb: 512      # must divide 512; Telegram caps it there
+    download_piece_size_kb: 4096
+    download_pieces_in_flight: 4
+    parallel_download_threshold_mb: 10
+    connection_pool_size: 1
+    chunk_cache_mb: 0
+    chunk_cache_readahead: 2
+    chunk_cache_block_kb: 1024
+```
+
+**Downloads** are cut into pieces and several are fetched at once. Bytes
+must be handed out in order, so a piece that arrives early waits its turn:
+peak buffering per download is `download_piece_size_kb x
+download_pieces_in_flight`, 16 MiB at the defaults. Raising either speeds
+up a single large download and costs memory for every concurrent reader.
+
+**More bots means more parallelism.** Pieces are handed to the configured
+bot tokens round-robin, so each additional token is another connection a
+single download can use. With one token, raise `connection_pool_size`
+instead: one MTProto connection sends its requests one after another, so
+extra connections are what let a single bot overlap transfers.
+
+**The chunk cache** (`chunk_cache_mb`, off by default) keeps downloaded
+blocks in memory. It pays off for readers that revisit bytes: seeking in a
+video, and SFTP clients that walk a file in small reads. A read of a few
+kilobytes pulls a whole `chunk_cache_block_kb` block, so a larger block
+serves more of the reads that follow it and wastes more on readers that
+jump around. `chunk_cache_readahead` additionally pulls that many blocks
+past each request so the next sequential read is already in memory.
+
+**Rate limits.** More parallelism means more requests per second. Telegram
+answers a flood with a wait, which TGDCFS honours; if uploads start logging
+flood waits, lower `upload_workers_big` and `connection_pool_size` before
+raising anything else.
+
+`scripts/measure_transfer.py` shows what the piece-level parallelism is
+worth against a simulated link, without needing a channel.
+
+## Development
+
+Install the dependencies:
+```bash
+poetry install
+```
+
+Run the app:
+```bash
+poetry run python main.py
+```
+
+Typecheck && lint:
+```bash
+make mypy
+make ruff
+```
+
+Before committing and pushing, run the following command to install git hooks:
+```bash
+pre-commit install
+```
+
+### Preview builds
+
+Pushing any branch other than `master` runs the full test suite and, in
+parallel, builds a Docker image from that exact commit so a change can be tried
+out on a real machine before it is merged. The release tags are never touched.
+
+```bash
+docker pull xyvran/tgdcfs:preview-<commit>     # pinned to one commit
+docker pull xyvran/tgdcfs:preview              # whichever branch built last
+```
+
+The commit-pinned tag is printed as a ready-to-copy command in the workflow run
+summary; prefer it whenever more than one branch is in flight. The frontend is
+built the same way as `xyvran/tgdcfs-fe:preview-<commit>`.
+
+Preview images are amd64 only (release images are also arm64) and are built
+before the test workflow finishes, so a green preview image is not a statement
+about the tests. Both images are smoke-checked first, though: the backend has to
+serve a working SFTP session and the frontend has to answer on `/tgdcfs/`, so a
+broken build never reaches the registry.
+
+These tags accumulate — delete them from Docker Hub once a branch is merged.
+
+The backend smoke check runs against any image, locally too:
+
+```bash
+docker run --rm -v "$PWD/scripts:/app/scripts:ro" xyvran/tgdcfs:preview \
+  python scripts/docker_smoke_check.py
+```
