@@ -1,10 +1,19 @@
+"""The Telegram store: one channel, addressed through the bot pool.
+
+Formerly ``MessageApi``. It batches ``get_messages`` calls (see
+:class:`MessageBroker`), caches downloaded blocks, splits large
+downloads into parallel pieces and owns the 2 GiB partitioning of
+uploads -- everything Telegram-specific about moving bytes lives here.
+"""
+
 import asyncio
 import logging
-from typing import AsyncIterator, Iterable, Iterator, List, Optional, Set
+from typing import AsyncIterator, Generator, Iterable, Iterator, List, Optional, Set
 
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from telethon.errors import MessageNotModifiedError, RPCError
 
+from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
 from tgdcfs.config import TransferConfig, get_config
 from tgdcfs.errors import (
     MessageNotFound,
@@ -16,7 +25,9 @@ from tgdcfs.reqres import (
     DeleteMessagesReq,
     DownloadFileReq,
     DownloadFileResp,
+    EditMessageMediaReq,
     EditMessageTextReq,
+    FileMessageFromBuffer,
     FileMessageFromStream,
     ForwardMessagesReq,
     GetPinnedMessageReq,
@@ -25,8 +36,9 @@ from tgdcfs.reqres import (
     PinMessageReq,
     SearchMessageReq,
     SendTextReq,
+    SentFileMessage,
+    UploadableFileMessage,
 )
-from tgdcfs.telegram.interface import TDLibApi
 from tgdcfs.utils.chunk_cache import (
     block_bounds,
     block_length,
@@ -36,14 +48,30 @@ from tgdcfs.utils.chunk_cache import (
 from tgdcfs.utils.others import exclude_none
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
-from .message_broker import MessageBroker
+from .broker import MessageBroker
+from .interface import TDLibApi
+from .uploader import FileUploader
 
 logger = logging.getLogger(__name__)
+
+BACKEND_NAME = "telegram"
+KEY_PREFIX = "tg"
 
 
 def _transfer() -> TransferConfig:
     return get_config().tgdcfs.transfer
 
+
+# Largest document a single message may carry.
+PART_SIZE_DEFAULT = 512 * 1024 * 4000  # 2 GB
+PART_SIZE_PREMIUM = 512 * 1024 * 8000  # 4 GB, premium accounts only
+
+# Longest text message Telegram accepts.
+MAX_TEXT_CHARS = 4096
+
+# A failed send is retried forever, this far apart: the bytes are
+# already on Telegram's servers, only the message is missing.
+SEND_RETRY_INTERVAL = 5  # seconds
 
 # Telegram's messages.deleteMessages caps each request at 100 message ids.
 DELETE_BATCH_SIZE = 100
@@ -62,17 +90,47 @@ bucket = InMemoryBucket([rate])
 limiter = Limiter(bucket, max_delay=60 * 1000)  # 60 seconds max delay
 
 
-class MessageApi(MessageBroker):
-    def __init__(self, tdlib: TDLibApi, private_file_channel: int):
-        super().__init__(tdlib, private_file_channel)
+class TelegramStore(MessageBroker, IStore):
+    def __init__(
+        self,
+        tdlib: TDLibApi,
+        private_file_channel: int,
+        key: Optional[str] = None,
+        premium_upload: bool = False,
+    ):
+        """
+        ``private_file_channel`` is the resolved (lib-specific) channel id
+        used on the wire; ``key`` is the serialization key, built from the
+        channel id as written in the config. ``premium_upload`` enables
+        4 GiB parts through the premium user account.
+        """
+        MessageBroker.__init__(self, tdlib, private_file_channel)
+        IStore.__init__(
+            self, key or make_store_key(KEY_PREFIX, str(private_file_channel))
+        )
+        self._premium_upload = premium_upload and tdlib.account is not None
         self.__readahead: Set[tuple[int, int, int]] = set()
+
+    @property
+    def backend(self) -> str:
+        return BACKEND_NAME
+
+    @property
+    def caps(self) -> StoreCapabilities:
+        return StoreCapabilities(
+            max_part_bytes=(
+                PART_SIZE_PREMIUM if self._premium_upload else PART_SIZE_DEFAULT
+            ),
+            max_text_chars=MAX_TEXT_CHARS,
+            supports_server_copy=True,
+        )
 
     @staticmethod
     def __try_acquire(name: str):
         limiter.try_acquire(name)
 
     async def send_text(self, message: str) -> int:
-        self.__try_acquire("MessageApi.send_text")
+        self.__try_acquire("TelegramStore.send_text")
         return (
             await self.tdlib.next_bot.send_text(
                 SendTextReq(chat=self.private_file_channel, text=message)
@@ -80,7 +138,7 @@ class MessageApi(MessageBroker):
         ).message_id
 
     async def edit_message_text(self, message_id: int, message: str) -> int:
-        self.__try_acquire("MessageApi.edit_message_text")
+        self.__try_acquire("TelegramStore.edit_message_text")
         try:
             return (
                 await self.tdlib.next_bot.edit_message_text(
@@ -101,7 +159,7 @@ class MessageApi(MessageBroker):
             raise e
 
     async def get_pinned_message(self) -> MessageRespWithDocument:
-        self.__try_acquire("MessageApi.get_pinned_message")
+        self.__try_acquire("TelegramStore.get_pinned_message")
 
         if not self.tdlib.account:
             raise PinnedMessageNotSupported()
@@ -126,7 +184,7 @@ class MessageApi(MessageBroker):
     ) -> List[int]:
         """Server-side copy of messages from ``source_channel`` into this
         channel. Returns the new message ids, aligned with the input."""
-        self.__try_acquire("MessageApi.forward_messages_from")
+        self.__try_acquire("TelegramStore.forward_messages_from")
         resp = await self.tdlib.next_bot.forward_messages(
             ForwardMessagesReq(
                 from_chat=source_channel,
@@ -136,33 +194,48 @@ class MessageApi(MessageBroker):
         )
         return [m.message_id for m in resp]
 
-    async def reupload_to(self, message_id: int, to_channel: int) -> int:
-        """Bandwidth-bound copy: stream a document down and up again.
+    async def copy_from(
+        self, source: IStore, message_ids: List[int]
+    ) -> Optional[List[int]]:
+        """Forward messages from another Telegram store into this one.
+
+        Only Telegram-to-Telegram copies can happen server-side; for any
+        other source the caller has to re-upload.
+        """
+        if not isinstance(source, TelegramStore):
+            return None
+        return await self.forward_messages_from(
+            source.private_file_channel, message_ids
+        )
+
+    async def _reupload_within(self, message_id: int) -> int:
+        """Bandwidth-bound copy inside this channel: stream a document
+        down and up again.
 
         The fallback for channels where forwarding is impossible
         ("restrict saving content"). Bytes are copied verbatim -- this
         sits below the encryption decorator, so ciphertext stays
         ciphertext and is never encrypted twice. The document name is
-        not preserved; names live in the TGDCFS metadata, so nothing
+        not preserved; names live in the metadata, so nothing
         user-visible depends on it.
         """
-        # Imported here to avoid a circular import at module load time.
-        from tgdcfs.core.repository.impl.file_content.file_uploader import FileUploader
-
         message = (await self.get_messages([message_id]))[0]
         if not message or not message.document:
             raise MessageNotFound(message_id=message_id)
         size = message.document.size
         resp = await self.download_file(message_id, 0, size - 1)
-        file_msg = FileMessageFromStream.new(
-            stream=resp.chunks, size=size, name=f"part-{message_id}"
+        sent = await self.upload(
+            FileMessageFromStream.new(
+                stream=resp.chunks, size=size, name=f"part-{message_id}"
+            )
         )
-        uploader = FileUploader(self.tdlib.next_bot, file_msg)
-        await uploader.upload()
-        sent = await uploader.send(to_channel)
-        return sent.message_id
+        if len(sent) != 1:
+            raise TechnicalError(
+                f"Re-uploading message {message_id} produced {len(sent)} parts"
+            )
+        return sent[0].message_id
 
-    async def duplicate_messages(self, message_ids: List[int]) -> List[int]:
+    async def copy_within(self, message_ids: List[int]) -> List[int]:
         """Copy messages within this channel, without moving their bytes.
 
         Forwarding is a server-side operation: the new messages point at
@@ -183,9 +256,88 @@ class MessageApi(MessageBroker):
                 f"{self.private_file_channel} ({ex}); falling back to re-upload"
             )
             return [
-                await self.reupload_to(message_id, self.private_file_channel)
-                for message_id in message_ids
+                await self._reupload_within(message_id) for message_id in message_ids
             ]
+
+    # -- uploads -----------------------------------------------------------
+
+    @staticmethod
+    def _partition(size: int, part_size: int) -> Generator[int]:
+        parts = (size + part_size - 1) // part_size
+        for _ in range(parts - 1):
+            yield part_size
+        yield size - (parts - 1) * part_size
+
+    async def _send_file(
+        self, file_msg: UploadableFileMessage, use_account_api: bool
+    ) -> SentFileMessage:
+        if use_account_api and (account_api := self.tdlib.account):
+            api = account_api
+        else:
+            api = self.tdlib.next_bot
+
+        uploader = FileUploader(api, file_msg)
+        logger.info(
+            f"Uploading file {file_msg.name} of size {file_msg.size} bytes to "
+            f"channel {self.private_file_channel} using {(await api.get_me()).name}."
+        )
+        size = await uploader.upload()
+
+        while True:
+            try:
+                message = await uploader.send(self.private_file_channel)
+                return SentFileMessage(message_id=message.message_id, size=size)
+            except Exception as ex:
+                logger.error(
+                    f"Exception occurred when sending file {file_msg.name}: {ex}. "
+                    f"Waiting {SEND_RETRY_INTERVAL} seconds before retrying."
+                )
+                await asyncio.sleep(SEND_RETRY_INTERVAL)
+
+    async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        """Upload ``file_msg`` in parts of at most one Telegram document.
+
+        Files above the bot limit go through the premium account when the
+        deployment allows it, in 4 GiB parts.
+        """
+        size = file_msg.get_size()
+        file_name = file_msg.name or "unnamed"
+
+        premium_upload = size > PART_SIZE_DEFAULT and self._premium_upload
+        part_size = PART_SIZE_PREMIUM if premium_upload else PART_SIZE_DEFAULT
+
+        res: List[SentFileMessage] = []
+        for i, part in enumerate(self._partition(size, part_size)):
+            file_msg.name = f"[part{i + 1}]{file_name}"
+            file_msg.size = part
+            res.append(await self._send_file(file_msg, use_account_api=premium_upload))
+            file_msg.next_part(part)
+        return res
+
+    async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int:
+        file_msg: FileMessageFromBuffer = FileMessageFromBuffer.new(
+            buffer=buffer, name=name
+        )
+        uploader = FileUploader(self.tdlib.next_bot, file_msg)
+        await uploader.upload()
+
+        while True:
+            try:
+                message = await uploader.client.edit_message_media(
+                    EditMessageMediaReq(
+                        chat=self.private_file_channel,
+                        message_id=message_id,
+                        file=uploader.get_uploaded_file(),
+                    )
+                )
+                return message.message_id
+            except Exception as ex:
+                logger.error(
+                    f"Exception occurred when editing document of message "
+                    f"{message_id}: {ex}. Waiting {SEND_RETRY_INTERVAL} seconds "
+                    f"before retrying."
+                )
+                await asyncio.sleep(SEND_RETRY_INTERVAL)
 
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False
@@ -210,7 +362,7 @@ class MessageApi(MessageBroker):
             return
         for start in range(0, len(unique_ids), DELETE_BATCH_SIZE):
             batch = tuple(unique_ids[start : start + DELETE_BATCH_SIZE])
-            self.__try_acquire("MessageApi.delete_messages")
+            self.__try_acquire("TelegramStore.delete_messages")
             try:
                 await self.tdlib.next_bot.delete_messages(
                     DeleteMessagesReq(
@@ -225,13 +377,13 @@ class MessageApi(MessageBroker):
                 )
 
     async def pin_message(self, message_id: int):
-        self.__try_acquire("MessageApi.pin_message")
+        self.__try_acquire("TelegramStore.pin_message")
         return await self.tdlib.next_bot.pin_message(
             PinMessageReq(chat=self.private_file_channel, message_id=message_id)
         )
 
     async def search_messages(self, search: str) -> list[MessageResp]:
-        self.__try_acquire("MessageApi.search_messages")
+        self.__try_acquire("TelegramStore.search_messages")
         if self.tdlib.account:
             return list(
                 exclude_none(

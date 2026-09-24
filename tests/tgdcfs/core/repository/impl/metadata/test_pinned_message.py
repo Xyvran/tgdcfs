@@ -1,9 +1,11 @@
 import json
 import pytest
 
-from tgdcfs.core.api import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion, TGFSMetadata
-from tgdcfs.core.repository.impl.metadata.pinned_message import TGMsgMetadataRepository
+from tgdcfs.core.repository.impl.metadata.pinned_message import (
+    PinnedMessageMetadataRepository,
+)
 from tgdcfs.core.repository.interface import IFileContentRepository
 from tgdcfs.errors import MetadataNotInitialized, NoPinnedMessage
 from tgdcfs.reqres import (
@@ -14,18 +16,22 @@ from tgdcfs.reqres import (
 )
 
 
-class TestTGMsgMetadataRepository:
+class TestPinnedMessageMetadataRepository:
     @pytest.fixture
     def mock_message_api(self, mocker):
-        return mocker.AsyncMock(spec=MessageApi)
+        store = mocker.AsyncMock(spec=TelegramStore)
+        store.key = "tg:111"
+        return store
 
     @pytest.fixture
     def mock_fc_repo(self, mocker):
         return mocker.AsyncMock(spec=IFileContentRepository)
 
     @pytest.fixture
-    def repository(self, mock_message_api, mock_fc_repo) -> TGMsgMetadataRepository:
-        return TGMsgMetadataRepository(mock_message_api, mock_fc_repo)
+    def repository(
+        self, mock_message_api, mock_fc_repo
+    ) -> PinnedMessageMetadataRepository:
+        return PinnedMessageMetadataRepository(mock_message_api, mock_fc_repo)
 
     @pytest.fixture
     def sample_metadata(self) -> TGFSMetadata:
@@ -44,7 +50,7 @@ class TestTGMsgMetadataRepository:
         return MessageRespWithDocument(message_id=123, text="", document=document)
 
     def test_init(self, mock_message_api, mock_fc_repo):
-        repo = TGMsgMetadataRepository(mock_message_api, mock_fc_repo)
+        repo = PinnedMessageMetadataRepository(mock_message_api, mock_fc_repo)
 
         assert repo._message_api == mock_message_api
         assert repo._fc_repo == mock_fc_repo
@@ -52,7 +58,7 @@ class TestTGMsgMetadataRepository:
         assert repo.metadata is None
 
     def test_metadata_file_name_constant(self):
-        assert TGMsgMetadataRepository.METADATA_FILE_NAME == "metadata.json"
+        assert PinnedMessageMetadataRepository.METADATA_FILE_NAME == "metadata.json"
 
     @pytest.mark.asyncio
     async def test_push_without_metadata_raises_error(self, repository):

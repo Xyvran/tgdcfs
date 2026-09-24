@@ -6,8 +6,8 @@ from typing import List, Optional, Sequence, cast
 import pytest
 
 from tgdcfs.config import TransferConfig
-from tgdcfs.core.api.message import MessageApi
-from tgdcfs.core.api.message import message_broker as mb
+from tgdcfs.backends.telegram.store import TelegramStore
+from tgdcfs.backends.telegram import broker as mb
 from tgdcfs.reqres import (
     Document,
     DownloadFileReq,
@@ -15,7 +15,7 @@ from tgdcfs.reqres import (
     GetMessagesResp,
     MessageResp,
 )
-from tgdcfs.telegram.interface import ITDLibClient, TDLibApi
+from tgdcfs.backends.telegram.interface import ITDLibClient, TDLibApi
 from tgdcfs.utils.chunk_cache import ChunkCache
 from tgdcfs.utils.message_cache import global_message_cache
 
@@ -97,16 +97,16 @@ def cache() -> ChunkCache:
 
 
 @pytest.fixture
-def api(bot, cache, mocker) -> MessageApi:
-    mocker.patch("tgdcfs.core.api.message.chunk_cache", return_value=cache)
+def api(bot, cache, mocker) -> TelegramStore:
+    mocker.patch("tgdcfs.backends.telegram.store.chunk_cache", return_value=cache)
     mocker.patch(
-        "tgdcfs.core.api.message._transfer",
+        "tgdcfs.backends.telegram.store._transfer",
         return_value=TransferConfig.from_dict({"chunk_cache_readahead": 0}),
     )
-    return MessageApi(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL)
+    return TelegramStore(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL)
 
 
-async def read(api: MessageApi, begin: int, end: int) -> bytes:
+async def read(api: TelegramStore, begin: int, end: int) -> bytes:
     resp = await api.download_file(MESSAGE, begin, end)
     return b"".join([chunk async for chunk in resp.chunks])
 
@@ -196,8 +196,10 @@ class TestSafety:
 
     @pytest.mark.asyncio
     async def test_a_disabled_cache_leaves_the_range_untouched(self, bot, mocker):
-        mocker.patch("tgdcfs.core.api.message.chunk_cache", return_value=ChunkCache(0))
-        api = MessageApi(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL)
+        mocker.patch(
+            "tgdcfs.backends.telegram.store.chunk_cache", return_value=ChunkCache(0)
+        )
+        api = TelegramStore(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL)
 
         assert await read(api, 10, 20) == CONTENT[10:21]
         assert bot.ranges == [(10, 20)]
@@ -205,13 +207,13 @@ class TestSafety:
     @pytest.mark.asyncio
     async def test_blocks_of_different_channels_do_not_mix(self, bot, cache, mocker):
         """Mirror copies live in their own channels under their own ids."""
-        mocker.patch("tgdcfs.core.api.message.chunk_cache", return_value=cache)
+        mocker.patch("tgdcfs.backends.telegram.store.chunk_cache", return_value=cache)
         mocker.patch(
-            "tgdcfs.core.api.message._transfer",
+            "tgdcfs.backends.telegram.store._transfer",
             return_value=TransferConfig.from_dict({"chunk_cache_readahead": 0}),
         )
-        first = MessageApi(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), 1)
-        second = MessageApi(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), 2)
+        first = TelegramStore(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), 1)
+        second = TelegramStore(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), 2)
 
         await read(first, 0, 10)
         bot.ranges.clear()
@@ -222,13 +224,15 @@ class TestSafety:
 
 class TestReadAhead:
     @pytest.fixture
-    def api(self, bot, cache, mocker) -> MessageApi:
-        mocker.patch("tgdcfs.core.api.message.chunk_cache", return_value=cache)
+    def api(self, bot, cache, mocker) -> TelegramStore:
+        mocker.patch("tgdcfs.backends.telegram.store.chunk_cache", return_value=cache)
         mocker.patch(
-            "tgdcfs.core.api.message._transfer",
+            "tgdcfs.backends.telegram.store._transfer",
             return_value=TransferConfig.from_dict({"chunk_cache_readahead": 2}),
         )
-        return MessageApi(TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL)
+        return TelegramStore(
+            TDLibApi(bots=cast(Sequence[ITDLibClient], [bot])), CHANNEL
+        )
 
     @pytest.mark.asyncio
     async def test_the_next_blocks_are_pulled_in(self, api, cache):

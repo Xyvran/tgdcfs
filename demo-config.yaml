@@ -1,60 +1,70 @@
-telegram:
-  api_id: hidden
-  api_hash: hidden
-  bot:
-    session_file: bot.session
-    tokens:
-      - hidden
-  private_file_channel: 'tgdcfsdemo'
-  lib: pyrogram
-  # When ``true``, removing a file (or directory) through TGDCFS also issues
-  # ``messages.deleteMessages`` for every backing message in the channel:
-  # the JSON file-descriptor message and every content message of every
-  # version. Default is ``false`` -- metadata is updated but the original
-  # messages stay in the channel, matching historical behavior.
-  # The bot account must be an admin of ``private_file_channel`` with the
-  # "Delete Messages" permission for this to succeed.
-  delete_messages_on_remove: false
-  # ---------------------------------------------------------------------------
-  # Optional channel redundancy (RAID-1-style mirroring).
-  #
-  # ``mirrors`` maps a primary channel id (one of ``private_file_channel``)
-  # to one or more mirror channel ids. Every file part uploaded to the
-  # primary is also copied to each mirror -- server-side via message
-  # forwarding, so no upload bandwidth is spent. If the primary channel is
-  # ever banned or deleted, reads fail over to the mirrors automatically,
-  # and the mirror can be promoted to primary with a pure config change.
-  #
-  # Requirements:
-  #   * your bot(s) must be admin in every mirror channel;
-  #   * the primary channel must not have "Restrict saving content"
-  #     enabled (otherwise use ``mode: reupload``, which is
-  #     bandwidth-bound).
-  #
-  # ``strict: false`` (default): a failed mirror write is logged and the
-  # upload still succeeds; run the backfill task to close gaps later
-  # (Manager API: POST /redundancy/backfill/<channel-name>).
-  # The backfill task also mirrors all files that existed before
-  # redundancy was enabled.
-  #
-  # redundancy:
-  #   mirrors:
-  #     'tgdcfsdemo':
-  #       - 'tgdcfsdemomirror'
-  #   mode: forward     # forward (default) | reupload
-  #   strict: false
+# Backend credentials. One block per backend; only the backends that a
+# store below refers to are logged in.
+backends:
+  telegram:
+    api_id: hidden
+    api_hash: hidden
+    bot:
+      session_file: bot.session
+      tokens:
+        - hidden
+    lib: pyrogram
+    # When ``true``, removing a file (or directory) through TGDCFS also issues
+    # ``messages.deleteMessages`` for every backing message in the channel:
+    # the JSON file-descriptor message and every content message of every
+    # version. Default is ``false`` -- metadata is updated but the original
+    # messages stay in the channel, matching historical behavior.
+    # The bot account must be an admin of every store's channel with the
+    # "Delete Messages" permission for this to succeed.
+    delete_messages_on_remove: false
+
+# Stores: one channel of one backend, under a name of your choosing. The
+# name is only used in this file; the metadata refers to a store by
+# ``<backend prefix>:<channel>`` (here ``tg:tgdcfsdemo``), so renaming a
+# store is safe.
+stores:
+  demo:
+    backend: telegram
+    channel: 'tgdcfsdemo'
+  # demo-mirror:
+  #   backend: telegram
+  #   channel: 'tgdcfsdemomirror'
+
+# File systems: one top-level directory each, backed by a primary store
+# and optional mirror stores. Swapping ``primary`` and a mirror promotes
+# the mirror; see the README.
+#
+# ``mode``: auto (server-side copy where the pair of stores allows it,
+# re-upload otherwise) | forward (server-side only) | reupload.
+# ``sync``: inline (default) | background (accepted; runs inline until the
+# replication queue exists). ``strict: true`` fails an upload when
+# mirroring fails and requires ``sync: inline``.
+#
+# Requirements for mirrors: your bot(s) must be admin in every mirror
+# channel; a primary with "Restrict saving content" enabled needs
+# ``mode: reupload`` or ``auto``. Files that existed before a mirror was
+# added are copied by the backfill task
+# (Manager API: POST /api/redundancy/backfill/<filesystem>).
+filesystems:
+  default:
+    primary: demo
+    # mirrors: [demo-mirror]
+    # mode: auto
+    # sync: inline
+    # strict: false
+    metadata:
+      type: github_repo
+      github_repo:
+        repo: 'tgdcfs-demo/tgdcfs-demo'
+        commit: 'master'
+        access_token: hidden
+
 tgdcfs:
   users:
   jwt:
     secret: hidden
     algorithm: HS256
     life: 604800
-  metadata:
-    type: github_repo
-    github_repo:
-      repo: 'tgdcfs-demo/tgdcfs-demo'
-      commit: 'master'
-      access_token: hidden
   server:
     host: 0.0.0.0
     port: 1900

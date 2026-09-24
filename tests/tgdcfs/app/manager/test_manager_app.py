@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from tgdcfs.app.manager.app import create_manager_app
+from tgdcfs.backends.base import StoreCapabilities
 from tgdcfs.config import Config
 from tgdcfs.core.client import Client
 
@@ -9,8 +10,15 @@ class TestManagerApp:
     @pytest.fixture
     def mock_client(self, mocker):
         client = mocker.Mock(spec=Client)
-        client.message_api = mocker.Mock()
-        client.message_api.get_messages = mocker.AsyncMock()
+        client.store = mocker.Mock()
+        client.store.key = "tg:123456"
+        client.store.get_messages = mocker.AsyncMock()
+        client.store.caps = StoreCapabilities(
+            max_part_bytes=2_000_000_000,
+            max_text_chars=4096,
+            supports_server_copy=True,
+        )
+        client.mirror_group = None
         return client
 
     @pytest.fixture
@@ -18,15 +26,75 @@ class TestManagerApp:
         return {"Test-Channel": mock_client}
 
     @pytest.fixture
-    def mock_config(self, mocker):
-        config = mocker.Mock(spec=Config)
-        config.telegram = mocker.Mock()
-        config.telegram.private_file_channel = ["123456"]
-        config.tgdcfs = mocker.Mock()
-        channel = mocker.Mock()
-        channel.name = "Test-Channel"
-        config.tgdcfs.metadata = {"123456": channel}
-        return config
+    def mock_config(self):
+        return Config.from_dict(
+            {
+                "telegram": {
+                    "api_id": 1,
+                    "api_hash": "h",
+                    "bot": {"token": "t", "session_file": "bot.session"},
+                    "private_file_channel": ["123456"],
+                },
+                "tgdcfs": {
+                    "users": {},
+                    "metadata": {
+                        "123456": {"name": "Test-Channel", "type": "pinned_message"}
+                    },
+                    "jwt": {"secret": "s", "algorithm": "HS256", "life": 3600},
+                    "server": {"host": "0.0.0.0", "port": 8080},
+                },
+            }
+        )
+
+    def test_get_stores(self, mock_clients, mock_config):
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+
+        response = client.get("/stores")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "tg-123456": {
+                "backend": "telegram",
+                "channel": "123456",
+                "key": "tg:123456",
+                "primary_of": ["Test-Channel"],
+                "mirror_of": [],
+                "capabilities": {
+                    "max_part_bytes": 2_000_000_000,
+                    "max_text_chars": 4096,
+                    "supports_server_copy": True,
+                    "supports_edit_media": True,
+                },
+            }
+        }
+
+    def test_get_filesystems(self, mock_clients, mock_config):
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+
+        response = client.get("/filesystems")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "Test-Channel": {
+                "primary": "tg-123456",
+                "mirrors": [],
+                "mode": "auto",
+                "sync": "inline",
+                "strict": False,
+                "read_preference": [],
+                "metadata": "pinned_message",
+                "primary_dead": False,
+            }
+        }
+
+    def test_get_redundancy_without_mirrors(self, mock_clients, mock_config):
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+
+        response = client.get("/redundancy")
+
+        assert response.json() == {
+            "Test-Channel": {"mirrors": [], "mode": None, "strict": False}
+        }
 
     @pytest.fixture
     def manager_app(self, mock_client, mock_config):
@@ -128,7 +196,7 @@ class TestManagerApp:
         mock_message.message_id = 456
         mock_message.document = mocker.Mock(size=1024, mime_type="text/plain")
         mock_message.text = "Test caption"
-        mock_client.message_api.get_messages.return_value = [mock_message]
+        mock_client.store.get_messages.return_value = [mock_message]
 
         app = create_manager_app(mock_clients, mock_config)
         client = TestClient(app)
@@ -143,7 +211,7 @@ class TestManagerApp:
             "mime_type": "text/plain",
         }
         assert response.json() == expected
-        mock_client.message_api.get_messages.assert_called_once_with([456])
+        mock_client.store.get_messages.assert_called_once_with([456])
 
     @pytest.mark.asyncio
     async def test_get_telegram_message_wrong_channel(self, mock_clients, mock_config):
@@ -159,7 +227,7 @@ class TestManagerApp:
     async def test_get_telegram_message_not_found(
         self, mock_client, mock_clients, mock_config
     ):
-        mock_client.message_api.get_messages.return_value = [None]
+        mock_client.store.get_messages.return_value = [None]
 
         app = create_manager_app(mock_clients, mock_config)
         client = TestClient(app)
@@ -176,7 +244,7 @@ class TestManagerApp:
         mock_message = mocker.Mock()
         mock_message.message_id = 456
         mock_message.document = None
-        mock_client.message_api.get_messages.return_value = [mock_message]
+        mock_client.store.get_messages.return_value = [mock_message]
 
         app = create_manager_app(mock_clients, mock_config)
         client = TestClient(app)
@@ -198,7 +266,7 @@ class TestManagerApp:
         mock_message.message_id = 456
         mock_message.document = mocker.Mock(size=1024, mime_type="text/plain")
         mock_message.text = "Test file"
-        mock_client.message_api.get_messages.return_value = [mock_message]
+        mock_client.store.get_messages.return_value = [mock_message]
 
         # Mock Ops
         mock_ops = mocker.Mock()

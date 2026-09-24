@@ -1,9 +1,9 @@
-from .fd.tg_msg import TGMsgFDRepository
-from .file_content import TGMsgFileContentRepository
-from .metadata.pinned_message import TGMsgMetadataRepository
+from .fd.store_msg import StoreFDRepository
+from .file_content import StoreFileContentRepository
+from .metadata.pinned_message import PinnedMessageMetadataRepository
 
 __all__ = [
-    "TGMsgFDRepository",
-    "TGMsgFileContentRepository",
-    "TGMsgMetadataRepository",
+    "PinnedMessageMetadataRepository",
+    "StoreFDRepository",
+    "StoreFileContentRepository",
 ]

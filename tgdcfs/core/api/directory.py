@@ -1,10 +1,10 @@
 from typing import List, Optional
 
+from tgdcfs.backends.base import IStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileRef
 from tgdcfs.errors import DirectoryIsNotEmpty, FileOrDirectoryDoesNotExist
 
 from .file import FileApi
-from .message import MessageApi
 from .metadata import MetaDataApi
 
 
@@ -13,7 +13,7 @@ class DirectoryApi:
         self,
         metadata_api: MetaDataApi,
         file_api: FileApi,
-        message_api: MessageApi,
+        message_api: IStore,
     ):
         self.__metadata_api = metadata_api
         self.__file_api = file_api

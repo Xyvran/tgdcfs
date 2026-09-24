@@ -1,120 +1,86 @@
 import pytest
-from main import create_clients, run_server, main
+
+from main import create_clients, create_store_factory, main, run_server
+from tgdcfs.config import Config
+
+CONFIG = {
+    "backends": {
+        "telegram": {
+            "api_id": 12345,
+            "api_hash": "hash123",
+            "bot": {"token": "bot_token", "session_file": "bot.session"},
+        }
+    },
+    "stores": {
+        "tg-main": {"backend": "telegram", "channel": "-1001"},
+        "tg-spare": {"backend": "telegram", "channel": "-1002"},
+    },
+    "filesystems": {
+        "media": {"primary": "tg-main", "mirrors": ["tg-spare"]},
+        "notes": {"primary": "tg-spare", "allow_shared_store": True},
+    },
+    "tgdcfs": {
+        "users": {},
+        "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
+        "server": {"host": "0.0.0.0", "port": 8080},
+    },
+}
 
 
 class TestMain:
     @pytest.mark.asyncio
-    async def test_create_clients_with_account(self, mocker):
-        # Setup mocks
-        mock_pyrogram_login_account = mocker.AsyncMock()
-        mock_pyrogram_login_bots = mocker.AsyncMock()
-        mock_telethon_login_account = mocker.AsyncMock()
-        mock_telethon_login_bots = mocker.AsyncMock()
-
-        # Mock the imported modules
-        mocker.patch("main.pyrogram.login_as_account", mock_pyrogram_login_account)
-        mocker.patch("main.pyrogram.login_as_bots", mock_pyrogram_login_bots)
-        mocker.patch("main.telethon.login_as_account", mock_telethon_login_account)
-        mocker.patch("main.telethon.login_as_bots", mock_telethon_login_bots)
-
-        mock_client_create = mocker.patch("main.Client.create")
-        mock_tdlib_api = mocker.patch("main.TDLibApi")
-        mock_pyrogram_api = mocker.patch("main.PyrogramAPI")
-        mock_telethon_api = mocker.patch("main.TelethonAPI")
-
-        mock_config = mocker.Mock()
-        mock_config.telegram.account = mocker.Mock()  # Account is configured
-        mock_config.telegram.account.used_to_upload = True  # Account used for upload
-        mock_config.telegram.lib = "pyrogram"  # Using pyrogram
-        mock_config.telegram.private_file_channel = [12345]
-
-        # Mock metadata config
-        mock_metadata_cfg = mocker.Mock()
-        mock_metadata_cfg.name = "test_client"
-        mock_config.tgdcfs.metadata = {12345: mock_metadata_cfg}
-
-        mock_account = mocker.Mock()
-        mock_bots = [mocker.Mock()]
-        mock_client = mocker.Mock()
-        mock_tdlib_instance = mocker.Mock()
-        mock_pyrogram_api_instance = mocker.Mock()
-
-        mock_pyrogram_login_account.return_value = mock_account
-        mock_pyrogram_login_bots.return_value = mock_bots
-        mock_client_create.return_value = mock_client
-        mock_tdlib_api.return_value = mock_tdlib_instance
-        mock_pyrogram_api.return_value = mock_pyrogram_api_instance
-
-        # Call function
-        result = await create_clients(mock_config)
-
-        # Assertions
-        mock_pyrogram_login_account.assert_called_once_with(mock_config)
-        mock_pyrogram_login_bots.assert_called_once_with(mock_config)
-        mock_client_create.assert_called_once_with(
-            12345,
-            mock_metadata_cfg,
-            mock_tdlib_instance,
-            mock_config.telegram.account.used_to_upload,
-            encryption_cfg=mock_config.tgdcfs.encryption,
-            redundancy_cfg=mock_config.telegram.redundancy,
+    async def test_create_clients_logs_in_once_and_builds_every_filesystem(
+        self, mocker
+    ):
+        config = Config.from_dict(CONFIG)
+        tdlib = mocker.Mock()
+        login = mocker.patch(
+            "main.telegram.login", mocker.AsyncMock(return_value=tdlib)
         )
-        assert result == {"test_client": mock_client}
+        stores = {}
+
+        async def fake_create_store(store_cfg, cfg, api):
+            assert cfg is config and api is tdlib
+            stores[store_cfg.name] = mocker.Mock(key=store_cfg.key)
+            return stores[store_cfg.name]
+
+        mocker.patch("main.telegram.create_store", side_effect=fake_create_store)
+        created = {}
+
+        async def fake_client_create(filesystem, cfg, factory, encryption_cfg=None):
+            assert cfg is config
+            assert encryption_cfg is config.tgdcfs.encryption
+            created[filesystem.name] = await factory(cfg.stores[filesystem.primary])
+            return mocker.Mock(name=filesystem.name)
+
+        mocker.patch("main.Client.create", side_effect=fake_client_create)
+
+        result = await create_clients(config)
+
+        login.assert_awaited_once_with(config)
+        assert set(result) == {"media", "notes"}
+        assert created["media"].key == "tg:-1001"
+        assert created["notes"].key == "tg:-1002"
 
     @pytest.mark.asyncio
-    async def test_create_clients_without_account(self, mocker):
-        # Setup mocks
-        mock_telethon_login_account = mocker.AsyncMock()
-        mock_telethon_login_bots = mocker.AsyncMock()
-        mock_pyrogram_login_account = mocker.AsyncMock()
-        mock_pyrogram_login_bots = mocker.AsyncMock()
+    async def test_store_factory_rejects_unknown_backend(self, mocker):
+        config = Config.from_dict(CONFIG)
+        mocker.patch("main.telegram.login", mocker.AsyncMock())
+        factory = await create_store_factory(config)
 
-        # Mock the imported modules
-        mocker.patch("main.pyrogram.login_as_account", mock_pyrogram_login_account)
-        mocker.patch("main.pyrogram.login_as_bots", mock_pyrogram_login_bots)
-        mocker.patch("main.telethon.login_as_account", mock_telethon_login_account)
-        mocker.patch("main.telethon.login_as_bots", mock_telethon_login_bots)
+        store_cfg = mocker.Mock(backend="carrier-pigeon")
+        with pytest.raises(ValueError, match="Unsupported backend"):
+            await factory(store_cfg)
 
-        mock_client_create = mocker.patch("main.Client.create")
-        mock_tdlib_api = mocker.patch("main.TDLibApi")
-        mock_pyrogram_api = mocker.patch("main.PyrogramAPI")
-        mock_telethon_api = mocker.patch("main.TelethonAPI")
+    @pytest.mark.asyncio
+    async def test_store_factory_skips_the_login_of_unused_backends(self, mocker):
+        config = Config.from_dict(CONFIG)
+        config.stores.clear()
+        login = mocker.patch("main.telegram.login", mocker.AsyncMock())
 
-        mock_config = mocker.Mock()
-        mock_config.telegram.account = None  # No account configured
-        mock_config.telegram.lib = "telethon"  # Using telethon
-        mock_config.telegram.private_file_channel = [67890]
+        await create_store_factory(config)
 
-        # Mock metadata config
-        mock_metadata_cfg = mocker.Mock()
-        mock_metadata_cfg.name = "test_client"
-        mock_config.tgdcfs.metadata = {67890: mock_metadata_cfg}
-
-        mock_bots = [mocker.Mock()]
-        mock_client = mocker.Mock()
-        mock_tdlib_instance = mocker.Mock()
-        mock_telethon_api_instance = mocker.Mock()
-
-        mock_telethon_login_bots.return_value = mock_bots
-        mock_client_create.return_value = mock_client
-        mock_tdlib_api.return_value = mock_tdlib_instance
-        mock_telethon_api.return_value = mock_telethon_api_instance
-
-        # Call function
-        result = await create_clients(mock_config)
-
-        # Assertions
-        mock_telethon_login_account.assert_not_called()
-        mock_telethon_login_bots.assert_called_once_with(mock_config)
-        mock_client_create.assert_called_once_with(
-            67890,
-            mock_metadata_cfg,
-            mock_tdlib_instance,
-            False,
-            encryption_cfg=mock_config.tgdcfs.encryption,
-            redundancy_cfg=mock_config.telegram.redundancy,
-        )
-        assert result == {"test_client": mock_client}
+        login.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_run_server(self, mocker):

@@ -2,6 +2,7 @@ import datetime
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Self
 
+from tgdcfs.backends.base import normalize_store_key
 from tgdcfs.errors import (
     FileOrDirectoryAlreadyExists,
     FileOrDirectoryDoesNotExist,
@@ -20,9 +21,14 @@ class TGFSFileRef:
     name: str
     location: "TGFSDirectory" = field(repr=False)
 
-    # Mirror channel id (config string) -> message id of the file
-    # descriptor copy in that channel. Empty when redundancy is off.
+    # Mirror store key -> message id of the file descriptor copy in that
+    # store. Empty when redundancy is off.
     mirrors: Dict[str, int] = field(default_factory=dict)
+
+    # Key of the store ``message_id`` belongs to; ``None`` for refs written
+    # by tgfs, which belong to the configured primary. See
+    # ``TGFSFileVersion.store``.
+    store: Optional[str] = None
 
     def to_dict(self) -> TGFSFileRefSerialized:
         res = TGFSFileRefSerialized(
@@ -32,7 +38,27 @@ class TGFSFileRef:
         )
         if self.mirrors:
             res["mirrors"] = self.mirrors
+        if self.store:
+            res["store"] = self.store
         return res
+
+    def owned_by(self, store_key: str) -> bool:
+        return self.store is None or self.store == store_key
+
+    def relocate(self, primary_key: str) -> None:
+        """Re-express the ref relative to a new primary store.
+
+        Mirrors ``TGFSFileVersion.relocate``: the descriptor id of the old
+        primary becomes that store's mirror entry, and the new primary's
+        copy, if any, becomes ``message_id``.
+        """
+        if self.owned_by(primary_key) or self.store is None:
+            return
+        self.mirrors.setdefault(self.store, self.message_id)
+        if (mid := self.mirrors.get(primary_key)) and mid > 0:
+            del self.mirrors[primary_key]
+            self.message_id = mid
+            self.store = primary_key
 
     def delete(self) -> None:
         self.location.delete_file_ref(self)
@@ -95,10 +121,16 @@ class TGFSDirectory:
                     message_id=file["messageId"],
                     name=file["name"],
                     location=d,
+                    # Bare keys come from tgfs metadata and mean Telegram.
                     mirrors={
-                        str(channel): int(mid)
+                        normalize_store_key(channel): int(mid)
                         for channel, mid in (file.get("mirrors") or {}).items()
                     },
+                    store=(
+                        normalize_store_key(file["store"])
+                        if file.get("store")
+                        else None
+                    ),
                 )
                 for file in data["files"]
                 if file["name"] and file["messageId"]
@@ -184,6 +216,7 @@ class TGFSDirectory:
 
         moved = to.create_file_ref(name, fr.message_id)
         moved.mirrors = dict(fr.mirrors)
+        moved.store = fr.store
         try:
             self.delete_file_ref(fr)
         except Exception:

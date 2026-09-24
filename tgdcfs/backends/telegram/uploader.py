@@ -15,8 +15,9 @@ from tgdcfs.reqres import (
     UploadableFileMessage,
     UploadedFile,
 )
-from tgdcfs.telegram.interface import ITDLibClient
 from tgdcfs.utils.others import flood_wait_seconds, is_big_file
+
+from .interface import ITDLibClient
 
 logger = logging.getLogger(__name__)
 

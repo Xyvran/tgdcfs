@@ -6,7 +6,7 @@ from pyrogram import types as t
 
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import DownloadFileReq
-from tgdcfs.telegram.impl.pyrogram import GET_FILE_CHUNK_SIZE, PyrogramAPI
+from tgdcfs.backends.telegram.impl.pyrogram import GET_FILE_CHUNK_SIZE, PyrogramAPI
 
 
 class TestPyrogramDownload:

@@ -1,147 +1,59 @@
-import asyncio
 import logging
 from typing import Generator, List, Optional
 
-from tgdcfs.core.api import MessageApi
+from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSFileVersion
 from tgdcfs.core.repository.interface import IFileContentRepository
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import (
-    EditMessageMediaReq,
     FileContent,
-    FileMessageFromBuffer,
     SentFileMessage,
     UploadableFileMessage,
 )
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
-from .file_uploader import FileUploader
-
 logger = logging.getLogger(__name__)
-RETRY_INTERVAL = 5  # seconds
 
-PART_SIZE_DEFAULT = (
-    512 * 1024 * 4000
-)  # 2 GB, max size of a single file message in Telegram
-PART_SIZE_PREMIUM = (
-    512 * 1024 * 8000
-)  # 4 GB, max size of a single file message in Telegram Premium
-
-# How many 2 GB parts of one file are fetched at a time. Each part may
-# itself be split across bots, so this multiplies with the per-message
+# How many parts of one file are fetched at a time. Each part may itself
+# be split across bots, so this multiplies with the per-message
 # concurrency -- keep it small.
 PART_PREFETCH_CONCURRENCY = 2
 
 
-class TGMsgFileContentRepository(IFileContentRepository):
+class StoreFileContentRepository(IFileContentRepository):
+    """File content as part messages in a store, mirrored into others.
+
+    Backend-agnostic: the store partitions and moves the bytes, this
+    class maps byte ranges onto parts and fails reads over to mirror
+    copies.
+    """
+
     def __init__(
         self,
-        message_api: MessageApi,
-        use_account_api_to_upload: bool,
+        store: IStore,
         mirror_group: Optional[MirrorGroup] = None,
     ):
-        self._message_api = message_api
-        self._use_account_api_to_upload = (
-            use_account_api_to_upload and self._message_api.tdlib.account
-        )
+        self._store = store
         self._mirror_group = mirror_group
 
-    async def _send_file(
-        self, file_msg: UploadableFileMessage, use_account_api: bool
-    ) -> SentFileMessage:
-        if use_account_api and (account_api := self._message_api.tdlib.account):
-            api = account_api
-        else:
-            api = self._message_api.tdlib.next_bot
-
-        uploader = FileUploader(api, file_msg)
-        logger.info(
-            f"Uploading file {file_msg.name} of size {file_msg.size} bytes to channel {self._message_api.private_file_channel} "
-            f"using {(await api.get_me()).name}."
-        )
-        size = await uploader.upload()
-
-        while True:
-            try:
-                message = await uploader.send(
-                    self._message_api.private_file_channel,
-                )
-                return SentFileMessage(message_id=message.message_id, size=size)
-            except Exception as ex:
-                logger.error(
-                    f"Exception occurred when sending file {file_msg.name}: {ex}. "
-                    f"Waiting {RETRY_INTERVAL} seconds before retrying."
-                )
-                await asyncio.sleep(RETRY_INTERVAL)
-
-    @staticmethod
-    def _partition(size: int, part_size) -> Generator[int]:
-        parts = (size + part_size - 1) // part_size
-        for i in range(parts - 1):
-            yield part_size
-        yield size - (parts - 1) * part_size
-
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
-        size = file_msg.get_size()
+        res = await self._store.upload(file_msg)
 
-        res: List[SentFileMessage] = []
-        file_name = file_msg.name or "unnamed"
-
-        premium_upload = size > PART_SIZE_DEFAULT and self._use_account_api_to_upload
-
-        for i, part_size in enumerate(
-            self._partition(size, PART_SIZE_PREMIUM)
-            if premium_upload
-            else self._partition(size, PART_SIZE_DEFAULT)
-        ):
-            file_msg.name = f"[part{i+1}]{file_name}"
-            file_msg.size = part_size
-            res.append(
-                await self._send_file(
-                    file_msg, use_account_api=True if premium_upload else False
-                )
-            )
-            file_msg.next_part(part_size)
-
-        # Replicate the freshly uploaded parts into the mirror channels.
-        # Server-side forwarding, so this costs one RPC per mirror, not a
-        # second upload. The mapping travels back to the caller inside the
-        # SentFileMessage objects and ends up in TGFSFileVersion.mirrors.
+        # Replicate the freshly uploaded parts into the mirror stores. The
+        # mapping travels back to the caller inside the SentFileMessage
+        # objects and ends up in TGFSFileVersion.mirrors.
         if self._mirror_group:
             mirror_map = await self._mirror_group.mirror_parts(
                 [m.message_id for m in res]
             )
-            for channel_key, mirror_ids in mirror_map.items():
+            for store_key, mirror_ids in mirror_map.items():
                 for sent, mirror_id in zip(res, mirror_ids):
-                    sent.mirrors[channel_key] = mirror_id
+                    sent.mirrors[store_key] = mirror_id
         return res
 
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:
-        file_msg: FileMessageFromBuffer = FileMessageFromBuffer.new(
-            buffer=buffer,
-            name=name,
-        )
-
-        uploader = FileUploader(self._message_api.tdlib.next_bot, file_msg)
-        await uploader.upload()
-
-        while True:
-            try:
-                message = await uploader.client.edit_message_media(
-                    EditMessageMediaReq(
-                        chat=self._message_api.private_file_channel,
-                        message_id=message_id,
-                        file=uploader.get_uploaded_file(),
-                    )
-                )
-                return message.message_id
-            except Exception as ex:
-                logger.error(
-                    f"Exception occurred when editing document of message {message_id}: {ex}. "
-                    f"Waiting {RETRY_INTERVAL} seconds before retrying."
-                )
-                await asyncio.sleep(RETRY_INTERVAL)
+        return await self._store.replace_document(message_id, buffer, name)
 
     @staticmethod
     def _get_file_part_to_download(
@@ -152,7 +64,7 @@ class TGMsgFileContentRepository(IFileContentRepository):
             message_id,
             part_begin,
             part_end,
-        ) in TGMsgFileContentRepository._get_file_parts_indexed(fv, begin, end):
+        ) in StoreFileContentRepository._get_file_parts_indexed(fv, begin, end):
             yield message_id, part_begin, part_end
 
     @staticmethod
@@ -207,21 +119,25 @@ class TGMsgFileContentRepository(IFileContentRepository):
         self, fv: TGFSFileVersion, part_idx: int, message_id: int
     ) -> List[tuple[Optional[str], int]]:
         """Download sources for one part: the primary plus every mirror
-        channel that holds a copy. ``None`` denotes the primary channel.
+        store that holds a copy. ``None`` denotes the primary store.
 
         While the primary is marked dead (circuit breaker), mirrors are
         tried first so each read does not pay a doomed primary RPC; the
         primary stays in the list as the source of last resort.
         """
-        sources: List[tuple[Optional[str], int]] = [(None, message_id)]
+        # A version relocated from a former primary has no copy here yet:
+        # its ids name that store, which is one of the mirrors now.
+        sources: List[tuple[Optional[str], int]] = (
+            [(None, message_id)] if fv.owned_by(self._store.key) else []
+        )
         if self._mirror_group:
-            for channel_key, mirror_ids in (fv.mirrors or {}).items():
+            for store_key, mirror_ids in (fv.mirrors or {}).items():
                 if (
-                    self._mirror_group.api_for(channel_key)
+                    self._mirror_group.store_for(store_key)
                     and part_idx < len(mirror_ids)
                     and mirror_ids[part_idx] > 0
                 ):
-                    sources.append((channel_key, mirror_ids[part_idx]))
+                    sources.append((store_key, mirror_ids[part_idx]))
             if self._mirror_group.primary_dead() and len(sources) > 1:
                 sources = sources[1:] + sources[:1]
         return sources
@@ -237,28 +153,28 @@ class TGMsgFileContentRepository(IFileContentRepository):
         sources = self._part_sources(fv, part_idx, message_id)
         served = 0
         last_ex: Optional[Exception] = None
-        for channel_key, mid in sources:
-            api = (
-                self._message_api
-                if channel_key is None
-                else self._mirror_group.api_for(channel_key)  # type: ignore[union-attr]
+        for store_key, mid in sources:
+            store = (
+                self._store
+                if store_key is None
+                else self._mirror_group.store_for(store_key)  # type: ignore[union-attr]
             )
-            if api is None:
+            if store is None:
                 continue
             try:
-                resp = await api.download_file(mid, begin + served, end)
+                resp = await store.download_file(mid, begin + served, end)
                 async for chunk in resp.chunks:
                     yield chunk
                     served += len(chunk)
                 return
             except Exception as ex:
                 last_ex = ex
-                if channel_key is None and self._mirror_group:
+                if store_key is None and self._mirror_group:
                     self._mirror_group.mark_primary_dead()
                 if len(sources) > 1:
                     logger.warning(
                         f"Downloading part {part_idx} (message {mid}) from "
-                        f"{'primary' if channel_key is None else f'mirror {channel_key}'} "
+                        f"{'primary' if store_key is None else f'mirror {store_key}'} "
                         f"failed: {ex}. Trying next source."
                     )
         if last_ex:

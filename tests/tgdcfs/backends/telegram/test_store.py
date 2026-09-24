@@ -6,7 +6,7 @@ import telethon.types as tlt
 from telethon.errors import MessageNotModifiedError, RPCError
 
 from tgdcfs.config import TransferConfig
-from tgdcfs.core.api.message import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.errors import (
     MessageNotFound,
     NoPinnedMessage,
@@ -27,10 +27,10 @@ from tgdcfs.reqres import (
     SendTextReq,
     Document,
 )
-from tgdcfs.telegram.interface import TDLibApi
+from tgdcfs.backends.telegram.interface import TDLibApi
 
 
-class TestMessageApi:
+class TestTelegramStore:
     @pytest.fixture
     def mock_tdlib(self, mocker):
         tdlib = mocker.Mock(spec=TDLibApi)
@@ -55,12 +55,12 @@ class TestMessageApi:
 
     @pytest.fixture
     def message_api(self, mock_tdlib, mock_private_channel):
-        return MessageApi(mock_tdlib, mock_private_channel)
+        return TelegramStore(mock_tdlib, mock_private_channel)
 
     @pytest.fixture(autouse=True)
     def mock_rate_limiter(self, mocker):
         # Mock the rate limiter to avoid delays in tests
-        mocker.patch("tgdcfs.core.api.message.limiter.try_acquire")
+        mocker.patch("tgdcfs.backends.telegram.store.limiter.try_acquire")
 
     @pytest.mark.asyncio
     async def test_send_text(self, message_api, mock_tdlib, mock_private_channel):
@@ -262,26 +262,26 @@ class TestMessageApi:
         assert result == []
 
     def test_split_download_pieces(self):
-        pieces = list(MessageApi.split_download_pieces(0, 299, 100))
+        pieces = list(TelegramStore.split_download_pieces(0, 299, 100))
 
         assert pieces == [(0, 99), (100, 199), (200, 299)]
 
     def test_split_download_pieces_uneven(self):
         """The last piece is short; it is never padded past ``end``."""
-        pieces = list(MessageApi.split_download_pieces(0, 10, 4))
+        pieces = list(TelegramStore.split_download_pieces(0, 10, 4))
 
         assert pieces == [(0, 3), (4, 7), (8, 10)]
 
     def test_split_download_pieces_shorter_than_one_piece(self):
-        pieces = list(MessageApi.split_download_pieces(10, 19, 4096))
+        pieces = list(TelegramStore.split_download_pieces(10, 19, 4096))
 
         assert pieces == [(10, 19)]
 
     def test_size_calculation(self):
         # _size counts the bytes of an inclusive range
-        assert MessageApi._size(0, 10) == 11
-        assert MessageApi._size(0, 0) == 1
-        assert MessageApi._size(100, 199) == 100
+        assert TelegramStore._size(0, 10) == 11
+        assert TelegramStore._size(0, 0) == 1
+        assert TelegramStore._size(100, 199) == 100
 
     @pytest.mark.asyncio
     async def test_download_file_small(
@@ -314,7 +314,7 @@ class TestMessageApi:
         settings = TransferConfig.from_dict(
             {"parallel_download_threshold_mb": 1, **overrides}
         )
-        mocker.patch("tgdcfs.core.api.message._transfer", return_value=settings)
+        mocker.patch("tgdcfs.backends.telegram.store._transfer", return_value=settings)
         return settings
 
     @staticmethod
@@ -396,7 +396,7 @@ class TestMessageApi:
         def _patch(enabled: bool):
             cfg = mocker.Mock()
             cfg.telegram.delete_messages_on_remove = enabled
-            mocker.patch("tgdcfs.core.api.message.get_config", return_value=cfg)
+            mocker.patch("tgdcfs.backends.telegram.store.get_config", return_value=cfg)
 
         return _patch
 
@@ -486,9 +486,7 @@ class TestMessageApi:
         assert result == mock_response
 
     @pytest.mark.asyncio
-    async def test_duplicate_messages_forwards_in_one_call(
-        self, message_api, mock_tdlib
-    ):
+    async def test_copy_within_forwards_in_one_call(self, message_api, mock_tdlib):
         mock_tdlib.next_bot.forward_messages = AsyncMock(
             return_value=[
                 SendMessageResp(message_id=11),
@@ -496,7 +494,7 @@ class TestMessageApi:
             ]
         )
 
-        result = await message_api.duplicate_messages([1, 2])
+        result = await message_api.copy_within([1, 2])
 
         req = mock_tdlib.next_bot.forward_messages.call_args[0][0]
         # Forwarding is server-side: the documents are not moved, and source
@@ -506,17 +504,15 @@ class TestMessageApi:
         assert result == [11, 12]
 
     @pytest.mark.asyncio
-    async def test_duplicate_messages_without_ids_calls_nothing(
-        self, message_api, mock_tdlib
-    ):
+    async def test_copy_within_without_ids_calls_nothing(self, message_api, mock_tdlib):
         mock_tdlib.next_bot.forward_messages = AsyncMock()
 
-        assert await message_api.duplicate_messages([]) == []
+        assert await message_api.copy_within([]) == []
 
         mock_tdlib.next_bot.forward_messages.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_duplicate_messages_falls_back_to_reupload(
+    async def test_copy_within_falls_back_to_reupload(
         self, message_api, mock_tdlib, mocker
     ):
         # Channels with "restrict saving content" reject forwarding.
@@ -524,20 +520,16 @@ class TestMessageApi:
             side_effect=RuntimeError("CHAT_FORWARDS_RESTRICTED")
         )
         reupload = mocker.patch.object(
-            MessageApi, "reupload_to", new=AsyncMock(side_effect=[21, 22])
+            TelegramStore, "_reupload_within", new=AsyncMock(side_effect=[21, 22])
         )
 
-        result = await message_api.duplicate_messages([1, 2])
+        result = await message_api.copy_within([1, 2])
 
         assert result == [21, 22]
         assert [call.args[0] for call in reupload.call_args_list] == [1, 2]
-        assert all(
-            call.args[1] == message_api.private_file_channel
-            for call in reupload.call_args_list
-        )
 
     @pytest.mark.asyncio
-    async def test_reupload_to_streams_the_document_verbatim(
+    async def test_reupload_within_streams_the_document_verbatim(
         self, message_api, mock_tdlib, mocker
     ):
         message = MessageResp(
@@ -552,37 +544,38 @@ class TestMessageApi:
             ),
         )
         mocker.patch.object(
-            MessageApi, "get_messages", new=AsyncMock(return_value=[message])
+            TelegramStore, "get_messages", new=AsyncMock(return_value=[message])
         )
         chunks = AsyncMock()
         download = mocker.patch.object(
-            MessageApi,
+            TelegramStore,
             "download_file",
             new=AsyncMock(return_value=Mock(spec=DownloadFileResp, chunks=chunks)),
         )
         uploader = Mock()
-        uploader.upload = AsyncMock()
+        uploader.upload = AsyncMock(return_value=64)
         uploader.send = AsyncMock(return_value=SendMessageResp(message_id=99))
         uploader_cls = mocker.patch(
-            "tgdcfs.core.repository.impl.file_content.file_uploader.FileUploader",
+            "tgdcfs.backends.telegram.store.FileUploader",
             return_value=uploader,
         )
+        mock_tdlib.next_bot.get_me = AsyncMock(return_value=Mock(name="bot"))
 
-        result = await message_api.reupload_to(1, 4242)
+        result = await message_api._reupload_within(1)
 
         assert result == 99
         # The whole document is read, and the bytes go over untouched -- this
         # runs below the encryption layer, so ciphertext stays ciphertext.
         download.assert_awaited_once_with(1, 0, 63)
         assert uploader_cls.call_args[0][1].stream is chunks
-        uploader.send.assert_awaited_once_with(4242)
+        uploader.send.assert_awaited_once_with(message_api.private_file_channel)
 
     @pytest.mark.asyncio
-    async def test_reupload_to_rejects_a_message_without_a_document(
+    async def test_reupload_within_rejects_a_message_without_a_document(
         self, message_api, mocker
     ):
         mocker.patch.object(
-            MessageApi,
+            TelegramStore,
             "get_messages",
             new=AsyncMock(
                 return_value=[MessageResp(message_id=1, text="", document=None)]
@@ -590,4 +583,4 @@ class TestMessageApi:
         )
 
         with pytest.raises(MessageNotFound):
-            await message_api.reupload_to(1, 4242)
+            await message_api._reupload_within(1)

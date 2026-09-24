@@ -17,53 +17,38 @@ from uvicorn.server import Server
 
 from tgdcfs.app import create_app
 from tgdcfs.app.sftp import start_sftp_server
-from tgdcfs.config import Config, get_config
+from tgdcfs.backends.base import IStore
+from tgdcfs.backends.telegram import factory as telegram
+from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
-from tgdcfs.telegram import PyrogramAPI, TDLibApi, TelethonAPI, pyrogram, telethon
+from tgdcfs.core.client import StoreFactory
+
+
+async def create_store_factory(config: Config) -> StoreFactory:
+    """Log in to every backend the config uses and return the factory
+    that turns a store config into a live store."""
+    tdlib_api = (
+        await telegram.login(config) if config.uses_backend["telegram"] else None
+    )
+
+    async def create_store(store_cfg: StoreConfig) -> IStore:
+        if store_cfg.backend == "telegram" and tdlib_api is not None:
+            return await telegram.create_store(store_cfg, config, tdlib_api)
+        raise ValueError(f"Unsupported backend: {store_cfg.backend}")
+
+    return create_store
 
 
 async def create_clients(config: Config) -> Clients:
-    if config.telegram.lib == "pyrogram":
-        tdlib_api = TDLibApi(
-            account=(
-                PyrogramAPI(await pyrogram.login_as_account(config))
-                if config.telegram.account
-                else None
-            ),
-            bots=[PyrogramAPI(bot) for bot in await pyrogram.login_as_bots(config)],
-        )
-    else:
-        account = None
-        if config.telegram.account:
-            account_client = await telethon.login_as_account(config)
-            account = TelethonAPI(
-                account_client,
-                await telethon.open_extra_connections(config, account_client),
-            )
-
-        bots = []
-        for bot in await telethon.login_as_bots(config):
-            bots.append(
-                TelethonAPI(bot, await telethon.open_extra_connections(config, bot))
-            )
-
-        tdlib_api = TDLibApi(account=account, bots=bots)
+    store_factory = await create_store_factory(config)
 
     clients: Clients = {}
-
-    for channel_id in config.telegram.private_file_channel:
-        metadata_cfg = config.tgdcfs.metadata[channel_id]
-        clients[metadata_cfg.name] = await Client.create(
-            channel_id,
-            metadata_cfg,
-            tdlib_api,
-            (
-                config.telegram.account.used_to_upload
-                if config.telegram.account
-                else False
-            ),
+    for filesystem in config.filesystems.values():
+        clients[filesystem.name] = await Client.create(
+            filesystem,
+            config,
+            store_factory,
             encryption_cfg=config.tgdcfs.encryption,
-            redundancy_cfg=config.telegram.redundancy,
         )
     return clients
 

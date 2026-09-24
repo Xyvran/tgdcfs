@@ -13,6 +13,7 @@ from telethon.helpers import TotalList
 from telethon.sessions import StringSession
 from telethon.tl.types import InputDocumentFileLocation, PeerChannel
 
+from tgdcfs.backends.telegram.interface import ITDLibClient
 from tgdcfs.config import Config, get_config
 from tgdcfs.errors import TechnicalError, UnDownloadableMessage
 from tgdcfs.reqres import (
@@ -39,7 +40,6 @@ from tgdcfs.reqres import (
     SendMessageResp,
     SendTextReq,
 )
-from tgdcfs.telegram.interface import ITDLibClient
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
 from tgdcfs.utils.others import exclude_none

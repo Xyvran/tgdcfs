@@ -4,7 +4,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from tgdcfs.core.repository.impl.file_content.file_uploader import (
+from tgdcfs.backends.telegram.uploader import (
     MAX_PART_ATTEMPTS,
     FileChunk,
     WorkersConfig,
@@ -18,14 +18,14 @@ from tgdcfs.reqres import (
     SendMessageResp,
 )
 from tgdcfs.tasks.integrations import TaskTracker
-from tgdcfs.telegram.interface import ITDLibClient, TDLibApi
+from tgdcfs.backends.telegram.interface import ITDLibClient, TDLibApi
 
 
 @pytest.fixture
 def no_backoff(mocker):
     """Skip the retry backoff so the retry tests do not sit in real sleeps."""
     return mocker.patch(
-        "tgdcfs.core.repository.impl.file_content.file_uploader.asyncio.sleep",
+        "tgdcfs.backends.telegram.uploader.asyncio.sleep",
         new=mocker.AsyncMock(),
     )
 
@@ -387,7 +387,7 @@ class TestErrorHandling:
             seconds = 17
 
         sleep = mocker.patch(
-            "tgdcfs.core.repository.impl.file_content.file_uploader.asyncio.sleep",
+            "tgdcfs.backends.telegram.uploader.asyncio.sleep",
             new=mocker.AsyncMock(),
         )
         mock_client.save_file_part = mocker.AsyncMock(

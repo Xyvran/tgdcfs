@@ -1,7 +1,7 @@
 import json
 from typing import AsyncIterator, Dict, Optional
 
-from tgdcfs.core.api import MessageApi
+from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion, TGFSMetadata
 from tgdcfs.core.repository.interface import IFileContentRepository, IMetaDataRepository
@@ -16,23 +16,29 @@ from tgdcfs.reqres import (
 )
 
 
-class TGMsgMetadataRepository(IMetaDataRepository):
+class PinnedMessageMetadataRepository(IMetaDataRepository):
+    """The directory tree as a pinned document in the primary store.
+
+    Backend-agnostic; the mirror group keeps a pinned copy in every
+    mirror store so any of them can be promoted to primary.
+    """
+
     METADATA_FILE_NAME = "metadata.json"
 
     def __init__(
         self,
-        message_api: MessageApi,
+        store: IStore,
         fc_repo: IFileContentRepository,
         mirror_group: Optional[MirrorGroup] = None,
     ):
         super().__init__()
 
-        self._message_api = message_api
+        self._message_api = store
         self._fc_repo = fc_repo
         self._mirror_group = mirror_group
 
         self._message_id: Optional[int] = None
-        # Mirror channel id -> message id of the pinned metadata copy there.
+        # Mirror store key -> message id of the pinned metadata copy there.
         self._mirror_message_ids: Dict[str, int] = {}
 
     async def push(self) -> None:
@@ -48,7 +54,7 @@ class TGMsgMetadataRepository(IMetaDataRepository):
             )
             # The primary blob was edited in place, so the mirror copies
             # are stale now: forward the fresh blob, pin it, drop the old
-            # copy. Keeps every mirror channel self-sufficient for a
+            # copy. Keeps every mirror store self-sufficient for a
             # config-level promotion after the primary is lost.
             if self._mirror_group:
                 await self._mirror_group.mirror_pinned(

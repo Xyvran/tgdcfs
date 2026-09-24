@@ -1,87 +1,94 @@
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
+from tgdcfs.backends.base import IStore
 from tgdcfs.config import (
+    Config,
     EncryptionConfig,
-    MetadataConfig,
+    FilesystemConfig,
     MetadataType,
-    RedundancyConfig,
+    StoreConfig,
 )
-from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MessageApi, MetaDataApi
-from tgdcfs.core.mirror import MirrorChannel, MirrorGroup
+from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
+from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.repository.impl import (
-    TGMsgFDRepository,
-    TGMsgFileContentRepository,
-    TGMsgMetadataRepository,
+    PinnedMessageMetadataRepository,
+    StoreFDRepository,
+    StoreFileContentRepository,
 )
 from tgdcfs.core.repository.interface import (
     IFDRepository,
     IFileContentRepository,
     IMetaDataRepository,
 )
-from tgdcfs.telegram import TDLibApi
+
+# Builds the live store for a store config; the backends' logins live
+# behind it so ``Client.create`` never touches a backend library.
+StoreFactory = Callable[[StoreConfig], Awaitable[IStore]]
 
 
 class Client:
+    """One virtual file system: a primary store, its mirrors and the APIs
+    that serve the tree stored there."""
+
     def __init__(
         self,
         name: str,
-        message_api: MessageApi,
+        store: IStore,
         file_api: FileApi,
         dir_api: DirectoryApi,
         fc_repo: IFileContentRepository,
         fd_repo: Optional[IFDRepository] = None,
         metadata_api: Optional[MetaDataApi] = None,
         mirror_group: Optional[MirrorGroup] = None,
+        filesystem: Optional[FilesystemConfig] = None,
     ):
         self.name = name
-        self.message_api = message_api
+        self.store = store
         self.file_api = file_api
         self.dir_api = dir_api
         self.fc_repo = fc_repo
         self.fd_repo = fd_repo
         self.metadata_api = metadata_api
         self.mirror_group = mirror_group
+        self.filesystem = filesystem
+
+    @property
+    def message_api(self) -> IStore:
+        """The primary store, under the name the app layer grew up with."""
+        return self.store
 
     @classmethod
     async def create(
         cls,
-        channel_id: str,
-        metadata_cfg: MetadataConfig,
-        tdlib_api: TDLibApi,
-        use_account_api_to_upload: bool = False,
+        filesystem: FilesystemConfig,
+        config: Config,
+        store_factory: StoreFactory,
         encryption_cfg: Optional[EncryptionConfig] = None,
-        redundancy_cfg: Optional[RedundancyConfig] = None,
     ) -> "Client":
-        channel = await tdlib_api.next_bot.resolve_channel_id(channel_id)
-        message_api = MessageApi(tdlib_api, channel)
+        store = await store_factory(config.stores[filesystem.primary])
 
-        # One MessageApi per mirror channel; the serialization key stays
-        # the config string (stable across telegram libs), the resolved
-        # id is only used on the wire.
+        # One store per mirror; the serialization key is the store's key
+        # (backend prefix + channel id as configured), stable across
+        # backend libs and config renames.
         mirror_group: Optional[MirrorGroup] = None
-        if redundancy_cfg and (mirror_ids := redundancy_cfg.mirrors.get(channel_id)):
-            mirror_channels: List[MirrorChannel] = []
-            for mirror_id in mirror_ids:
-                resolved = await tdlib_api.next_bot.resolve_channel_id(mirror_id)
-                mirror_channels.append(
-                    MirrorChannel(
-                        key=mirror_id,
-                        message_api=MessageApi(tdlib_api, resolved),
+        if filesystem.mirrors:
+            mirror_stores: List[MirrorStore] = []
+            for mirror_name in filesystem.mirrors:
+                mirror_cfg = config.stores[mirror_name]
+                mirror_stores.append(
+                    MirrorStore(
+                        key=mirror_cfg.key, store=await store_factory(mirror_cfg)
                     )
                 )
             mirror_group = MirrorGroup(
-                primary=message_api,
-                channels=mirror_channels,
-                mode=redundancy_cfg.mode,
-                strict=redundancy_cfg.strict,
+                primary=store,
+                stores=mirror_stores,
+                mode=filesystem.mode,
+                strict=filesystem.strict,
             )
 
-        fc_repo: IFileContentRepository = TGMsgFileContentRepository(
-            message_api,
-            use_account_api_to_upload
-            and tdlib_api.account is not None
-            and (await tdlib_api.account.get_me()).is_premium,
-            mirror_group=mirror_group,
+        fc_repo: IFileContentRepository = StoreFileContentRepository(
+            store, mirror_group=mirror_group
         )
 
         # Wrap the file-content repository in an encryption decorator if
@@ -110,16 +117,18 @@ class Client:
 
                 path_name_key = derive_path_name_key(master.key)
 
-        fd_repo = TGMsgFDRepository(message_api, mirror_group=mirror_group)
+        fd_repo = StoreFDRepository(store, mirror_group=mirror_group)
 
+        metadata_cfg = filesystem.metadata
         if metadata_cfg.type == MetadataType.PINNED_MESSAGE:
-            metadata_repo: IMetaDataRepository = TGMsgMetadataRepository(
-                message_api, fc_repo, mirror_group=mirror_group
+            metadata_repo: IMetaDataRepository = PinnedMessageMetadataRepository(
+                store, fc_repo, mirror_group=mirror_group
             )
         else:
             if (github_repo_config := metadata_cfg.github_repo) is None:
                 raise ValueError(
-                    "configuration tgdcfs -> metadata -> github is required."
+                    f"configuration filesystems -> {filesystem.name} -> metadata "
+                    f"-> github_repo is required."
                 )
             from tgdcfs.core.repository.impl.metadata.github_repo import (
                 GithubRepoMetadataRepository,
@@ -134,18 +143,19 @@ class Client:
         metadata_api = MetaDataApi(metadata_repo)
         await metadata_api.init()
 
-        file_api = FileApi(metadata_api, fd_api, message_api, mirror_group=mirror_group)
-        dir_api = DirectoryApi(metadata_api, file_api, message_api)
+        file_api = FileApi(metadata_api, fd_api, store, mirror_group=mirror_group)
+        dir_api = DirectoryApi(metadata_api, file_api, store)
 
         return cls(
-            name=metadata_cfg.name,
-            message_api=message_api,
+            name=filesystem.name,
+            store=store,
             file_api=file_api,
             dir_api=dir_api,
             fc_repo=fc_repo,
             fd_repo=fd_repo,
             metadata_api=metadata_api,
             mirror_group=mirror_group,
+            filesystem=filesystem,
         )
 
 

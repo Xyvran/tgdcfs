@@ -474,7 +474,7 @@ async def test_encrypt_names_consistent_across_multipart_split() -> None:
     file's parts stay correlated by message_id (and by the consistent
     encrypted name) the same way they would for plaintext uploads.
 
-    We simulate the real ``TGMsgFileContentRepository.save`` loop, which
+    We simulate the real ``StoreFileContentRepository.save`` loop, which
     captures the base name once and then prefixes ``[partN]`` per part.
     """
     from tgdcfs.crypto.names import NAME_PREFIX, decrypt_name, derive_name_key
@@ -486,7 +486,7 @@ async def test_encrypt_names_consistent_across_multipart_split() -> None:
 
     async def multipart_save(file_msg):
         # Mirror the partition + rename loop in
-        # ``tgdcfs.core.repository.impl.file_content.TGMsgFileContentRepository``.
+        # ``tgdcfs.core.repository.impl.file_content.StoreFileContentRepository``.
         base = file_msg.name or "unnamed"
         total = file_msg.get_size()
         # Three artificial parts; the size split is irrelevant for the

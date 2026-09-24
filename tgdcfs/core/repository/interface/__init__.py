@@ -17,9 +17,11 @@ from tgdcfs.reqres import FileContent, SentFileMessage, UploadableFileMessage
 class FDRepositoryResp:
     message_id: int
     fd: TGFSFileDesc
-    # Mirror channel id -> message id of the FD copy in that channel.
+    # Mirror store key -> message id of the FD copy in that store.
     # Empty when redundancy is off.
     mirrors: Dict[str, int] = field(default_factory=dict)
+    # Key of the store ``message_id`` was written to.
+    store: Optional[str] = None
 
 
 class IFileContentRepository(metaclass=ABCMeta):

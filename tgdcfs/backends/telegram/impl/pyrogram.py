@@ -9,6 +9,7 @@ from pyrogram import types as t
 from pyrogram.raw import functions as rf
 from pyrogram.raw import types as rt
 
+from tgdcfs.backends.telegram.interface import ITDLibClient
 from tgdcfs.config import Config
 from tgdcfs.errors import TechnicalError, UnDownloadableMessage
 from tgdcfs.reqres import (
@@ -35,7 +36,6 @@ from tgdcfs.reqres import (
     SendMessageResp,
     SendTextReq,
 )
-from tgdcfs.telegram.interface import ITDLibClient
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
 from tgdcfs.utils.others import exclude_none

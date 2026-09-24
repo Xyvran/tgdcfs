@@ -3,7 +3,7 @@ import datetime
 
 from tgdcfs.core.api.file import FileApi
 from tgdcfs.core.api.file_desc import FileDescApi
-from tgdcfs.core.api.message import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.api.metadata import MetaDataApi
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.errors import FileOrDirectoryAlreadyExists, FileOrDirectoryDoesNotExist
@@ -25,7 +25,9 @@ class TestFileApi:
 
     @pytest.fixture
     def mock_message_api(self, mocker):
-        return mocker.AsyncMock(spec=MessageApi)
+        store = mocker.AsyncMock(spec=TelegramStore)
+        store.key = "tg:111"
+        return store
 
     @pytest.fixture
     def file_api(
@@ -94,7 +96,7 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.return_value = self._fd_with_parts(
             ("v1", [200, 201], [10, 20])
         )
-        mock_message_api.duplicate_messages.return_value = [300, 301]
+        mock_message_api.copy_within.return_value = [300, 301]
         resp = mocker.Mock()
         resp.message_id = 999
         resp.mirrors = {}
@@ -104,7 +106,7 @@ class TestFileApi:
 
         # The whole history is duplicated in a single call, and nothing is
         # uploaded: the copy points at fresh messages of its own.
-        mock_message_api.duplicate_messages.assert_called_once_with([200, 201])
+        mock_message_api.copy_within.assert_called_once_with([200, 201])
         copied_fd = mock_file_desc_api.save_new_file_desc.call_args[0][0]
         assert copied_fd.get_latest_version().message_ids == [300, 301]
         assert copied_fd.get_latest_version().part_sizes == [10, 20]
@@ -128,7 +130,7 @@ class TestFileApi:
             ("v2", [201, 202], [20, 30]),
         )
         mock_file_desc_api.get_file_desc.return_value = source
-        mock_message_api.duplicate_messages.return_value = [301, 302, 300]
+        mock_message_api.copy_within.return_value = [301, 302, 300]
         resp = mocker.Mock()
         resp.message_id = 999
         resp.mirrors = {}
@@ -165,7 +167,7 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.return_value = self._fd_with_parts(
             ("v1", [200], [10])
         )
-        mock_message_api.duplicate_messages.return_value = [300]
+        mock_message_api.copy_within.return_value = [300]
         resp = mocker.Mock()
         resp.message_id = 999
         resp.mirrors = {}
@@ -190,7 +192,7 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.return_value = self._fd_with_parts(
             ("v1", [200], [10])
         )
-        mock_message_api.duplicate_messages.return_value = [300]
+        mock_message_api.copy_within.return_value = [300]
         mock_file_desc_api.save_new_file_desc.side_effect = RuntimeError("channel down")
 
         with pytest.raises(RuntimeError):
@@ -214,7 +216,7 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.return_value = self._fd_with_parts(
             ("v1", [200], [10])
         )
-        mock_message_api.duplicate_messages.return_value = [300]
+        mock_message_api.copy_within.return_value = [300]
         resp = mocker.Mock()
         resp.message_id = 999
         resp.mirrors = {}
@@ -260,6 +262,7 @@ class TestFileApi:
         resp = mocker.Mock()
         resp.message_id = sample_file_ref.message_id
         resp.mirrors = dict(sample_file_ref.mirrors)
+        resp.store = sample_file_ref.store
 
         await file_api._sync_file_ref(sample_file_ref, resp)
 

@@ -1,16 +1,16 @@
-"""Backfill: mirror pre-existing data into the redundancy channels.
+"""Backfill: mirror pre-existing data into the mirror stores.
 
 When redundancy is enabled on an existing installation, nothing that is
-already in the channel has a mirror copy. This module walks the metadata
+already in the primary store has a mirror copy. This module walks the metadata
 tree (the authoritative work list -- everything TGDCFS serves is reachable
 from it), finds file versions without a complete mirror set, and copies
 them using the same primitives as the live write path.
 
 The job is idempotent and resumable for free: a version is skipped when
-its ``mirrors`` map already covers every configured channel, and the FD
+its ``mirrors`` map already covers every configured store, and the FD
 edit that records the map is the commit point of each unit of work. A
 crash between forward and commit merely leaves an orphaned copy in the
-mirror channel, which is harmless.
+mirror store, which is harmless.
 """
 
 from __future__ import annotations
@@ -63,26 +63,26 @@ async def _verify_mirrors(client: "Client", fd: TGFSFileDesc) -> None:
     if (mirror_group := client.mirror_group) is None:
         return
     for version in fd.get_versions(exclude_invalid=True):
-        for channel_key in list(version.mirrors.keys()):
-            if (api := mirror_group.api_for(channel_key)) is None:
+        for store_key in list(version.mirrors.keys()):
+            if (api := mirror_group.store_for(store_key)) is None:
                 continue
-            ids = [mid for mid in version.mirrors[channel_key] if mid > 0]
+            ids = [mid for mid in version.mirrors[store_key] if mid > 0]
             if not ids:
                 continue
             try:
                 messages = await api.get_messages(ids)
             except Exception as ex:
                 logger.warning(
-                    f"Verification of mirror channel {channel_key} failed "
+                    f"Verification of mirror store {store_key} failed "
                     f"for {fd.name}@{version.id}: {ex}"
                 )
                 continue
             if any(m is None or m.document is None for m in messages):
                 logger.warning(
-                    f"Mirror copy of {fd.name}@{version.id} in channel "
-                    f"{channel_key} is incomplete, scheduling re-mirror"
+                    f"Mirror copy of {fd.name}@{version.id} in store "
+                    f"{store_key} is incomplete, scheduling re-mirror"
                 )
-                del version.mirrors[channel_key]
+                del version.mirrors[store_key]
 
 
 async def _backfill_file(
@@ -105,13 +105,11 @@ async def _backfill_file(
     changed = False
     for version in fd.get_versions(exclude_invalid=True):
         report.versions_checked += 1
-        missing = mirror_group.missing_channels(
-            version.mirrors, len(version.message_ids)
-        )
+        missing = mirror_group.missing_stores(version.mirrors, len(version.message_ids))
         if not missing:
             continue
         mirrored = await mirror_group.mirror_parts(
-            version.message_ids, only_channels=missing
+            version.message_ids, only_stores=missing
         )
         if mirrored:
             version.mirrors.update(mirrored)
@@ -124,7 +122,7 @@ async def _backfill_file(
                 f"{', '.join(still_missing)}"
             )
 
-    fd_missing = set(mirror_group.channel_keys) - {
+    fd_missing = set(mirror_group.store_keys) - {
         key for key, mid in fr.mirrors.items() if mid > 0
     }
 
@@ -132,9 +130,14 @@ async def _backfill_file(
         # Commit point: the (possibly updated) mirrors map is persisted
         # in the FD message, and the FD itself gets its mirror copies.
         resp = await fd_repo.save(fd, fr)
-        if resp.mirrors != fr.mirrors or resp.message_id != fr.message_id:
+        if (
+            resp.mirrors != fr.mirrors
+            or resp.message_id != fr.message_id
+            or resp.store != fr.store
+        ):
             fr.message_id = resp.message_id
             fr.mirrors = dict(resp.mirrors)
+            fr.store = resp.store
         if fd_missing:
             report.fds_mirrored += 1
 
@@ -144,7 +147,7 @@ async def backfill_mirrors(
     verify: bool = False,
     task_id: Optional[str] = None,
 ) -> BackfillReport:
-    """Mirror every unmirrored file version of ``client``'s channel.
+    """Mirror every unmirrored file version of ``client``'s file system.
 
     Files are processed newest first so the most recent data is
     protected earliest. Failures are recorded and skipped -- rerunning
@@ -154,7 +157,7 @@ async def backfill_mirrors(
 
     if client.mirror_group is None or client.fd_repo is None:
         report.failures.append(
-            f"Channel '{client.name}' has no mirror channels configured"
+            f"File system '{client.name}' has no mirror stores configured"
         )
         return report
 
@@ -175,13 +178,13 @@ async def backfill_mirrors(
 
     metadata_dirty = False
     for fr, _ in dated:
-        before = (fr.message_id, dict(fr.mirrors))
+        before = (fr.message_id, dict(fr.mirrors), fr.store)
         try:
             await _backfill_file(client, fr, verify, report)
         except Exception as ex:
             report.failures.append(f"{fr.name}: {ex}")
             logger.error(f"Backfill failed for {fr.name}: {ex}")
-        if before != (fr.message_id, fr.mirrors):
+        if before != (fr.message_id, fr.mirrors, fr.store):
             metadata_dirty = True
         report.files_scanned += 1
         if task_id:

@@ -19,12 +19,80 @@ logger = logging.getLogger(__name__)
 
 
 def create_manager_app(clients: Clients, config: Config) -> FastAPI:
-    ops = {channel_id: Ops(client) for channel_id, client in clients.items()}
+    ops = {name: Ops(client) for name, client in clients.items()}
 
-    def get_name_by_channel_id(channel_id: int) -> str:
-        return config.tgdcfs.metadata[str(channel_id)].name
+    def get_name_by_channel_id(channel_id: int) -> Optional[str]:
+        """File system whose primary is the Telegram channel ``channel_id``.
+
+        The mini app imports messages by Telegram channel id, so this
+        lookup stays keyed by channel rather than by store name.
+        """
+        fs = config.filesystem_for_channel("telegram", str(channel_id))
+        return fs.name if fs else None
 
     app = FastAPI()
+
+    @app.get("/stores")
+    async def get_stores():
+        """Configured stores with their backend and capabilities."""
+        res = {}
+        for name, store_cfg in config.stores.items():
+            entry: dict = {
+                "backend": store_cfg.backend,
+                "channel": store_cfg.channel,
+                "key": store_cfg.key,
+                "primary_of": [
+                    fs.name for fs in config.filesystems.values() if fs.primary == name
+                ],
+                "mirror_of": [
+                    fs.name for fs in config.filesystems.values() if name in fs.mirrors
+                ],
+            }
+            # Capabilities come from the live store; a store only referenced
+            # by a file system that failed to start has none.
+            for client in clients.values():
+                live = (
+                    client.store
+                    if client.store.key == store_cfg.key
+                    else (
+                        client.mirror_group.store_for(store_cfg.key)
+                        if client.mirror_group
+                        else None
+                    )
+                )
+                if live is not None:
+                    caps = live.caps
+                    entry["capabilities"] = {
+                        "max_part_bytes": caps.max_part_bytes,
+                        "max_text_chars": caps.max_text_chars,
+                        "supports_server_copy": caps.supports_server_copy,
+                        "supports_edit_media": caps.supports_edit_media,
+                    }
+                    break
+            res[name] = entry
+        return res
+
+    @app.get("/filesystems")
+    async def get_filesystems():
+        """File systems with their primary, mirrors and mirroring settings."""
+        res = {}
+        for name, fs in config.filesystems.items():
+            client = clients.get(name)
+            res[name] = {
+                "primary": fs.primary,
+                "mirrors": list(fs.mirrors),
+                "mode": fs.mode,
+                "sync": fs.sync,
+                "strict": fs.strict,
+                "read_preference": list(fs.read_preference),
+                "metadata": fs.metadata.type.value,
+                "primary_dead": bool(
+                    client
+                    and client.mirror_group
+                    and client.mirror_group.primary_dead()
+                ),
+            }
+        return res
 
     @app.get("/tasks", response_model=List[dict])
     async def get_tasks(
@@ -54,15 +122,19 @@ def create_manager_app(clients: Clients, config: Config) -> FastAPI:
 
     @app.get("/redundancy")
     async def get_redundancy():
-        """Redundancy configuration overview, per client."""
-        redundancy = config.telegram.redundancy
+        """Redundancy overview per file system, keyed by mirror store key.
+
+        Kept for the tgfs manager UI; ``/filesystems`` is the fuller view.
+        """
         return {
             name: {
                 "mirrors": (
-                    client.mirror_group.channel_keys if client.mirror_group else []
+                    client.mirror_group.store_keys if client.mirror_group else []
                 ),
-                "mode": redundancy.mode if redundancy else None,
-                "strict": redundancy.strict if redundancy else False,
+                "mode": client.mirror_group.mode if client.mirror_group else None,
+                "strict": (
+                    client.mirror_group.strict if client.mirror_group else False
+                ),
             }
             for name, client in clients.items()
         }
@@ -81,7 +153,7 @@ def create_manager_app(clients: Clients, config: Config) -> FastAPI:
         if client.mirror_group is None:
             raise HTTPException(
                 status_code=400,
-                detail=f"No mirror channels configured for '{client_name}'",
+                detail=f"No mirror stores configured for '{client_name}'",
             )
 
         task_id = await create_backfill_task(client, count_files(client))
@@ -96,16 +168,16 @@ def create_manager_app(clients: Clients, config: Config) -> FastAPI:
         return {"task_id": task_id}
 
     async def get_message(channel_id: int, message_id: int) -> MessageRespWithDocument:
-        if str(channel_id) not in config.telegram.private_file_channel:
+        if (client_name := get_name_by_channel_id(channel_id)) is None:
             raise HTTPException(
                 status_code=400,
                 detail="The message is not in one of the configured file channels. "
                 "Please forward the message to the file channel of your importing location first.",
             )
 
-        client = clients[get_name_by_channel_id(channel_id)]
+        client = clients[client_name]
 
-        message = (await client.message_api.get_messages([message_id]))[0]
+        message = (await client.store.get_messages([message_id]))[0]
 
         if not message:
             raise HTTPException(

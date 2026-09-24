@@ -1,9 +1,10 @@
 # tgdcfs: Architecture and Implementation Plan
 
-Status: proposal (nothing implemented yet). This document plans how to
-build tgdcfs as a new project: the tgfs code base as the main part, plus
-Discord as a second storage backend that can be configured next to
-Telegram, either as the primary store or as a mirror, in both directions.
+Status: phases 0 and 1 implemented (see "Progress" at the end), phases
+2 to 4 planned. This document plans how to build tgdcfs as a new
+project: the tgfs code base as the main part, plus Discord as a second
+storage backend that can be configured next to Telegram, either as the
+primary store or as a mirror, in both directions.
 
 Reference implementations:
 
@@ -550,3 +551,54 @@ Decisions taken (2026-09-24):
    Pages) are set up fresh for the new repository, see section 3.2.
 3. Cross-backend replication defaults to `sync: background`.
 4. FTP and SMB from dcfs are not ported for now.
+
+## 9. Progress
+
+### Phase 0 (done)
+
+Flat copy of tgfs at commit `7464666`, package renamed, `TGFS_*`
+environment variables and the `tgfs:` config block accepted with a
+deprecation warning, on-disk format constants kept.
+
+### Phase 1 (done)
+
+* `tgdcfs/backends/base.py`: `IStore`, `StoreCapabilities`, store keys
+  (`make_store_key`, `normalize_store_key`). `tgdcfs/backends/telegram/`
+  holds the moved Telegram code; `TelegramStore` (formerly `MessageApi`)
+  owns the 2 GiB partitioning, `replace_document`, `copy_within` and
+  `copy_from`; `factory.py` logs in and builds stores.
+* Repositories are backend-agnostic: `StoreFileContentRepository`,
+  `StoreFDRepository`, `PinnedMessageMetadataRepository`.
+* `MirrorGroup` works on stores with `mode: auto | forward | reupload`;
+  `auto` tries `copy_from` and falls back to re-uploading through
+  `target.upload()`. A re-upload that the target splits into several
+  messages is refused until replicas exist (phase 3).
+* Config: `backends`, `stores`, `filesystems`; the tgfs layout is
+  translated on load; validation as in section 5. `sync: background` is
+  accepted and runs inline for now.
+* Manager: `GET /stores`, `GET /filesystems`; `/redundancy` and the
+  backfill endpoint kept.
+* Metadata keys carry the backend prefix; bare keys from tgfs are read
+  as `tg:`.
+
+Deviations from the plan, found while implementing:
+
+* **Promotion needed a data change.** tgfs assumed `messageIds` and
+  the descriptor `messageId` belong to whatever store is configured as
+  primary, so swapping primary and mirror would have pointed every id
+  at the wrong channel. Versions and file refs now record the owning
+  store key (`store` field, absent in tgfs metadata) and are relocated
+  on load: the old primary's ids become that store's mirror entry, the
+  new primary's copy becomes the primary ids, and a version without a
+  copy in the new primary stays readable from the old store and is
+  never written to by id in the new one. Copying such versions into the
+  new primary is left to the replication queue (phase 3). Metadata
+  written by tgfs has no `store` field and keeps the old assumption.
+* **The primary must be reachable for validation.** `_validate_fv`
+  now survives a primary that raises (banned channel) and checks the
+  mirrors instead; tgfs only handled missing messages, not a dead
+  store.
+* **The pinned metadata blob must fit one primary part.** The pinned
+  reader assumes a single-part document; that holds on Telegram (2 GiB)
+  and needs attention before a Discord primary (10 MB parts) can carry
+  `pinned_message` metadata for a large tree. Phase 2 item.

@@ -1,9 +1,10 @@
 import datetime
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 from uuid import uuid4 as uuid
 
+from tgdcfs.backends.base import normalize_store_key
 from tgdcfs.reqres import SentFileMessage
 from tgdcfs.utils.time import FIRST_DAY_OF_EPOCH, ts
 
@@ -25,10 +26,17 @@ class TGFSFileVersion:
     message_ids: List[int] = field(default_factory=list)
     part_sizes: List[int] = field(default_factory=list)  # sizes of each part
 
-    # Mirror channel id (config string) -> message ids of the copies of
-    # each part in that channel, aligned with message_ids. A 0 entry
-    # means "this part has no copy in that channel (yet)".
+    # Mirror store key -> message ids of the copies of each part in that
+    # store, aligned with message_ids. A 0 entry means "this part has no
+    # copy in that store (yet)".
     mirrors: Dict[str, List[int]] = field(default_factory=dict)
+
+    # Key of the store that ``message_ids`` belong to. ``None`` for
+    # versions written before the field existed (tgfs), which always
+    # belong to the configured primary. When the configured primary is a
+    # different store (the mirror was promoted), ``relocate`` re-expresses
+    # the version relative to the new primary.
+    store: Optional[str] = None
 
     @property
     def updated_at_timestamp(self) -> int:
@@ -52,6 +60,8 @@ class TGFSFileVersion:
         # seeing the exact format they always did.
         if self.mirrors:
             res["mirrors"] = self.mirrors
+        if self.store:
+            res["store"] = self.store
         return res
 
     @staticmethod
@@ -63,7 +73,9 @@ class TGFSFileVersion:
         )
 
     @staticmethod
-    def from_sent_file_message(*messages: SentFileMessage) -> "TGFSFileVersion":
+    def from_sent_file_message(
+        *messages: SentFileMessage, store: Optional[str] = None
+    ) -> "TGFSFileVersion":
         mirrors: Dict[str, List[int]] = {}
         for channel in {ch for msg in messages for ch in msg.mirrors}:
             mirrors[channel] = [msg.mirrors.get(channel, 0) for msg in messages]
@@ -73,6 +85,7 @@ class TGFSFileVersion:
             message_ids=[msg.message_id for msg in messages],
             part_sizes=[msg.size for msg in messages],
             mirrors=mirrors,
+            store=store,
         )
 
     @staticmethod
@@ -92,10 +105,13 @@ class TGFSFileVersion:
             updated_at=updated_at,
             message_ids=message_ids,
             part_sizes=[],  # part sizes are not serialized
+            # Keys written by tgfs are bare Telegram channel ids; they are
+            # read as ``tg:`` keys and written back with the prefix.
             mirrors={
-                str(channel): list(ids)
+                normalize_store_key(channel): list(ids)
                 for channel, ids in (data.get("mirrors") or {}).items()
             },
+            store=(normalize_store_key(data["store"]) if data.get("store") else None),
         )
 
     def set_invalid(self):
@@ -106,6 +122,34 @@ class TGFSFileVersion:
 
     def is_valid(self) -> bool:
         return bool(self.message_ids)
+
+    def owned_by(self, store_key: str) -> bool:
+        """Whether ``message_ids`` are ids of ``store_key``.
+
+        A version without a recorded store belongs to whatever store is
+        the primary; that is what tgfs always assumed.
+        """
+        return self.store is None or self.store == store_key
+
+    def relocate(self, primary_key: str) -> None:
+        """Re-express the version relative to a new primary store.
+
+        After a mirror is promoted, ``message_ids`` still name messages of
+        the old primary. They become that store's mirror entry, and the
+        new primary's mirror entry, when it is complete, becomes
+        ``message_ids``. Without a complete copy in the new primary the
+        ids keep pointing at the old store, which readers then treat as a
+        mirror: the version stays readable, and nothing is ever written
+        to those ids in the wrong store.
+        """
+        if self.owned_by(primary_key) or self.store is None:
+            return
+        self.mirrors.setdefault(self.store, list(self.message_ids))
+        ids = self.mirrors.get(primary_key)
+        if ids and len(ids) == len(self.message_ids) and all(i > 0 for i in ids):
+            del self.mirrors[primary_key]
+            self.message_ids = list(ids)
+            self.store = primary_key
 
 
 @dataclass

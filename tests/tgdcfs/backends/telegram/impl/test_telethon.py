@@ -7,7 +7,7 @@ from telethon.helpers import TotalList
 from telethon import types as tlt
 from telethon.errors import FileReferenceExpiredError, SessionPasswordNeededError
 
-from tgdcfs.telegram.impl.telethon import (
+from tgdcfs.backends.telegram.impl.telethon import (
     DOWNLOAD_REQUEST_SIZE,
     TelethonAPI,
     Session,
@@ -126,7 +126,9 @@ class TestTelethonAPI:
         mock_cache.__setitem__ = mocker.Mock()
         mock_cache.gets.return_value = []
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
         mock_channel_cache.return_value = mock_cache_instance
@@ -150,7 +152,9 @@ class TestTelethonAPI:
             MessageResp(message_id=12345, text="cached", document=None)
         ]
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
         mock_channel_cache.return_value = mock_cache_instance
@@ -241,7 +245,9 @@ class TestTelethonAPI:
         mock_cache = mocker.Mock()
         mock_cache.__setitem__ = mocker.Mock()
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
         mock_channel_cache.return_value = mock_cache_instance
@@ -265,7 +271,9 @@ class TestTelethonAPI:
         mock_cache = mocker.Mock()
         mock_cache.__setitem__ = mocker.Mock()
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
         mock_channel_cache.return_value = mock_cache_instance
@@ -286,7 +294,9 @@ class TestTelethonAPI:
 
         req = SearchMessageReq(chat=mock_chat, search="test query")
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_search_cache = mocker.Mock()
         mock_search_cache.__contains__ = mocker.Mock(return_value=False)
         mock_search_cache.__setitem__ = mocker.Mock()
@@ -309,7 +319,9 @@ class TestTelethonAPI:
         req = SearchMessageReq(chat=mock_chat, search="cached query")
         cached_result = (MessageResp(message_id=1, text="cached", document=None),)
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_search_cache = mocker.Mock()
         mock_search_cache.__contains__ = mocker.Mock(return_value=True)
         mock_search_cache.__getitem__ = mocker.Mock(return_value=cached_result)
@@ -343,7 +355,9 @@ class TestTelethonAPI:
         mock_cache = mocker.Mock()
         mock_cache.__setitem__ = mocker.Mock()
 
-        mock_channel_cache = mocker.patch("tgdcfs.telegram.impl.telethon.channel_cache")
+        mock_channel_cache = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.channel_cache"
+        )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
         mock_channel_cache.return_value = mock_cache_instance
@@ -821,9 +835,9 @@ class TestLoginAsAccount:
         mock_user = mocker.Mock(spec=tlt.User)
         mock_user.username = "testuser"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
 
         mock_session_instance = MockSession.return_value
@@ -849,9 +863,9 @@ class TestLoginAsAccount:
         mock_sms_req = mocker.Mock()
         mock_sms_req.phone_code_hash = "test_hash"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -888,9 +902,9 @@ class TestLoginAsAccount:
         mock_sms_req = mocker.Mock()
         mock_sms_req.phone_code_hash = "test_hash"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -930,9 +944,9 @@ class TestLoginAsAccount:
         mock_sms_req = mocker.Mock()
         mock_sms_req.phone_code_hash = "test_hash"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -955,11 +969,11 @@ class TestLoginAsAccount:
         mock_user = mocker.Mock(spec=tlt.User)
         mock_user.username = None
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
-        mock_logger = mocker.patch("tgdcfs.telegram.impl.telethon.logger")
+        mock_logger = mocker.patch("tgdcfs.backends.telegram.impl.telethon.logger")
 
         mock_session_instance = MockSession.return_value
         mock_session_instance.get.return_value = mocker.Mock(spec=StringSession)
@@ -1011,9 +1025,9 @@ class TestLoginAsBots:
         mock_users[0].username = "bot1"
         mock_users[1].username = "bot2"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1059,9 +1073,9 @@ class TestLoginAsBots:
         mock_user = mocker.Mock(spec=tlt.User)
         mock_user.username = "singlebot"
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1102,9 +1116,9 @@ class TestLoginAsBots:
         mock_user.username = "existingbot"
         existing_session = mocker.Mock(spec=StringSession)
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1142,12 +1156,12 @@ class TestLoginAsBots:
         mock_user = mocker.Mock(spec=tlt.User)
         mock_user.username = None
 
-        MockSession = mocker.patch("tgdcfs.telegram.impl.telethon.Session")
+        MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
-        mock_logger = mocker.patch("tgdcfs.telegram.impl.telethon.logger")
+        mock_logger = mocker.patch("tgdcfs.backends.telegram.impl.telethon.logger")
 
         mock_session_instance = mocker.Mock()
         MockSession.return_value = mock_session_instance
@@ -1258,7 +1272,9 @@ class TestOpenExtraConnections:
     def _pool_size(mocker, size: int):
         cfg = Mock()
         cfg.tgdcfs.transfer = TransferConfig.from_dict({"connection_pool_size": size})
-        mocker.patch("tgdcfs.telegram.impl.telethon.get_config", return_value=cfg)
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.get_config", return_value=cfg
+        )
 
     @pytest.mark.asyncio
     async def test_a_pool_of_one_opens_nothing(self, mocker, config):
@@ -1272,9 +1288,9 @@ class TestOpenExtraConnections:
         self._pool_size(mocker, 4)
         client = mocker.MagicMock()
         client.session.save.return_value = "session-string"
-        mocker.patch("tgdcfs.telegram.impl.telethon.StringSession")
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.StringSession")
         built = mocker.patch(
-            "tgdcfs.telegram.impl.telethon.TelegramClient",
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient",
             side_effect=lambda *_a, **_kw: mocker.AsyncMock(spec=TelegramClient),
         )
 
@@ -1292,7 +1308,7 @@ class TestOpenExtraConnections:
         self._pool_size(mocker, 4)
         client = mocker.MagicMock()
         client.session.save.return_value = "session-string"
-        mocker.patch("tgdcfs.telegram.impl.telethon.StringSession")
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.StringSession")
 
         opened: list = []
 
@@ -1303,7 +1319,9 @@ class TestOpenExtraConnections:
             opened.append(connection)
             return connection
 
-        mocker.patch("tgdcfs.telegram.impl.telethon.TelegramClient", side_effect=build)
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.TelegramClient", side_effect=build
+        )
 
         extra = await open_extra_connections(config, client)
 
@@ -1316,7 +1334,9 @@ class TestChunkCacheInvalidation:
     @pytest.fixture
     def cache(self, mocker):
         cache = ChunkCache(1024 * 1024)
-        mocker.patch("tgdcfs.telegram.impl.telethon.chunk_cache", return_value=cache)
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.chunk_cache", return_value=cache
+        )
         return cache
 
     @pytest.fixture

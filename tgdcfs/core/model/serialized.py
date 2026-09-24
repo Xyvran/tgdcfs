@@ -8,10 +8,14 @@ class TGFSFileVersionSerialized(TypedDict, total=False):
     messageId: int
     messageIds: List[int]
     size: int
-    # Mirror channel id -> message ids of the forwarded copies of each
-    # part, in the same order as messageIds. Absent when redundancy is
-    # not in use, so pre-redundancy metadata parses unchanged.
+    # Mirror store key (``tg:<channel>``; a bare channel id is a Telegram
+    # key written by tgfs) -> message ids of the copies of each part, in
+    # the same order as messageIds. Absent when redundancy is not in use,
+    # so pre-redundancy metadata parses unchanged.
     mirrors: Dict[str, List[int]]
+    # Store key that messageIds belong to. Absent for versions written by
+    # tgfs (they belong to the configured primary).
+    store: str
 
 
 class TGFSFileDescSerialized(TypedDict, total=False):
@@ -24,9 +28,11 @@ class TGFSFileRefSerialized(TypedDict, total=False):
     type: Literal["FR"]
     messageId: int
     name: str
-    # Mirror channel id -> message id of the file descriptor copy in
-    # that channel. Absent when redundancy is not in use.
+    # Mirror store key -> message id of the file descriptor copy in that
+    # store. Absent when redundancy is not in use.
     mirrors: Dict[str, int]
+    # Store key that messageId belongs to; absent for refs written by tgfs.
+    store: str
 
 
 class TGFSDirectorySerialized(TypedDict, total=False):

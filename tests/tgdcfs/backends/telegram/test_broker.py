@@ -4,10 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from tgdcfs.core.api.message import message_broker as mb
-from tgdcfs.core.api.message.message_broker import MessageBroker
+from tgdcfs.backends.telegram import broker as mb
+from tgdcfs.backends.telegram.broker import MessageBroker
 from tgdcfs.reqres import GetMessagesResp, MessageResp
-from tgdcfs.telegram.interface import ITDLibClient, TDLibApi
+from tgdcfs.backends.telegram.interface import ITDLibClient, TDLibApi
 from tgdcfs.utils.message_cache import channel_cache, global_message_cache
 
 

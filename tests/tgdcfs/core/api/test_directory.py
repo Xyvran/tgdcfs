@@ -4,7 +4,7 @@ import pytest
 
 from tgdcfs.core.api.directory import DirectoryApi
 from tgdcfs.core.api.file import FileApi
-from tgdcfs.core.api.message import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.api.metadata import MetaDataApi
 from tgdcfs.core.model import TGFSDirectory, TGFSFileRef, TGFSFileVersion
 from tgdcfs.errors import DirectoryIsNotEmpty
@@ -21,7 +21,9 @@ class TestDirectoryApi:
 
     @pytest.fixture
     def mock_message_api(self, mocker):
-        return mocker.AsyncMock(spec=MessageApi)
+        store = mocker.AsyncMock(spec=TelegramStore)
+        store.key = "tg:111"
+        return store
 
     @pytest.fixture
     def dir_api(

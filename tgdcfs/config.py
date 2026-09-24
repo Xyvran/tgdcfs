@@ -6,6 +6,8 @@ from typing import Dict, List, Literal, Optional, Self, TypedDict
 
 import yaml
 
+from tgdcfs.backends import BACKEND_NAMES, BACKEND_PREFIXES, make_store_key
+
 logger = logging.getLogger(__name__)
 
 
@@ -569,6 +571,13 @@ class TelegramConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "TelegramConfig":
+        # ``private_file_channel`` and ``redundancy`` belong to the legacy
+        # (tgfs) layout, where the file channels were listed under the
+        # backend. In the current layout they are ``stores`` and
+        # ``filesystems``; see ``Config.from_dict``.
+        channels = data.get("private_file_channel") or []
+        if isinstance(channels, (str, int)):
+            channels = [channels]
         return cls(
             api_id=data["api_id"],
             api_hash=data["api_hash"],
@@ -576,7 +585,7 @@ class TelegramConfig:
                 AccountConfig.from_dict(data["account"]) if "account" in data else None
             ),
             bot=BotConfig.from_dict(data["bot"]),
-            private_file_channel=data["private_file_channel"],
+            private_file_channel=[str(c) for c in channels],
             lib=data.get("lib") or "telethon",
             delete_messages_on_remove=bool(
                 data.get("delete_messages_on_remove", False)
@@ -586,9 +595,247 @@ class TelegramConfig:
 
 
 @dataclass
+class StoreConfig:
+    """One channel of one backend, under a name of the user's choosing.
+
+    The name is only used inside the config (file systems refer to
+    stores by it); what ends up in the metadata is ``key``, built from
+    the backend and the channel id, so a store can be renamed freely.
+    """
+
+    name: str
+    backend: str
+    channel: str
+
+    @property
+    def key(self) -> str:
+        return make_store_key(BACKEND_PREFIXES[self.backend], self.channel)
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict) -> "StoreConfig":
+        backend = str(data.get("backend") or "telegram")
+        if backend not in BACKEND_PREFIXES:
+            raise ValueError(
+                f"stores.{name}: unknown backend '{backend}', "
+                f"available: {', '.join(BACKEND_PREFIXES)}"
+            )
+        if backend not in BACKEND_NAMES:
+            raise ValueError(
+                f"stores.{name}: backend '{backend}' is not available in this "
+                f"version yet"
+            )
+        if (channel := data.get("channel")) is None or str(channel) == "":
+            raise ValueError(f"stores.{name}: 'channel' is required")
+        return cls(name=name, backend=backend, channel=str(channel))
+
+
+MirrorMode = Literal["auto", "forward", "reupload"]
+SyncMode = Literal["inline", "background"]
+
+
+@dataclass
+class FilesystemConfig:
+    """A virtual file system: one primary store plus mirror stores.
+
+    ``mode`` picks how parts reach a mirror: ``auto`` copies server-side
+    when the pair of stores allows it and re-uploads otherwise,
+    ``forward`` insists on the server-side copy, ``reupload`` never asks
+    for one. ``sync`` says whether mirroring happens inside the write
+    (``inline``) or from a background queue (``background``; accepted
+    already, but it behaves like ``inline`` until the replication queue
+    exists). ``strict`` fails the write when a mirror write fails and
+    therefore requires ``inline``.
+    """
+
+    name: str
+    primary: str
+    mirrors: List[str]
+    mode: MirrorMode
+    sync: SyncMode
+    strict: bool
+    read_preference: List[str]
+    metadata: MetadataConfig
+    allow_shared_store: bool = False
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict) -> "FilesystemConfig":
+        if not (primary := data.get("primary")):
+            raise ValueError(f"filesystems.{name}: 'primary' is required")
+        mirrors = [str(m) for m in (data.get("mirrors") or [])]
+        if str(primary) in mirrors:
+            raise ValueError(
+                f"filesystems.{name}: the primary store cannot be its own mirror"
+            )
+        if len(set(mirrors)) != len(mirrors):
+            raise ValueError(f"filesystems.{name}: duplicate mirror store")
+
+        mode = str(data.get("mode", "auto"))
+        if mode not in ("auto", "forward", "reupload"):
+            raise ValueError(
+                f"filesystems.{name}: unknown mode '{mode}', "
+                f"available options: auto, forward, reupload"
+            )
+        sync = str(data.get("sync", "inline"))
+        if sync not in ("inline", "background"):
+            raise ValueError(
+                f"filesystems.{name}: unknown sync '{sync}', "
+                f"available options: inline, background"
+            )
+        strict = bool(data.get("strict", False))
+        if strict and sync == "background":
+            raise ValueError(
+                f"filesystems.{name}: 'strict: true' requires 'sync: inline'"
+            )
+        if sync == "background":
+            logger.warning(
+                f"filesystems.{name}: 'sync: background' is not implemented yet, "
+                f"mirroring runs inline"
+            )
+
+        metadata_data: MetadataConfigDict = {
+            "name": name,
+            "type": MetadataType.PINNED_MESSAGE.value,
+            "github_repo": None,
+        }
+        metadata_data.update(data.get("metadata") or {})  # type: ignore[typeddict-item]
+        metadata = MetadataConfig.from_dict(metadata_data)
+        return cls(
+            name=name,
+            primary=str(primary),
+            mirrors=mirrors,
+            mode=mode,  # type: ignore[arg-type]
+            sync=sync,  # type: ignore[arg-type]
+            strict=strict,
+            read_preference=[str(s) for s in (data.get("read_preference") or [])],
+            metadata=metadata,
+            allow_shared_store=bool(data.get("allow_shared_store", False)),
+        )
+
+    @property
+    def store_names(self) -> List[str]:
+        return [self.primary, *self.mirrors]
+
+
+def _legacy_stores_and_filesystems(
+    telegram: TelegramConfig, app: TGFSConfig
+) -> tuple[Dict[str, StoreConfig], Dict[str, FilesystemConfig]]:
+    """Translate the tgfs layout into stores and file systems.
+
+    ``telegram.private_file_channel`` lists the primary channels,
+    ``tgfs.metadata[<channel>]`` names each file system, and
+    ``telegram.redundancy.mirrors[<channel>]`` lists its mirrors. Store
+    names are derived from the channel id; they never reach the
+    metadata, so the choice is free.
+    """
+    stores: Dict[str, StoreConfig] = {}
+    filesystems: Dict[str, FilesystemConfig] = {}
+
+    def store_name(channel: str) -> str:
+        name = f"tg-{channel}"
+        if name not in stores:
+            stores[name] = StoreConfig(name=name, backend="telegram", channel=channel)
+        return name
+
+    redundancy = telegram.redundancy
+    for channel in telegram.private_file_channel:
+        if (metadata := app.metadata.get(channel)) is None:
+            raise ValueError(
+                f"configuration tgdcfs -> metadata -> {channel} is missing"
+            )
+        mirror_channels = redundancy.mirrors.get(channel, []) if redundancy else []
+        filesystems[metadata.name] = FilesystemConfig(
+            name=metadata.name,
+            primary=store_name(channel),
+            mirrors=[store_name(m) for m in mirror_channels],
+            mode=redundancy.mode if redundancy else "auto",
+            sync="inline",
+            strict=redundancy.strict if redundancy else False,
+            read_preference=[],
+            metadata=metadata,
+            # tgfs allowed any channel arrangement; keep that.
+            allow_shared_store=True,
+        )
+    return stores, filesystems
+
+
+def _validate_filesystems(
+    stores: Dict[str, StoreConfig], filesystems: Dict[str, FilesystemConfig]
+) -> None:
+    primaries: Dict[str, str] = {}
+    for fs in filesystems.values():
+        for store_name in fs.store_names:
+            if store_name not in stores:
+                raise ValueError(f"filesystems.{fs.name}: unknown store '{store_name}'")
+        for store_name in fs.read_preference:
+            if store_name not in fs.store_names:
+                raise ValueError(
+                    f"filesystems.{fs.name}: read_preference names '{store_name}', "
+                    f"which is neither its primary nor one of its mirrors"
+                )
+        if (other := primaries.get(fs.primary)) is not None:
+            raise ValueError(
+                f"filesystems.{fs.name}: store '{fs.primary}' is already the "
+                f"primary of '{other}'"
+            )
+        primaries[fs.primary] = fs.name
+    for fs in filesystems.values():
+        for mirror in fs.mirrors:
+            if (owner := primaries.get(mirror)) and not (
+                fs.allow_shared_store or filesystems[owner].allow_shared_store
+            ):
+                raise ValueError(
+                    f"filesystems.{fs.name}: mirror '{mirror}' is the primary of "
+                    f"'{owner}'; two trees writing into one store invites id "
+                    f"confusion, set 'allow_shared_store: true' to allow it"
+                )
+
+
+@dataclass
 class Config:
+    """The whole configuration.
+
+    Current layout::
+
+        backends:
+          telegram: {...}
+        stores:
+          <name>: {backend: telegram, channel: "..."}
+        filesystems:
+          <name>: {primary: <store>, mirrors: [<store>], metadata: {...}}
+        tgdcfs: {...}
+
+    The tgfs layout (``telegram.private_file_channel``, ``tgfs.metadata``
+    keyed by channel, ``telegram.redundancy``) is translated on load.
+    """
+
     telegram: TelegramConfig
     tgdcfs: TGFSConfig
+    stores: Dict[str, StoreConfig] = field(default_factory=dict)
+    filesystems: Dict[str, FilesystemConfig] = field(default_factory=dict)
+
+    def filesystem_for_store(self, store_name: str) -> Optional[FilesystemConfig]:
+        """The file system whose primary is ``store_name``."""
+        for fs in self.filesystems.values():
+            if fs.primary == store_name:
+                return fs
+        return None
+
+    def filesystem_for_channel(
+        self, backend: str, channel: str
+    ) -> Optional[FilesystemConfig]:
+        """The file system whose primary store is ``channel`` of ``backend``."""
+        for store in self.stores.values():
+            if store.backend == backend and store.channel == str(channel):
+                if fs := self.filesystem_for_store(store.name):
+                    return fs
+        return None
+
+    @property
+    def uses_backend(self) -> Dict[str, bool]:
+        return {
+            name: any(store.backend == name for store in self.stores.values())
+            for name in BACKEND_PREFIXES
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
@@ -604,9 +851,42 @@ class Config:
             app_data = data["tgfs"]
         else:
             raise ValueError("configuration block 'tgdcfs' is missing")
+
+        # Backend credentials: ``backends.telegram`` in the current layout,
+        # top-level ``telegram`` in the tgfs layout.
+        backends = data.get("backends") or {}
+        if "telegram" in backends:
+            telegram_data = backends["telegram"]
+        elif "telegram" in data:
+            telegram_data = data["telegram"]
+        else:
+            raise ValueError("configuration block 'backends.telegram' is missing")
+        telegram = TelegramConfig.from_dict(telegram_data)
+        app = TGFSConfig.from_dict(app_data)
+
+        if "stores" in data or "filesystems" in data:
+            if telegram.private_file_channel:
+                raise ValueError(
+                    "'telegram.private_file_channel' cannot be combined with "
+                    "'stores'/'filesystems'; list the channel as a store instead"
+                )
+            stores = {
+                str(name): StoreConfig.from_dict(str(name), store or {})
+                for name, store in (data.get("stores") or {}).items()
+            }
+            filesystems = {
+                str(name): FilesystemConfig.from_dict(str(name), fs or {})
+                for name, fs in (data.get("filesystems") or {}).items()
+            }
+        else:
+            stores, filesystems = _legacy_stores_and_filesystems(telegram, app)
+
+        _validate_filesystems(stores, filesystems)
         return cls(
-            telegram=TelegramConfig.from_dict(data["telegram"]),
-            tgdcfs=TGFSConfig.from_dict(app_data),
+            telegram=telegram,
+            tgdcfs=app,
+            stores=stores,
+            filesystems=filesystems,
         )
 
 

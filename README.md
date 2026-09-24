@@ -79,8 +79,8 @@ encryption, channel redundancy and the manager UI's task list. SSH cannot
 share a socket with HTTP, hence the separate port.
 
 **Layout and accounts.** The root lists one directory per configured
-channel, exactly like `/webdav` does, and everything below it is that
-channel's tree. Accounts are the `tgdcfs.users` from the same config: a user
+file system, exactly like `/webdav` does, and everything below it is that
+file system's tree. Accounts are the `tgdcfs.users` from the same config: a user
 with `readonly: true` can list and download but gets "permission denied" on
 uploads, deletes, renames and directory creation. With no users configured
 at all, SFTP allows anonymous read-only access — the same deal the HTTP
@@ -118,52 +118,108 @@ version), moving between two channels is refused, and there are no symlinks
 or real POSIX permissions — `chmod`, `chown` and `touch -t` are accepted
 and ignored so clients like `rsync` do not abort.
 
-## Channel redundancy
+## Stores and file systems
+
+A **store** is one channel of one backend (Telegram today, Discord
+next), under a name of your choosing. A **file system** is what you see
+as a top-level directory over WebDAV and SFTP: it has one *primary*
+store and any number of *mirror* stores, and the same store can play
+either role. Swapping primary and mirror is a config change.
+
+```yaml
+backends:
+  telegram:
+    api_id: 12345
+    api_hash: "..."
+    bot:
+      session_file: bot.session
+      tokens: ["..."]
+    delete_messages_on_remove: false
+
+stores:
+  tg-main:  {backend: telegram, channel: "-1001234567890"}
+  tg-spare: {backend: telegram, channel: "-1009876543210"}
+
+filesystems:
+  media:
+    primary: tg-main
+    mirrors: [tg-spare]
+    mode: auto           # auto (default) | forward | reupload
+    sync: inline         # inline (default) | background (accepted, runs inline for now)
+    strict: false        # true: an upload fails when mirroring fails
+    metadata:
+      type: pinned_message   # or github_repo, see below
+
+tgdcfs:
+  users: {...}
+  jwt: {...}
+  server: {host: 0.0.0.0, port: 1900}
+```
+
+The tgfs layout (`telegram.private_file_channel`, `tgfs.metadata` keyed
+by channel id, `telegram.redundancy`) is still accepted and translated
+on load, so a tgfs `config.yaml` works unchanged. The two layouts cannot
+be mixed in one file.
+
+Rules the loader enforces: every store a file system names exists; a
+store is the primary of at most one file system; a file system does not
+mirror into its own primary; a store that is the primary of one file
+system is not a mirror of another unless that file system sets
+`allow_shared_store: true` (two trees writing into one channel invites
+id confusion); `strict: true` requires `sync: inline`.
+
+The manager API describes the result: `GET /api/stores` lists the stores
+with their backend, key and capabilities, `GET /api/filesystems` the
+file systems with their primary, mirrors and mirroring settings.
+
+## Mirroring
 
 Telegram channels can be banned or deleted, taking every stored file with
-them. With redundancy enabled, TGDCFS keeps a full copy of everything in one
-or more *mirror channels*:
+them. With mirror stores configured, TGDCFS keeps a full copy of everything
+in each of them:
 
-* **Mirroring is server-side.** New uploads are copied to the mirrors via
-  Telegram's message forwarding — no re-upload, one API call per file part.
+* **Copies are server-side where possible.** Between two Telegram stores
+  new uploads are copied via message forwarding — no re-upload, one API
+  call per file part. Where a server-side copy is impossible (a channel
+  with "Restrict saving content", or, later, a mirror on another
+  backend) the part is streamed down and up again. `mode: auto` picks
+  the cheap path and falls back; `forward` insists on the server-side
+  copy; `reupload` never asks for one.
 * **Reads fail over automatically.** If a part (or the whole primary
-  channel) becomes unavailable, downloads are served from a mirror.
+  store) becomes unavailable, downloads are served from a mirror.
 * **File descriptors are mirrored too**, and in `pinned_message` metadata
   mode a pinned copy of the metadata blob is maintained in every mirror,
-  so a mirror channel is self-sufficient: if the primary is banned, swap
-  the mirror in as `private_file_channel` in the config and keep going.
+  so a mirror store is self-sufficient.
+* **Promotion is a config change.** Every descriptor and version written
+  by TGDCFS records which store its ids belong to. When the primary is
+  lost, make the mirror the `primary` and the old primary a mirror (or
+  drop it): versions the new primary holds are served from it, versions
+  it never received stay readable from the old store, and new uploads go
+  to the new primary. Metadata written by tgfs carries no store
+  information and is assumed to belong to the configured primary, so
+  run the backfill task once under TGDCFS before relying on a swap.
 * **Pre-existing files are covered by the backfill task**
-  (`POST /redundancy/backfill/<channel-name>` on the manager API, progress
-  via the regular `/tasks` endpoints; add `?verify=true` to also re-mirror
-  copies that were manually deleted). Backfill forwards server-side as
-  well, so mirroring a multi-terabyte library costs API calls, not
-  bandwidth.
+  (`POST /api/redundancy/backfill/<filesystem>`, progress via the
+  regular `/api/tasks` endpoints; add `?verify=true` to also re-mirror
+  copies that were manually deleted). Between Telegram stores backfill
+  forwards server-side as well, so mirroring a multi-terabyte library
+  costs API calls, not bandwidth.
 * **Works with encryption**: mirrors receive the ciphertext messages
   including the inline header, so files remain decryptable from a mirror
   alone.
 
-Set up:
-
-```yaml
-telegram:
-  private_file_channel:
-    - '1234567890'
-  redundancy:
-    mirrors:
-      '1234567890':      # primary channel id
-        - '9876543210'   # mirror channel id(s)
-    mode: forward        # forward (default) | reupload
-    strict: false        # true: uploads fail when mirroring fails
-```
-
-Requirements: the bot(s) must be admin in every mirror channel, and the
-primary channel must not have "Restrict saving content" enabled —
-otherwise set `mode: reupload` (bandwidth-bound). With `strict: false`
-(default) a failing mirror never fails the upload; gaps are logged and can
-be closed by re-running the backfill task.
+Requirements: the bot(s) must be admin in every mirror channel. With
+`strict: false` (default) a failing mirror never fails the upload; gaps
+are logged and can be closed by re-running the backfill task.
 
 When redundancy matters to you, prefer the `github_repo` metadata type:
-the directory tree then survives even the loss of *all* channels.
+the directory tree then survives even the loss of *all* stores.
+
+**Metadata keys.** Mirror entries in the metadata are keyed by the
+store's key, `<backend prefix>:<channel id as configured>`, for example
+`tg:-1001234567890`. Entries written by tgfs carry the bare channel id;
+they are read as Telegram keys and written back with the prefix. Store
+*names* never reach the metadata, so a store can be renamed freely.
 
 ## At-rest encryption
 

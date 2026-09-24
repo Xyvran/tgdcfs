@@ -2,6 +2,7 @@ import logging
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from uuid import uuid4 as uuid
 
+from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.repository.interface import FDRepositoryResp
@@ -13,12 +14,11 @@ from tgdcfs.reqres import (
 )
 
 from .file_desc import FileDescApi
-from .message import MessageApi
 from .metadata import MetaDataApi
 
 logger = logging.getLogger(__name__)
 
-# {mirror channel id -> message ids to delete there}
+# {mirror store key -> message ids to delete there}
 MirrorMessageIds = Dict[str, List[int]]
 
 
@@ -33,7 +33,7 @@ class FileApi:
         self,
         metadata_api: MetaDataApi,
         file_desc_api: FileDescApi,
-        message_api: MessageApi,
+        message_api: IStore,
         mirror_group: Optional[MirrorGroup] = None,
     ):
         self._metadata_api = metadata_api
@@ -42,7 +42,7 @@ class FileApi:
         self._mirror_group = mirror_group
 
     async def collect_message_ids(self, fr: TGFSFileRef) -> List[int]:
-        """Return every primary-channel message id backing ``fr``.
+        """Return every primary-store message id backing ``fr``.
 
         Includes the file descriptor message itself plus every content
         message across all known versions. Returns just the descriptor
@@ -56,12 +56,9 @@ class FileApi:
         self, fr: TGFSFileRef
     ) -> Tuple[List[int], MirrorMessageIds]:
         """Like :meth:`collect_message_ids`, but also returns the message
-        ids of every mirrored copy, grouped by mirror channel."""
+        ids of every mirrored copy, grouped by mirror store."""
         ids: List[int] = []
         mirror_ids: MirrorMessageIds = {}
-        if fr.message_id > 0:
-            ids.append(fr.message_id)
-        _merge_mirror_ids(mirror_ids, fr.mirrors)
         try:
             fd = await self._file_desc_api.get_file_desc(fr)
         except Exception as ex:
@@ -69,14 +66,47 @@ class FileApi:
                 f"Could not load file descriptor for {fr.name} "
                 f"(message_id={fr.message_id}): {ex}"
             )
+            fd = None
+        # After get_file_desc the ref is relocated, so its ids are sorted
+        # into the right store below.
+        self._collect_ref_ids(fr, ids, mirror_ids)
+        if fd is None:
             return ids, mirror_ids
         for version in fd.get_versions():
-            ids.extend(mid for mid in version.message_ids if mid > 0)
-            for channel_key, version_mirror_ids in version.mirrors.items():
-                mirror_ids.setdefault(channel_key, []).extend(
-                    mid for mid in version_mirror_ids if mid > 0
-                )
+            self._collect_version_ids(version, ids, mirror_ids)
         return ids, mirror_ids
+
+    @property
+    def _store_key(self) -> str:
+        return self._message_api.key
+
+    def _collect_ref_ids(
+        self, fr: TGFSFileRef, ids: List[int], mirror_ids: MirrorMessageIds
+    ) -> None:
+        """Sort the descriptor id into the primary or the store it belongs to.
+
+        An id that belongs to a former primary must never be deleted
+        from the current one: it names an unrelated message there.
+        """
+        if fr.message_id > 0:
+            if fr.owned_by(self._store_key):
+                ids.append(fr.message_id)
+            elif fr.store:
+                mirror_ids.setdefault(fr.store, []).append(fr.message_id)
+        _merge_mirror_ids(mirror_ids, fr.mirrors)
+
+    def _collect_version_ids(
+        self, version: TGFSFileVersion, ids: List[int], mirror_ids: MirrorMessageIds
+    ) -> None:
+        owned = [mid for mid in version.message_ids if mid > 0]
+        if version.owned_by(self._store_key):
+            ids.extend(owned)
+        elif version.store:
+            mirror_ids.setdefault(version.store, []).extend(owned)
+        for channel_key, version_mirror_ids in version.mirrors.items():
+            mirror_ids.setdefault(channel_key, []).extend(
+                mid for mid in version_mirror_ids if mid > 0
+            )
 
     async def _collect_version_message_ids(
         self, fr: TGFSFileRef, version_id: str
@@ -87,11 +117,10 @@ class FileApi:
         except Exception as ex:
             logger.warning(f"Could not load version {version_id} of {fr.name}: {ex}")
             return [], {}
-        mirror_ids: MirrorMessageIds = {
-            channel_key: [mid for mid in ids if mid > 0]
-            for channel_key, ids in version.mirrors.items()
-        }
-        return [mid for mid in version.message_ids if mid > 0], mirror_ids
+        ids: List[int] = []
+        mirror_ids: MirrorMessageIds = {}
+        self._collect_version_ids(version, ids, mirror_ids)
+        return ids, mirror_ids
 
     async def delete_mirrored(
         self, mirror_ids: MirrorMessageIds, force: bool = False
@@ -160,7 +189,7 @@ class FileApi:
         """
         versions = fd.get_versions(sort=True)
         parts = [mid for version in versions for mid in version.message_ids]
-        new_parts = await self._message_api.duplicate_messages(parts)
+        new_parts = await self._message_api.copy_within(parts)
 
         mirrors: Dict[str, List[int]] = {}
         if self._mirror_group and new_parts:
@@ -182,6 +211,7 @@ class FileApi:
                         channel_key: ids[offset : offset + n]
                         for channel_key, ids in mirrors.items()
                     },
+                    store=self._store_key,
                 )
             )
             offset += n
@@ -210,6 +240,7 @@ class FileApi:
             await self._discard_orphans(copied_fd, resp)
             raise
         copied_fr.mirrors = dict(resp.mirrors)
+        copied_fr.store = resp.store
         await self._metadata_api.push()
         return copied_fr
 
@@ -228,11 +259,7 @@ class FileApi:
             message_ids.append(resp.message_id)
             _merge_mirror_ids(mirror_ids, resp.mirrors)
         for version in fd.get_versions():
-            message_ids.extend(mid for mid in version.message_ids if mid > 0)
-            for channel_key, ids in version.mirrors.items():
-                mirror_ids.setdefault(channel_key, []).extend(
-                    mid for mid in ids if mid > 0
-                )
+            self._collect_version_ids(version, message_ids, mirror_ids)
         try:
             await self._message_api.delete_messages(message_ids, force=True)
             await self.delete_mirrored(mirror_ids, force=True)
@@ -258,6 +285,7 @@ class FileApi:
         resp = await self._file_desc_api.create_file_desc(file_msg)
         fr = where.create_file_ref(file_msg.name, resp.message_id)
         fr.mirrors = dict(resp.mirrors)
+        fr.store = resp.store
         await self._metadata_api.push()
         return resp.fd
 
@@ -268,9 +296,14 @@ class FileApi:
         manually deleted), and the mirror map changes whenever mirror copies
         are (re)written.
         """
-        if fr.message_id != resp.message_id or fr.mirrors != resp.mirrors:
+        if (
+            fr.message_id != resp.message_id
+            or fr.mirrors != resp.mirrors
+            or fr.store != resp.store
+        ):
             fr.message_id = resp.message_id
             fr.mirrors = dict(resp.mirrors)
+            fr.store = resp.store
             await self._metadata_api.push()
 
     async def _update_existing_file(

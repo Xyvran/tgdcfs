@@ -14,7 +14,7 @@ source's own children/files lists, making the two indistinguishable. A copy
 now duplicates the content messages server-side (no bytes on the wire) and
 gets its own descriptor.
 
-The tests drive the real ``Ops`` / ``FileApi`` / ``TGMsgFDRepository`` stack
+The tests drive the real ``Ops`` / ``FileApi`` / ``StoreFDRepository`` stack
 with message deletion switched on -- the setting under which the data loss
 happened.
 """
@@ -26,12 +26,12 @@ import pytest
 from tgdcfs.core.api.directory import DirectoryApi
 from tgdcfs.core.api.file import FileApi
 from tgdcfs.core.api.file_desc import FileDescApi
-from tgdcfs.core.api.message import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.api.metadata import MetaDataApi
 from tgdcfs.core.client import Client
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.ops import Ops
-from tgdcfs.core.repository.impl.fd.tg_msg import TGMsgFDRepository
+from tgdcfs.core.repository.impl.fd.store_msg import StoreFDRepository
 from tgdcfs.core.repository.interface import IFileContentRepository, IMetaDataRepository
 from tgdcfs.errors import InvalidPath
 from tgdcfs.reqres import Document, MessageResp, SentFileMessage
@@ -71,9 +71,10 @@ class FakeChannel:
         return message_id
 
 
-class FakeMessageApi:
+class FakeTelegramStore:
     def __init__(self, channel: FakeChannel) -> None:
         self.channel = channel
+        self.key = "tg:fake"
         self.duplicated: List[int] = []
 
     async def send_text(self, message: str) -> int:
@@ -88,7 +89,7 @@ class FakeMessageApi:
     async def get_messages(self, ids: List[int]) -> List[Optional[MessageResp]]:
         return [self.channel.messages.get(message_id) for message_id in ids]
 
-    async def duplicate_messages(self, ids: List[int]) -> List[int]:
+    async def copy_within(self, ids: List[int]) -> List[int]:
         # Forwarding is server-side: new message ids pointing at documents
         # that are already on telegram. The fake mimics that by cloning the
         # entry -- no payload changes hands, exactly as in the real thing.
@@ -142,10 +143,10 @@ class FakeClient:
     def __init__(self) -> None:
         self.name = "test"
         self.channel = FakeChannel()
-        self.fake_message_api = FakeMessageApi(self.channel)
-        message_api = cast(MessageApi, self.fake_message_api)
+        self.fake_message_api = FakeTelegramStore(self.channel)
+        message_api = cast(TelegramStore, self.fake_message_api)
         self.fc_repo = FakeFileContentRepository(self.channel)
-        file_desc_api = FileDescApi(TGMsgFDRepository(message_api), self.fc_repo)
+        file_desc_api = FileDescApi(StoreFDRepository(message_api), self.fc_repo)
         self.metadata_repo = FakeMetadataRepository()
         self.metadata_api = MetaDataApi(self.metadata_repo)
         self.file_api = FileApi(self.metadata_api, file_desc_api, message_api)

@@ -5,8 +5,9 @@ from functools import reduce
 from typing import List, Optional, Set
 
 from tgdcfs.reqres import GetMessagesReq, GetMessagesResp, MessageResp
-from tgdcfs.telegram.interface import TDLibApi
 from tgdcfs.utils.message_cache import channel_cache
+
+from .interface import TDLibApi
 
 # How long a batch collects further requests before it is sent. Counted from
 # the *first* pending request, so a steady stream of requests cannot keep

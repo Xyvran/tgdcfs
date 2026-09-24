@@ -3,9 +3,9 @@ import json
 import pytest
 from unittest.mock import Mock, AsyncMock
 
-from tgdcfs.core.api import MessageApi
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
-from tgdcfs.core.repository.impl.fd.tg_msg import TGMsgFDRepository
+from tgdcfs.core.repository.impl.fd.store_msg import StoreFDRepository
 from tgdcfs.core.repository.interface import FDRepositoryResp
 from tgdcfs.errors import MessageNotFound
 
@@ -13,8 +13,9 @@ from tgdcfs.errors import MessageNotFound
 # Global fixtures for all test classes
 @pytest.fixture
 def mock_message_api():
-    """Mock MessageApi with common configuration"""
-    api = Mock(spec=MessageApi)
+    """Mock TelegramStore with common configuration"""
+    api = Mock(spec=TelegramStore)
+    api.key = "tg:111"
     api.send_text = AsyncMock()
     api.edit_message_text = AsyncMock()
     api.get_messages = AsyncMock()
@@ -24,7 +25,7 @@ def mock_message_api():
 @pytest.fixture
 def repository(mock_message_api):
     """Create repository instance with mocked API"""
-    return TGMsgFDRepository(mock_message_api)
+    return StoreFDRepository(mock_message_api)
 
 
 @pytest.fixture
@@ -62,12 +63,12 @@ def mock_message():
     return message
 
 
-class TestTGMsgFDRepository:
-    """Test the main TGMsgFDRepository class"""
+class TestStoreFDRepository:
+    """Test the main StoreFDRepository class"""
 
     def test_init(self, mock_message_api):
         """Test repository initialization"""
-        repository = TGMsgFDRepository(mock_message_api)
+        repository = StoreFDRepository(mock_message_api)
         assert repository._message_api == mock_message_api
 
 

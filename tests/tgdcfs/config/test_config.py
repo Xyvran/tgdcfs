@@ -305,6 +305,7 @@ class TestConfig:
             },
             "tgdcfs": {
                 "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
                 "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
                 "server": {"host": "0.0.0.0", "port": 8080},
             },
@@ -325,6 +326,7 @@ class TestConfig:
             },
             "tgfs": {
                 "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
                 "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
                 "server": {"host": "0.0.0.0", "port": 8080},
             },
@@ -343,11 +345,13 @@ class TestConfig:
             },
             "tgdcfs": {
                 "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
                 "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
                 "server": {"host": "0.0.0.0", "port": 8080},
             },
             "tgfs": {
                 "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
                 "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
                 "server": {"host": "0.0.0.0", "port": 9090},
             },
@@ -414,6 +418,7 @@ class TestConfigFunctions:
             },
             "tgdcfs": {
                 "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
                 "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
                 "server": {"host": "0.0.0.0", "port": 8080},
             },
