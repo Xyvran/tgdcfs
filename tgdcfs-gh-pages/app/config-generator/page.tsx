@@ -37,6 +37,7 @@ import {
   DiscordConfig,
   FilesystemConfig,
   StoreConfig,
+  SyncMode,
   isValidDirectoryName,
   isValidStoreName,
   needsReupload,
@@ -541,14 +542,21 @@ export default function ConfigGenerator() {
       .filter((fs) => fs.name.trim() !== "" && fs.primary in stores)
       .forEach((fs) => {
         const mirrors = fs.mirrors.filter((m) => m in stores && m !== fs.primary);
+        // The loader derives sync from the stores when it is left out:
+        // background as soon as a mirror re-uploads, inline otherwise.
+        // Writing the same value would pin it, so a config generated today
+        // would keep blocking uploads after the default changes; only a
+        // choice that differs from the derived default is written.
+        const derivedSync: SyncMode =
+          needsReupload(fs, config.stores) && !fs.strict ? "background" : "inline";
         filesystems[fs.name.trim()] = {
           primary: fs.primary,
           ...(mirrors.length > 0
             ? {
                 mirrors,
                 mode: fs.mode,
-                sync: fs.sync,
-                strict: fs.strict,
+                ...(fs.sync !== derivedSync ? { sync: fs.sync } : {}),
+                ...(fs.strict ? { strict: true } : {}),
                 ...(fs.allow_shared_store ? { allow_shared_store: true } : {}),
               }
             : {}),

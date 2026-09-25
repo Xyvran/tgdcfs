@@ -791,28 +791,58 @@ class FilesystemConfig:
     def store_names(self) -> List[str]:
         return [self.primary, *self.mirrors]
 
-    def needs_reupload(self, stores: Dict[str, "StoreConfig"]) -> bool:
-        """Whether some mirror can only be filled by re-uploading the bytes.
+    def reuploading_mirrors(self, stores: Dict[str, "StoreConfig"]) -> List[str]:
+        """The mirrors that can only be filled by re-uploading the bytes.
 
         That is the case for a mirror in another backend, for any Discord
-        store involved (Discord has no server-side copy) and when
-        ``mode: reupload`` asks for it.
+        store involved (Discord has no server-side copy) and, for every
+        mirror, when ``mode: reupload`` asks for it.
         """
-        if not self.mirrors:
-            return False
         if self.mode == "reupload":
-            return True
+            return list(self.mirrors)
         primary = stores[self.primary].backend
-        return any(
-            stores[m].backend != primary or stores[m].backend == "discord"
+        return [
+            m
             for m in self.mirrors
-        )
+            if stores[m].backend != primary or stores[m].backend == "discord"
+        ]
+
+    def needs_reupload(self, stores: Dict[str, "StoreConfig"]) -> bool:
+        """Whether some mirror can only be filled by re-uploading the bytes."""
+        return bool(self.reuploading_mirrors(stores))
 
     def derive_sync(self, stores: Dict[str, "StoreConfig"]) -> None:
         """Pick ``background`` for a configured-by-default file system whose
         mirrors re-upload. ``strict`` keeps ``inline``, which it requires."""
         if self.sync_is_default and not self.strict and self.needs_reupload(stores):
             self.sync = "background"
+
+    def warn_if_writes_wait_for_mirrors(self, stores: Dict[str, "StoreConfig"]) -> None:
+        """Log a warning when writes block on a mirror that re-uploads.
+
+        With ``sync: inline`` a write answers only after every mirror has
+        its copy. A mirror that re-uploads streams the whole file down and
+        up again first, so a large upload keeps its client waiting for
+        minutes and WebDAV clients give up. The loader defaults such a
+        file system to ``background``; this warns when an explicit
+        ``sync: inline`` or ``strict: true`` overrides that.
+        """
+        if self.sync != "inline":
+            return
+        if not (mirrors := self.reuploading_mirrors(stores)):
+            return
+        cause = "'strict: true'" if self.strict else "'sync: inline'"
+        remedy = (
+            "set 'sync: background' and drop 'strict: true'"
+            if self.strict
+            else "set 'sync: background' or leave 'sync' out"
+        )
+        logger.warning(
+            f"filesystems.{self.name}: {cause} makes every write wait until "
+            f"{', '.join(repr(m) for m in mirrors)} re-uploaded the bytes; large "
+            f"uploads can time out on the client. Unless writes must wait for "
+            f"the copy, {remedy}."
+        )
 
 
 def _legacy_stores_and_filesystems(
@@ -879,6 +909,7 @@ def _validate_filesystems(
         primaries[fs.primary] = fs.name
     for fs in filesystems.values():
         fs.derive_sync(stores)
+        fs.warn_if_writes_wait_for_mirrors(stores)
         for mirror in fs.mirrors:
             if (owner := primaries.get(mirror)) and not (
                 fs.allow_shared_store or filesystems[owner].allow_shared_store

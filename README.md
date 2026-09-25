@@ -275,7 +275,10 @@ in each of them:
   Discord store on either side, another backend, `mode: reupload`)
   runs in the background and Telegram-to-Telegram forwarding inline;
   a client would otherwise time out waiting for a large upload to pass
-  through the mirror a second time. `strict: true` keeps `inline`.
+  through the mirror a second time. `strict: true` keeps `inline`. An
+  explicit `sync: inline` or `strict: true` over such a mirror is
+  accepted, and the server logs a warning at startup that names the
+  mirrors every write will wait for.
 * **Reads fail over automatically.** If a part (or the whole primary
   store) becomes unavailable, downloads are served from a mirror.
 * **File descriptors are mirrored too**, and in `pinned_message` metadata

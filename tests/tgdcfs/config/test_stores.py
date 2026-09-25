@@ -1,6 +1,8 @@
 """Stores and file systems: the current config layout, the tgfs layout
 translated on load, and the validation between the two."""
 
+import logging
+
 import pytest
 
 from tgdcfs.config import Config, FilesystemConfig, MetadataType, StoreConfig
@@ -185,6 +187,97 @@ class TestDerivedSync:
         assert Config.from_dict(data).filesystems["media"].sync == "background"
         data["filesystems"]["media"]["mirrors"].remove("dc")
         assert Config.from_dict(data).filesystems["media"].sync == "inline"
+
+
+class TestWritesWaitForMirrorsWarning:
+    """An explicit ``inline`` (or ``strict``) over a re-uploading mirror is
+    legal but keeps every upload waiting; the loader says so once."""
+
+    stores = staticmethod(TestDerivedSync.stores)
+    fs = staticmethod(TestDerivedSync.fs)
+
+    def warnings(self, caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == "tgdcfs.config"
+        ]
+
+    def test_explicit_inline_over_discord_mirror_warns(self, caplog):
+        fs = self.fs(mirrors=["dc"], sync="inline")
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", dc="discord")
+            )
+        (message,) = self.warnings(caplog)
+        assert "filesystems.media" in message
+        assert "'sync: inline'" in message
+        assert "'dc'" in message
+        assert "sync: background" in message
+
+    def test_strict_over_discord_mirror_names_strict(self, caplog):
+        fs = self.fs(mirrors=["dc"], strict=True)
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", dc="discord")
+            )
+        (message,) = self.warnings(caplog)
+        assert "'strict: true'" in message
+        assert "drop 'strict: true'" in message
+
+    def test_only_the_reuploading_mirrors_are_named(self, caplog):
+        fs = self.fs(mirrors=["spare", "dc"], sync="inline")
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", spare="telegram", dc="discord")
+            )
+        (message,) = self.warnings(caplog)
+        assert "'dc'" in message
+        assert "'spare'" not in message
+
+    def test_reupload_mode_names_every_mirror(self, caplog):
+        fs = self.fs(mirrors=["spare"], mode="reupload", sync="inline")
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", spare="telegram")
+            )
+        (message,) = self.warnings(caplog)
+        assert "'spare'" in message
+
+    def test_background_is_silent(self, caplog):
+        fs = self.fs(mirrors=["dc"], sync="background")
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", dc="discord")
+            )
+        assert self.warnings(caplog) == []
+
+    def test_telegram_forwarding_is_silent(self, caplog):
+        fs = self.fs(mirrors=["spare"], sync="inline", strict=True)
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", spare="telegram")
+            )
+        assert self.warnings(caplog) == []
+
+    def test_derived_default_is_silent(self, caplog):
+        fs = self.fs(mirrors=["dc"])
+        stores = self.stores(main="telegram", dc="discord")
+        fs.derive_sync(stores)
+        with caplog.at_level(logging.WARNING):
+            fs.warn_if_writes_wait_for_mirrors(stores)
+        assert self.warnings(caplog) == []
+
+    def test_emitted_when_the_config_loads(self, caplog):
+        data = current_layout()
+        data["backends"]["discord"] = {"bot_tokens": ["t"]}
+        data["stores"]["dc"] = {"backend": "discord", "channel": "1"}
+        data["filesystems"]["media"]["mirrors"].append("dc")
+        data["filesystems"]["media"]["sync"] = "inline"
+        data["filesystems"]["media"]["strict"] = True
+        with caplog.at_level(logging.WARNING):
+            Config.from_dict(data)
+        assert any("'strict: true'" in m for m in self.warnings(caplog))
 
 
 class TestCurrentLayout:

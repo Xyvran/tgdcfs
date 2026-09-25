@@ -281,6 +281,8 @@ export function FilesystemField({
             afterwards. Background is preselected as soon as a mirror
             re-uploads, since a client would otherwise time out waiting
             for a large upload to pass through the mirror a second time.
+            The server picks the same default when the config leaves Sync
+            out, so it is only written when your choice differs.
             {reuploadMirror && filesystem.sync === "inline" && (
               <>
                 {" "}
