@@ -120,6 +120,71 @@ class TestFilesystemConfig:
     def test_background_sync_is_accepted(self):
         fs = FilesystemConfig.from_dict("media", {"primary": "a", "sync": "background"})
         assert fs.sync == "background"
+        assert fs.sync_is_default is False
+
+
+class TestDerivedSync:
+    """Left out, ``sync`` follows the mirrors: background when one re-uploads."""
+
+    @staticmethod
+    def stores(**backends: str):
+        return {
+            name: StoreConfig.from_dict(name, {"backend": backend, "channel": "1"})
+            for name, backend in backends.items()
+        }
+
+    @staticmethod
+    def fs(**data):
+        return FilesystemConfig.from_dict("media", {"primary": "main", **data})
+
+    def test_no_mirrors_stays_inline(self):
+        fs = self.fs()
+        fs.derive_sync(self.stores(main="telegram"))
+        assert fs.sync == "inline"
+
+    def test_telegram_forwarding_stays_inline(self):
+        fs = self.fs(mirrors=["spare"])
+        fs.derive_sync(self.stores(main="telegram", spare="telegram"))
+        assert fs.sync == "inline"
+
+    def test_discord_mirror_of_telegram_goes_background(self):
+        fs = self.fs(mirrors=["spare", "dc"])
+        fs.derive_sync(self.stores(main="telegram", spare="telegram", dc="discord"))
+        assert fs.sync == "background"
+
+    def test_telegram_mirror_of_discord_goes_background(self):
+        fs = self.fs(mirrors=["tg"])
+        fs.derive_sync(self.stores(main="discord", tg="telegram"))
+        assert fs.sync == "background"
+
+    def test_discord_to_discord_goes_background(self):
+        fs = self.fs(mirrors=["dc2"])
+        fs.derive_sync(self.stores(main="discord", dc2="discord"))
+        assert fs.sync == "background"
+
+    def test_reupload_mode_goes_background(self):
+        fs = self.fs(mirrors=["spare"], mode="reupload")
+        fs.derive_sync(self.stores(main="telegram", spare="telegram"))
+        assert fs.sync == "background"
+
+    def test_explicit_inline_is_kept(self):
+        fs = self.fs(mirrors=["dc"], sync="inline")
+        fs.derive_sync(self.stores(main="telegram", dc="discord"))
+        assert fs.sync == "inline"
+
+    def test_strict_keeps_inline(self):
+        fs = self.fs(mirrors=["dc"], strict=True)
+        fs.derive_sync(self.stores(main="telegram", dc="discord"))
+        assert fs.sync == "inline"
+
+    def test_applied_when_the_config_loads(self):
+        data = current_layout()
+        data["backends"]["discord"] = {"bot_tokens": ["t"]}
+        data["stores"]["dc"] = {"backend": "discord", "channel": "1"}
+        data["filesystems"]["media"]["mirrors"].append("dc")
+        assert Config.from_dict(data).filesystems["media"].sync == "background"
+        data["filesystems"]["media"]["mirrors"].remove("dc")
+        assert Config.from_dict(data).filesystems["media"].sync == "inline"
 
 
 class TestCurrentLayout:

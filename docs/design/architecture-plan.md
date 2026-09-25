@@ -310,7 +310,8 @@ a forward (one RPC) and unacceptable for a reupload into Discord (a
 adds a replication queue:
 
 * `sync: inline | background` per file system, default `inline` for
-  forward-capable pairs and `background` otherwise. With `background`
+  forward-capable pairs and `background` otherwise (derived by the
+  loader from the stores' backends and `mode`). With `background`
   the write path records the version with the primary only, enqueues
   `(fs, file ref, version id, target store)` and returns.
 * The queue is persisted in the data dir (`replication.sqlite`, one row

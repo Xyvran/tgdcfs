@@ -39,6 +39,7 @@ import {
   StoreConfig,
   isValidDirectoryName,
   isValidStoreName,
+  needsReupload,
 } from "./types";
 
 interface SftpConfig {
@@ -425,6 +426,16 @@ export default function ConfigGenerator() {
     }
     if (field === "sync" && value === "background") {
       fs.strict = false;
+    }
+    // Same default as the loader: a mirror that re-uploads must not hold
+    // up the write. Only ever nudges towards background, never back.
+    if (
+      (field === "mirrors" || field === "primary" || field === "mode") &&
+      fs.sync === "inline" &&
+      !fs.strict &&
+      needsReupload(fs, config.stores)
+    ) {
+      fs.sync = "background";
     }
     filesystems[index] = fs;
     updateConfig("filesystems", filesystems);

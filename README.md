@@ -151,7 +151,7 @@ filesystems:
     primary: tg-main
     mirrors: [tg-spare]
     mode: auto           # auto (default) | forward | reupload
-    sync: inline         # inline (default) | background (accepted, runs inline for now)
+    sync: inline         # inline | background; default: background when a mirror re-uploads
     strict: false        # true: an upload fails when mirroring fails
     metadata:
       type: pinned_message   # or github_repo, see below
@@ -234,8 +234,8 @@ Limits that shape a Discord store (as of September 2026):
   Telegram by forwarding either.
 * Mirroring a Telegram primary *into* Discord re-partitions every
   version into Discord-sized messages (a replica, see Mirroring) and
-  re-uploads the bytes; use `sync: background` for such a mirror so
-  uploads do not wait for it.
+  re-uploads the bytes. Such a file system defaults to
+  `sync: background` so uploads do not wait for it.
 * `pinned_message` metadata must fit one attachment; use
   `github_repo` metadata for anything but small trees on a Discord
   primary.
@@ -270,9 +270,12 @@ in each of them:
   into the descriptor. The queue lives in `replication_queue.json` in
   the data directory, so nothing is lost on a restart; failed items back
   off and retry. `GET /api/replication/queue` shows what is pending,
-  `POST /api/replication/retry` retries failed items now. Use
-  `background` for any mirror that has to re-upload (Discord); `inline`
-  is fine for Telegram-to-Telegram forwarding.
+  `POST /api/replication/retry` retries failed items now. When `sync`
+  is not set, a file system with a mirror that has to re-upload (a
+  Discord store on either side, another backend, `mode: reupload`)
+  runs in the background and Telegram-to-Telegram forwarding inline;
+  a client would otherwise time out waiting for a large upload to pass
+  through the mirror a second time. `strict: true` keeps `inline`.
 * **Reads fail over automatically.** If a part (or the whole primary
   store) becomes unavailable, downloads are served from a mirror.
 * **File descriptors are mirrored too**, and in `pinned_message` metadata

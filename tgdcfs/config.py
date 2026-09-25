@@ -715,10 +715,13 @@ class FilesystemConfig:
     when the pair of stores allows it and re-uploads otherwise,
     ``forward`` insists on the server-side copy, ``reupload`` never asks
     for one. ``sync`` says whether mirroring happens inside the write
-    (``inline``) or from a persistent background queue (``background``,
-    the right choice when a mirror has to re-upload, e.g. into Discord).
-    ``strict`` fails the write when a mirror write fails and therefore
-    requires ``inline``.
+    (``inline``) or from a persistent background queue (``background``).
+    When ``sync`` is not given it is derived from the stores once they
+    are known (``derive_sync``): ``background`` as soon as a mirror has
+    to re-upload, since a write would otherwise wait for every byte to
+    pass through the mirror, ``inline`` for Telegram-to-Telegram
+    forwarding. ``strict`` fails the write when a mirror write fails and
+    therefore requires ``inline``.
     """
 
     name: str
@@ -730,6 +733,9 @@ class FilesystemConfig:
     read_preference: List[str]
     metadata: MetadataConfig
     allow_shared_store: bool = False
+    # True when ``sync`` was not configured and may be replaced by the
+    # value derived from the stores.
+    sync_is_default: bool = False
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "FilesystemConfig":
@@ -749,6 +755,7 @@ class FilesystemConfig:
                 f"filesystems.{name}: unknown mode '{mode}', "
                 f"available options: auto, forward, reupload"
             )
+        sync_is_default = "sync" not in data
         sync = str(data.get("sync", "inline"))
         if sync not in ("inline", "background"):
             raise ValueError(
@@ -777,11 +784,35 @@ class FilesystemConfig:
             read_preference=[str(s) for s in (data.get("read_preference") or [])],
             metadata=metadata,
             allow_shared_store=bool(data.get("allow_shared_store", False)),
+            sync_is_default=sync_is_default,
         )
 
     @property
     def store_names(self) -> List[str]:
         return [self.primary, *self.mirrors]
+
+    def needs_reupload(self, stores: Dict[str, "StoreConfig"]) -> bool:
+        """Whether some mirror can only be filled by re-uploading the bytes.
+
+        That is the case for a mirror in another backend, for any Discord
+        store involved (Discord has no server-side copy) and when
+        ``mode: reupload`` asks for it.
+        """
+        if not self.mirrors:
+            return False
+        if self.mode == "reupload":
+            return True
+        primary = stores[self.primary].backend
+        return any(
+            stores[m].backend != primary or stores[m].backend == "discord"
+            for m in self.mirrors
+        )
+
+    def derive_sync(self, stores: Dict[str, "StoreConfig"]) -> None:
+        """Pick ``background`` for a configured-by-default file system whose
+        mirrors re-upload. ``strict`` keeps ``inline``, which it requires."""
+        if self.sync_is_default and not self.strict and self.needs_reupload(stores):
+            self.sync = "background"
 
 
 def _legacy_stores_and_filesystems(
@@ -847,6 +878,7 @@ def _validate_filesystems(
             )
         primaries[fs.primary] = fs.name
     for fs in filesystems.values():
+        fs.derive_sync(stores)
         for mirror in fs.mirrors:
             if (owner := primaries.get(mirror)) and not (
                 fs.allow_shared_store or filesystems[owner].allow_shared_store

@@ -19,6 +19,7 @@ import {
   MirrorMode,
   StoreConfig,
   SyncMode,
+  needsReupload,
 } from "../types";
 import { ConfigTextField } from "./ConfigTextField";
 
@@ -59,15 +60,7 @@ export function FilesystemField({
   const mirrorCandidates = namedStores.filter(
     (s) => s.name !== filesystem.primary
   );
-  const primaryStore = namedStores.find((s) => s.name === filesystem.primary);
-  const reuploadMirror = filesystem.mirrors.some((name) => {
-    const store = namedStores.find((s) => s.name === name);
-    return (
-      store &&
-      primaryStore &&
-      (store.backend === "discord" || store.backend !== primaryStore.backend)
-    );
-  });
+  const reuploadMirror = needsReupload(filesystem, namedStores);
 
   return (
     <Box sx={{ mb: 3, pb: 2, borderBottom: 1, borderColor: "divider" }}>
@@ -285,7 +278,9 @@ export function FilesystemField({
             (no bandwidth) and re-uploads where that is impossible.
             &quot;Inline&quot; makes an upload wait for its copies;
             &quot;Background&quot; queues the file and a worker copies it
-            afterwards, which is what a re-uploading mirror needs.
+            afterwards. Background is preselected as soon as a mirror
+            re-uploads, since a client would otherwise time out waiting
+            for a large upload to pass through the mirror a second time.
             {reuploadMirror && filesystem.sync === "inline" && (
               <>
                 {" "}

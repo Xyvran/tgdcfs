@@ -48,10 +48,12 @@ stores:
 #
 # ``mode``: auto (server-side copy where the pair of stores allows it,
 # re-upload otherwise) | forward (server-side only) | reupload.
-# ``sync``: inline (default; mirror inside the write) | background (queue
-# the file and copy it from a background worker; use it for mirrors that
-# re-upload, e.g. Discord). ``strict: true`` fails an upload when mirroring
-# fails and requires ``sync: inline``.
+# ``sync``: inline (mirror inside the write) | background (queue the file
+# and copy it from a background worker). Left out, it is background as
+# soon as a mirror has to re-upload (Discord on either side, another
+# backend, ``mode: reupload``) and inline for Telegram-to-Telegram
+# forwarding. ``strict: true`` fails an upload when mirroring fails and
+# requires ``sync: inline``.
 #
 # Requirements for mirrors: your bot(s) must be admin in every mirror
 # channel; a primary with "Restrict saving content" enabled needs

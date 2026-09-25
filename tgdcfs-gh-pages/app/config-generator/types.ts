@@ -51,3 +51,24 @@ export const isValidDirectoryName = (name: string): boolean => {
 
 export const isValidStoreName = (name: string): boolean =>
   /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name);
+
+// Whether some mirror of the file system can only be filled by
+// re-uploading the bytes: another backend, Discord on either side (no
+// server-side copy) or an explicit re-upload mode. Mirrors the loader's
+// rule for the default sync mode.
+export const needsReupload = (
+  filesystem: FilesystemConfig,
+  stores: StoreConfig[]
+): boolean => {
+  if (filesystem.mirrors.length === 0) return false;
+  if (filesystem.mode === "reupload") return true;
+  const primary = stores.find((s) => s.name === filesystem.primary);
+  if (!primary) return false;
+  return filesystem.mirrors.some((name) => {
+    const store = stores.find((s) => s.name === name);
+    return (
+      store !== undefined &&
+      (store.backend === "discord" || store.backend !== primary.backend)
+    );
+  });
+};

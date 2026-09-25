@@ -269,3 +269,15 @@ class TestCopy:
 
     def test_missing_source_is_not_found(self, http):
         assert copy(http, "/src/none.txt", "/dest/none.txt").status_code == 404
+
+
+class TestUnknownFileSystem:
+    def test_path_outside_every_file_system_is_not_found(self, http):
+        # A browser asks for /webdav/favicon.ico; that is a 404, not a crash.
+        assert http.get("/webdav/favicon.ico").status_code == 404
+        assert (
+            http.request(
+                "PROPFIND", "/webdav/nope/", headers={"Depth": "0"}
+            ).status_code
+            == 404
+        )
