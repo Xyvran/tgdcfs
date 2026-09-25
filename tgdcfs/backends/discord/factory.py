@@ -17,7 +17,13 @@ async def login(config: Config) -> List[DiscordBotAPI]:
         raise ValueError("configuration block 'backends.discord' is missing")
     bots: List[DiscordBotAPI] = []
     for token in config.discord.bot_tokens:
-        client = await login_as_bot(token)
+        try:
+            client = await login_as_bot(token)
+        except Exception:
+            # Do not leave the bots that already made it logged in.
+            for bot in bots:
+                await bot.close()
+            raise
         bots.append(DiscordBotAPI(client, name=client.user.name if client.user else ""))
     return bots
 

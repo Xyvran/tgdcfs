@@ -1,13 +1,14 @@
 """DiscordBotAPI against a mocked discord.py client and CDN."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, List
+from typing import AsyncIterator, List, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import discord
 import pytest
 
-from tgdcfs.backends.discord.client import DiscordBotAPI
+from tgdcfs.backends.discord.client import DiscordBotAPI, login_as_bot
 from tgdcfs.errors import MessageNotFound, TechnicalError
 
 CHANNEL = 77
@@ -288,3 +289,90 @@ class TestClose:
     async def test_close(self, api):
         await api.close()
         api._bot.close.assert_awaited_once()
+
+
+def server_error(status: int = 503) -> discord.DiscordServerError:
+    response = Mock()
+    response.status = status
+    response.reason = "Service Unavailable"
+    return discord.DiscordServerError(response, "upstream connect error")
+
+
+def make_bot(
+    login_error: Optional[Exception] = None, connect_error: Optional[Exception] = None
+) -> Mock:
+    """A discord.Client stand-in whose gateway session stays open."""
+    bot = Mock()
+    bot.event = lambda fn: fn
+    bot.user = Mock()
+    bot.user.name = "dcfs"
+    bot.login = AsyncMock(side_effect=login_error)
+    bot.close = AsyncMock()
+
+    async def connect():
+        if connect_error is not None:
+            raise connect_error
+        await asyncio.Event().wait()
+
+    async def wait_until_ready():
+        if connect_error is not None:
+            await asyncio.Event().wait()
+
+    bot.connect = connect
+    bot.wait_until_ready = wait_until_ready
+    return bot
+
+
+class TestLogin:
+    @pytest.fixture
+    def clients(self, mocker):
+        bots: List[Mock] = []
+        mocker.patch(
+            "tgdcfs.backends.discord.client.discord.Client",
+            side_effect=lambda **_: bots.pop(0),
+        )
+        mocker.patch("tgdcfs.backends.discord.client.asyncio.sleep", AsyncMock())
+        return bots
+
+    async def test_logs_in(self, clients):
+        bot = make_bot()
+        clients.append(bot)
+        assert await login_as_bot("token") is bot
+        bot.login.assert_awaited_once_with("token")
+        bot.close.assert_not_awaited()
+
+    async def test_retries_a_server_error(self, clients):
+        failing = make_bot(login_error=server_error())
+        bot = make_bot()
+        clients.extend([failing, bot])
+        assert await login_as_bot("token", retry_interval=0) is bot
+        failing.close.assert_awaited_once()
+
+    async def test_retries_a_refused_connection(self, clients):
+        failing = make_bot(login_error=ConnectionRefusedError("refused"))
+        bot = make_bot()
+        clients.extend([failing, bot])
+        assert await login_as_bot("token", retry_interval=0) is bot
+
+    async def test_invalid_token_is_not_retried(self, clients):
+        failing = make_bot(login_error=discord.LoginFailure("Improper token"))
+        clients.extend([failing, make_bot()])
+        with pytest.raises(discord.LoginFailure):
+            await login_as_bot("token")
+        failing.close.assert_awaited_once()
+        assert len(clients) == 1
+
+    async def test_gives_up_after_max_attempts(self, clients):
+        bots = [make_bot(login_error=server_error()) for _ in range(3)]
+        clients.extend(bots)
+        with pytest.raises(TechnicalError, match="after 3 attempts"):
+            await login_as_bot("token", max_attempts=3, retry_interval=0)
+        for bot in bots:
+            bot.close.assert_awaited_once()
+
+    async def test_failed_gateway_connection_is_raised(self, clients):
+        failing = make_bot(connect_error=discord.LoginFailure("gateway"))
+        clients.append(failing)
+        with pytest.raises(discord.LoginFailure):
+            await login_as_bot("token")
+        failing.close.assert_awaited_once()

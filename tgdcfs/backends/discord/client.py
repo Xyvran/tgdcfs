@@ -307,8 +307,50 @@ class DiscordBotAPI:
         return user.name if user else self.name
 
 
-async def login_as_bot(token: str) -> discord.Client:
-    """Log a bot in and wait until its gateway session is ready."""
+# A login is retried on Discord-side failures (5xx from the API, a refused
+# connection) since those clear within seconds; a rejected token is not.
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_RETRY_INTERVAL = 5.0
+
+
+async def login_as_bot(
+    token: str,
+    max_attempts: int = LOGIN_MAX_ATTEMPTS,
+    retry_interval: float = LOGIN_RETRY_INTERVAL,
+) -> discord.Client:
+    """Log a bot in and wait until its gateway session is ready.
+
+    Transient failures (Discord answering 5xx, connection errors) are
+    retried with backoff; anything else, notably an invalid token, is
+    raised at once. A failed attempt closes its client so no session
+    is left open.
+    """
+    last: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        bot = _new_bot()
+        try:
+            await bot.login(token)
+            await _connect(bot)
+            return bot
+        except Exception as ex:
+            await bot.close()
+            if not is_transient(ex):
+                raise
+            last = ex
+            if attempt == max_attempts:
+                break
+            delay = min(retry_interval * attempt, 60.0)
+            logger.warning(
+                f"Discord login failed ({ex}); "
+                f"attempt {attempt}/{max_attempts}, retrying in {delay:.0f}s"
+            )
+            await asyncio.sleep(delay)
+    raise TechnicalError(
+        f"Discord login failed after {max_attempts} attempts: {last}"
+    ) from last
+
+
+def _new_bot() -> discord.Client:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guilds = True
@@ -320,7 +362,23 @@ async def login_as_bot(token: str) -> discord.Client:
         if bot.user is not None:
             logger.info(f"Discord: logged in as {bot.user} (id {bot.user.id})")
 
-    await bot.login(token)
-    asyncio.get_running_loop().create_task(bot.connect())
-    await bot.wait_until_ready()
     return bot
+
+
+async def _connect(bot: discord.Client) -> None:
+    """Open the gateway session in the background and wait until it is ready.
+
+    ``wait_until_ready`` alone would hang forever if the connection
+    fails, so the connect task is watched as well and its error raised.
+    """
+    connect = asyncio.get_running_loop().create_task(bot.connect())
+    ready = asyncio.ensure_future(bot.wait_until_ready())
+    done, _ = await asyncio.wait({connect, ready}, return_when=asyncio.FIRST_COMPLETED)
+    if connect in done and not ready.done():
+        ready.cancel()
+        # connect() returns only when the session ends; raising here covers
+        # both a failure and a session that closed before becoming ready.
+        exc = connect.exception()
+        if exc is not None:
+            raise exc
+        raise TechnicalError("Discord gateway session ended before it became ready")
