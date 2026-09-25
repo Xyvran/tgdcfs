@@ -126,6 +126,12 @@ as a top-level directory over WebDAV and SFTP: it has one *primary*
 store and any number of *mirror* stores, and the same store can play
 either role. Swapping primary and mirror is a config change.
 
+The [config generator](https://xyvran.github.io/tgdcfs/config-generator/)
+writes this file in the browser, with the same validation rules the
+loader applies; nothing you type leaves the page. The
+[getting-started guide](https://xyvran.github.io/tgdcfs/getting-started/)
+walks through the bots and channels it asks for.
+
 ```yaml
 backends:
   telegram:
@@ -568,11 +574,27 @@ worth against a simulated link, without needing a channel.
 
 ## Web frontend
 
-The Next.js app in `tgdcfs-gh-pages/` (published to GitHub Pages and as
-the `xyvran/tgdcfs-fe` image) has a config generator for the layout
-described above, a getting-started guide and the Telegram Mini App with
-a file explorer, background tasks and a "Mirrors and replication" view
-(queue, retry, backfill).
+The Next.js app in `tgdcfs-gh-pages/` is published at
+<https://xyvran.github.io/tgdcfs/> and as the `xyvran/tgdcfs-fe` image.
+It has:
+
+* the [config generator](https://xyvran.github.io/tgdcfs/config-generator/)
+  for the stores and file systems layout described above: Telegram and
+  Discord backends, any number of stores, primary and mirror stores per
+  file system with copy mode, sync and strictness, metadata as pinned
+  message or GitHub repository, and the WebDAV, SFTP and manager
+  settings. The YAML is generated on the fly and can be copied or
+  downloaded as `config.yaml`. Tokens and passphrases stay in the
+  browser.
+* the [getting-started guide](https://xyvran.github.io/tgdcfs/getting-started/)
+  for creating the Telegram app and bots, the Discord bot and the
+  channels.
+* the Telegram Mini App with a file explorer, background tasks and a
+  "Mirrors and replication" view (queue, retry, backfill), served by the
+  manager.
+
+A push to `master` deploys the site through the "Deploy Next.js to
+GitHub Pages" workflow; the image is built by the Docker workflows.
 
 ## Development
 
