@@ -1,5 +1,7 @@
 // Shared shapes of the config generator's form state.
 
+import { EncryptionConfig } from "./components/EncryptionField";
+
 export type Backend = "telegram" | "discord";
 
 export interface StoreConfig {
@@ -45,6 +47,197 @@ export interface DiscordConfig {
   max_file_size_bytes: number;
   delete_messages_on_remove: boolean;
 }
+
+export interface UserConfig {
+  username: string;
+  password: string;
+  readonly: boolean;
+}
+
+export interface SftpConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  host_key_file: string;
+  authorized_keys_dir: string;
+  upload_buffer_size_mb: number;
+}
+
+export interface CacheConfig {
+  enabled: boolean;
+  dir: string;
+  max_size_mb: number;
+  max_files: number;
+  max_file_size_mb: number;
+  block_kb: number;
+  stage_uploads: boolean;
+  keep_for_reads: boolean;
+  min_free_mb: number;
+  max_age_hours: number;
+  target_fill_percent: number;
+}
+
+// The loader's defaults; a value equal to its default is left out of the
+// YAML so the server's default keeps applying.
+export const CACHE_DEFAULTS: CacheConfig = {
+  enabled: false,
+  dir: "cache",
+  max_size_mb: 20480,
+  max_files: 0,
+  max_file_size_mb: 4096,
+  block_kb: 4096,
+  stage_uploads: true,
+  keep_for_reads: true,
+  min_free_mb: 1024,
+  max_age_hours: 0,
+  target_fill_percent: 90,
+};
+
+export interface TransferConfig {
+  // UI only: when off, no transfer block is written at all and the
+  // application falls back to its own defaults.
+  enabled: boolean;
+  upload_workers_small: number;
+  upload_workers_big: number;
+  upload_part_size_kb: number;
+  download_piece_size_kb: number;
+  download_pieces_in_flight: number;
+  parallel_download_threshold_mb: number;
+  connection_pool_size: number;
+  chunk_cache_mb: number;
+  chunk_cache_readahead: number;
+  chunk_cache_block_kb: number;
+}
+
+export interface ConfigData {
+  telegram: {
+    api_id: string;
+    api_hash: string;
+    lib: "pyrogram" | "telethon";
+    account: {
+      session_file: string;
+    };
+    bot: {
+      session_file: string;
+      tokens: string[];
+    };
+  };
+  discord: DiscordConfig;
+  stores: StoreConfig[];
+  filesystems: FilesystemConfig[];
+  tgdcfs: {
+    users: UserConfig[];
+    jwt: {
+      secret: string;
+      algorithm: string;
+      life: number;
+    };
+    server: {
+      host: string;
+      port: number;
+    };
+    sftp: SftpConfig;
+    transfer: TransferConfig;
+    encryption: EncryptionConfig;
+    cache: CacheConfig;
+  };
+}
+
+export const newFilesystem = (
+  name: string,
+  primary: string
+): FilesystemConfig => ({
+  name,
+  primary,
+  mirrors: [],
+  mode: "auto",
+  sync: "inline",
+  strict: false,
+  write_ack: "primary",
+  read_parallel: false,
+  read_sources: [],
+  allow_shared_store: false,
+  metadata: {
+    type: "pinned_message",
+    github_repo: { repo: "", commit: "master", access_token: "" },
+  },
+});
+
+// The form as it opens: one Telegram store, one file system on it, and
+// the loader's defaults everywhere else. A fresh object every time, so a
+// loaded config never shares nested state with the initial one.
+export const defaultConfig = (): ConfigData => ({
+  telegram: {
+    api_id: "",
+    api_hash: "",
+    lib: "telethon",
+    account: {
+      session_file: "account.session",
+    },
+    bot: {
+      session_file: "bot.session",
+      tokens: [""],
+    },
+  },
+  discord: {
+    enabled: false,
+    bot_tokens: [""],
+    max_file_size_bytes: 10000000,
+    delete_messages_on_remove: false,
+  },
+  stores: [{ name: "tg-main", backend: "telegram", channel: "" }],
+  filesystems: [newFilesystem("default", "tg-main")],
+  tgdcfs: {
+    users: [
+      {
+        username: "user",
+        password: "password",
+        readonly: false,
+      },
+    ],
+    jwt: {
+      secret: "",
+      algorithm: "HS256",
+      life: 604800,
+    },
+    server: {
+      host: "0.0.0.0",
+      port: 1900,
+    },
+    sftp: {
+      enabled: false,
+      host: "0.0.0.0",
+      port: 2222,
+      host_key_file: "sftp_host_key",
+      authorized_keys_dir: "",
+      upload_buffer_size_mb: 64,
+    },
+    cache: { ...CACHE_DEFAULTS },
+    transfer: {
+      enabled: false,
+      upload_workers_small: 3,
+      upload_workers_big: 8,
+      upload_part_size_kb: 512,
+      download_piece_size_kb: 4096,
+      download_pieces_in_flight: 4,
+      parallel_download_threshold_mb: 10,
+      connection_pool_size: 1,
+      chunk_cache_mb: 0,
+      chunk_cache_readahead: 2,
+      chunk_cache_block_kb: 1024,
+    },
+    encryption: {
+      enabled: false,
+      encrypt_names: false,
+      passphrase_source: "passphrase_env",
+      passphrase: "",
+      passphrase_env: "TGDCFS_MASTER_PASSPHRASE",
+      passphrase_file: "secrets/master.passphrase",
+      master_salt_file: "master.salt",
+      chunk_size: 65536,
+    },
+  },
+});
 
 export const isValidDirectoryName = (name: string): boolean => {
   // Valid directory name: no / \ : * ? " < > | and not . or ..
