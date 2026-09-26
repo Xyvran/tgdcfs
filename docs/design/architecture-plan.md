@@ -502,6 +502,94 @@ misses go to the scheduler, and their results land in the cache when
 `keep_for_reads` is on. The first full read of a file thus warms the
 cache at the combined speed of every store.
 
+### 4.12 Upload path: write-back and parallel distribution
+
+Today a PUT is *write-through*: the bytes stream to the primary store as
+they arrive, the client's request lasts as long as that upload, and the
+mirrors start afterwards. With the cache of 4.10 in place a second
+mode becomes possible, *write-back*: the PUT lands in the cache, the
+client is answered as soon as the bytes are on the local disk, and a
+distribution worker moves the version from the cache into the primary
+and every mirror at the same time.
+
+**What it buys.** The client's upload runs at the speed of the link to
+the tgdcfs host, not of the slowest backend; a FloodWait or a Discord
+rate limit never stalls a client; primary and mirrors are filled in
+parallel from one local file instead of one after the other; and the
+Telegram store can push several parts of one version at once, which the
+streaming path cannot do because a stream is read once, front to back.
+
+**What it costs.** Between the client's 201 and the primary's copy the
+bytes exist only on this instance's disk. That durability window does
+not exist today, so the mode is per file system, off by default, and
+its consequences are spelled out below rather than hidden.
+
+**Config.** `write_ack: primary | cache` per file system, default
+`primary` (today's behaviour). `cache` requires the cache to be enabled
+and is refused with `strict: true`, which promises the mirror copy at
+the time of the answer. `transfer.upload_parts_in_flight` (default 1)
+lets the Telegram store upload that many parts of one version at once
+when the source is seekable, that is a cache file.
+
+**Write path with `write_ack: cache`.**
+
+1. The PUT creates the file as today (empty version, visible at once),
+   then streams the body into a new cache entry. The size is known from
+   `Content-Length`; the entry is pinned. If the cache is disabled, over
+   budget or fails, the PUT falls back to write-through for this upload
+   and says so once in the log: the mode is an optimisation, never a
+   precondition for accepting data.
+2. When the body is complete the version is committed to the descriptor
+   as a *pending version*: the usual entry with `size` and `updatedAt`,
+   no message ids yet, and `"pending": true`. The id is generated here
+   and stays the version's id for good. The metadata is pushed, the
+   client gets its 201 (and the PROPPATCH that follows dates this
+   version, as in 4.6). The version is queued for distribution.
+3. The distribution worker uploads the version from the cache file into
+   the primary and, concurrently, into every mirror that re-uploads;
+   mirrors that forward wait for the primary's message ids. Each store
+   reads the file at its own pace through `VersionBytes` (4.10); the
+   Telegram store takes `upload_parts_in_flight` parts at a time, the
+   Discord store already sends its messages concurrently.
+4. The primary's message ids replace the pending marker in the same
+   version entry (same id), the mirrors' ids and replicas are recorded
+   as they finish, one descriptor edit per store as in the replication
+   engine, and the metadata is pushed. The entry is unpinned; with
+   `keep_for_reads` it stays as a read-cache entry.
+
+**Reading a pending version.** On the instance that holds the cache,
+`get()` serves a pending version from the cache file, so a client that
+uploads and downloads sees its own write at once. Every other reader
+(a second tgdcfs instance on the same channel, tgsaver, the mini app's
+import) must treat a version without message ids as invalid, exactly as
+`_validate_fv` does today, and therefore sees the previous version until
+distribution completes. The `pending` flag is only serialized when set,
+like `mirrors`, so a descriptor without one is byte-for-byte what it is
+now.
+
+**Persistence and recovery.** The distribution queue is the replication
+queue with a stage per item: `primary`, then `mirrors` (which is the
+existing replication step). On startup, pending versions with a cache
+file resume where they were: the primary upload restarts from the file
+(Telegram upload ids do not survive a restart), finished mirrors are
+kept. A pending version whose cache file is gone cannot be materialised
+any more: the version is marked invalid in the descriptor, the file
+falls back to its previous version, and the loss is reported through the
+task store and the log at error level. This is the failure the
+durability window admits; the README says so in plain words.
+
+**Interaction with the SFTP interface.** The SFTP write handle already
+spools an upload to memory or disk and hands it to the uploader on
+close. With `write_ack: cache` the spool *is* the cache entry: the
+close commits the pending version and returns, which removes the
+"upload happens at close" wait that SFTP clients see today.
+
+**Interaction with the mirrors.** With `write_ack: primary` nothing
+changes for the mirrors except that they read from the staged copy
+(4.10). With `write_ack: cache` they no longer wait for the primary
+unless they forward, so a Telegram primary with a Discord mirror fills
+both at once from the local file.
+
 ## 5. Configuration
 
 Schema v2. Everything under `tgdcfs:` is the old `tgfs:` block, renamed.
@@ -541,6 +629,7 @@ filesystems:
     read_preference: []      # optional, store names
     read_parallel: false     # spread the pieces of one download over every readable store (4.11)
     read_sources: []         # optional, restrict parallel reads to these stores
+    write_ack: primary       # primary | cache: answer a PUT when the primary or the local cache has it (4.12)
     metadata:
       type: github_repo
       github_repo: {repo: owner/repo, commit: master, access_token: "..."}
@@ -554,7 +643,7 @@ tgdcfs:
   jwt: {...}
   server: {host: 0.0.0.0, port: 1900}
   sftp: {...}
-  transfer: {...}            # Telegram tuning, unchanged
+  transfer: {...}            # Telegram tuning; gains upload_parts_in_flight (4.12)
   encryption: {...}          # unchanged, applies to every store
   cache:                     # local cache, see 4.10; off by default
     enabled: false
@@ -572,7 +661,8 @@ mirror of another only with an explicit `allow_shared_store: true`
 (two trees writing into one channel invites id confusion); a file
 system must not list its primary as a mirror; every store referenced
 exists; backends referenced by stores are configured; `strict` implies
-`sync: inline`.
+`sync: inline`; `write_ack: cache` requires `cache.enabled` and is
+refused together with `strict: true`.
 
 The legacy translation: `telegram.private_file_channel[i]` becomes store
 `tg-<channel>` and file system `tgfs.metadata[channel].name`;
@@ -635,8 +725,9 @@ validation endpoint; README sections for stores, file systems, Discord
 setup, limits and the promotion procedure; getting-started page; example
 configs; manager UI for queue and backfill progress.
 
-**Phase 5: local cache and multi-source reads (large).** Sections 4.10
-and 4.11, in this order so each step ships on its own:
+**Phase 5: local cache, write-back uploads and multi-source reads
+(large).** Sections 4.10 to 4.12, in this order so each step ships on
+its own:
 
 Every step that adds a config field adds it to the config generator
 (`tgdcfs-gh-pages/app/config-generator`) in the same step, with the
@@ -653,25 +744,42 @@ the generator does not know is a field the next deployment gets wrong.
    stage uploads, keep for reads) with the hint that the cache holds
    ciphertext and lives on the data volume. Delivers "mirroring without
    the read-back".
-2. Read cache: `get()` serves present blocks from disk, fills missing
+2. Write-back uploads (4.12): the `pending` version flag with every
+   reader skipping such versions, `write_ack` per file system with its
+   validation, the PUT and SFTP close paths committing a pending version
+   from the cache, the distribution stage in the queue with restart
+   recovery and the loss report, `get()` serving a pending version from
+   the cache, `transfer.upload_parts_in_flight` for seekable sources in
+   the Telegram store. Generator: `write_ack` on the file system form,
+   selectable only when the cache is enabled and strict is off, with the
+   durability note next to it.
+3. Read cache: `get()` serves present blocks from disk, fills missing
    whole blocks from the stores; the delete fan-out drops entries;
-   `GET /api/cache` with size, entries, pinned bytes and hit ratio and
-   `POST /api/cache/evict`; the mini app shows the same.
-3. Multi-source scheduler behind `read_parallel`: piece queue, per-store
+   `GET /api/cache` with size, entries, pinned bytes, pending versions
+   and hit ratio and `POST /api/cache/evict`; the mini app shows the
+   same.
+4. Multi-source scheduler behind `read_parallel`: piece queue, per-store
    slots, reorder window, per-piece failover and benching, the mapping
    through each store's layout, `read_sources`. The Telegram-internal
    piece split becomes one store's way of filling its slots. Generator:
    `read_parallel` and `read_sources` on the file system form, the
    sources limited to the file system's own stores, and a hint that the
    toggle only pays off with more than one readable store.
-4. Docs: README sections for the cache (disk sizing, the volume, what
-   is stored and that it is ciphertext) and for parallel reads;
-   getting-started page; demo config.
+5. Docs: README sections for the cache (disk sizing, the volume, what
+   is stored and that it is ciphertext), for write-back uploads (what
+   the durability window means and when to leave it off) and for
+   parallel reads; getting-started page; demo config.
 
 Tests per step against the fake channels: staging fills the cache and
 the mirror never calls `download_file`; a full cache leaves a write
 unstaged and the replication still succeeds; an evicted entry falls back
-to the download; `ENOSPC` does not fail a write; cache hits and misses
+to the download; `ENOSPC` does not fail a write; a write-back PUT
+returns before any store was called and the stores hold the version
+afterwards; a pending version is served from the cache on its own
+instance and skipped by a fresh reader; a restart with the cache file
+resumes the distribution, a restart without it reports the loss and
+serves the previous version; two mirrors and the primary upload
+concurrently from one file; cache hits and misses
 compose into the right bytes for every range shape; pieces from several
 stores arrive in order; a failing store hands its pieces to the others;
 a benched store is not asked again in that read.
@@ -708,6 +816,14 @@ of scope for now.
   budget is enforced by tgdcfs, not by the file system; running the
   cache dir on a volume shared with other data needs headroom for one
   version above the budget while a staging write is in flight.
+* **Write-back durability (Phase 5).** With `write_ack: cache` a
+  version acknowledged to the client lives only on the instance's disk
+  until the primary has it. A lost disk in that window loses the
+  version; the plan reports it loudly and falls back to the previous
+  version, but it cannot undo it. Off by default; the README tells
+  when it is worth it (fast local clients, slow or flaky backends) and
+  when not (a single-disk host holding the only copy of irreplaceable
+  data).
 * **Parallel reads and Discord (Phase 5).** Attachment downloads are
   plain CDN requests and not counted against the API rate limit, but a
   fresh URL for an expired one is an API call per message; a parallel
