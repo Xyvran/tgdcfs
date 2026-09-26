@@ -391,6 +391,117 @@ part size), plus JSON handling of snowflakes as strings (the manager API
 should serialize message ids as strings, JavaScript numbers cannot hold
 them).
 
+### 4.10 Local cache: write staging and read cache
+
+Every byte a mirror needs today is read back from the primary store
+first: a Telegram primary with a Discord mirror downloads each gigabyte
+once per mirror and uploads it again, and every mirror reads on its own.
+A local cache on the data volume removes the read-back and, kept after
+replication, serves repeated reads without touching a backend.
+
+**Where it sits.** Inside `StoreFileContentRepository`, below the
+encryption decorator, at the same level the replication engine copies
+bytes verbatim. The cache therefore holds exactly what the stores hold:
+ciphertext when encryption is on, never plaintext. It is one component,
+`core/cache.py` (`LocalCache`), used by three callers: the write path,
+the replication engine and the read path.
+
+**Unit and layout.** The cache is keyed by *version*, not by store
+message, because the stores cut a version differently (2 GiB Telegram
+parts, 10 MB Discord messages). Each cached version is a sparse file
+`cache/<fs>/<version id>.bin` plus a bitmap `<version id>.blocks` of
+present blocks of `block_kb` (default 4 MiB, the download piece size).
+A staged upload fills every block; a download fills the blocks it
+fetched; a read is served from disk for the blocks that are present and
+from the stores for the rest. Versions are immutable (a new upload is a
+new version id), so an entry can never be stale; a deleted version
+removes its entry in the delete fan-out.
+
+**Write staging.** `save()` wraps the `UploadableFileMessage` so every
+`read()` the uploader takes is also appended to the cache file. The
+client sees no extra latency: bytes still stream to the primary as they
+arrive, the copy to disk happens alongside through a bounded writer.
+If the disk cannot keep up, the staging of that upload is dropped and
+the upload continues as today; a failed upload removes its cache file.
+The version is *pinned* until every mirror has its copy.
+
+**Replication reads locally.** `MirrorGroup._replicate` and
+`_reupload_one` read through a `VersionBytes` source: the cache when the
+version is complete there, the store download otherwise, and with
+`keep_for_reads` the download fills the cache on the way. Several
+mirrors read the same file on disk instead of the primary store each.
+When `backfill_file` reports no missing store the version is unpinned:
+deleted with `keep_for_reads: false`, kept as an LRU entry otherwise.
+The cache is an accelerator only: a missing or evicted entry means the
+download path of today, never a failed replication.
+
+**Read cache.** `get()` first takes the blocks of the requested range
+that are on disk, then fetches the missing runs through the layouts (and
+the multi-source scheduler of 4.11), writes whole blocks into the cache
+and streams everything in order. Only whole blocks are cached, the last
+block of a version being the one legitimate short block. Small reads
+keep working the way they do now; the in-memory chunk cache of the
+Telegram store stays as the hot layer in front of the disk.
+
+**Budget and eviction.** `max_size_mb`, `max_files` (versions) and
+`max_file_size_mb` (larger versions are neither staged nor cached).
+Eviction is LRU by last access over unpinned versions; partial entries
+count their present bytes. Pinned versions are never evicted. When the
+budget is exhausted by pinned entries a new upload is not staged (one
+warning, then the download path) rather than throwing away work that
+already sits on disk. `ENOSPC` or any other disk error is treated the
+same way: the cache steps aside, the transfer goes on.
+
+**Index and recovery.** `cache/index.json` (version, file system, size,
+present blocks, last access, pinned) is written atomically like
+`replication_queue.json`; on startup it is rebuilt from the files when
+missing or unreadable, pins are re-derived from the replication queue,
+and files without an index entry or without a version in the metadata
+are removed.
+
+### 4.11 Multi-source reads
+
+The read path serves a range from one layout and fails over to the next
+layout from the byte where the previous one stopped (4.6). Parallelism
+exists only inside the Telegram store, which splits a download into
+pieces across its bots. With several stores holding a version, the
+stores can share one download.
+
+**Scheduler.** `read_parallel: true` on a file system cuts a range into
+pieces of `transfer.download_piece_size_kb` and hands each piece to the
+next store with a free slot; per-store slots default to the Telegram
+`download_pieces_in_flight` and a small constant for Discord. A store
+that finishes early takes the next piece, so a fast store does more of
+the work without anyone estimating throughput. Output stays in order
+through a bounded reorder window; the memory bound is the window times
+the piece size, as it is today for the Telegram-internal split.
+
+**Mapping.** A piece is a logical byte range. For each store it maps
+through that store's layout (`_map_range` on the primary layout for the
+primary and aligned mirrors, on the replica layout for a replica) to one
+or more `(message id, offset)` segments, which the store's
+`download_file` fetches and the scheduler concatenates. A piece that
+spans two Discord messages is two segments from the same store.
+
+**Failure.** A piece that fails on one store is re-queued to another;
+this replaces the per-layout failover with a per-piece one and keeps the
+"continue from the last delivered byte" guarantee. A store that fails
+several pieces in a row is benched for the rest of the read, the way the
+primary is marked dead today. A read fails only when no store can serve
+a piece.
+
+**Preference and scope.** `read_preference` keeps its meaning and
+decides who gets a piece when several stores are idle. `read_sources`
+optionally restricts parallel reads to some stores, for example to keep
+a Discord mirror out of bulk media reads and save its rate limit. Reads
+below `parallel_download_threshold_mb` stay on the single-store path: a
+media player asking for 64 KiB needs latency, not bandwidth.
+
+**With the cache.** Cache hits leave the piece list before scheduling,
+misses go to the scheduler, and their results land in the cache when
+`keep_for_reads` is on. The first full read of a file thus warms the
+cache at the combined speed of every store.
+
 ## 5. Configuration
 
 Schema v2. Everything under `tgdcfs:` is the old `tgfs:` block, renamed.
@@ -428,6 +539,8 @@ filesystems:
     sync: background         # inline | background (default derived from mode and backends)
     strict: false
     read_preference: []      # optional, store names
+    read_parallel: false     # spread the pieces of one download over every readable store (4.11)
+    read_sources: []         # optional, restrict parallel reads to these stores
     metadata:
       type: github_repo
       github_repo: {repo: owner/repo, commit: master, access_token: "..."}
@@ -443,6 +556,15 @@ tgdcfs:
   sftp: {...}
   transfer: {...}            # Telegram tuning, unchanged
   encryption: {...}          # unchanged, applies to every store
+  cache:                     # local cache, see 4.10; off by default
+    enabled: false
+    dir: cache               # relative to the data dir, so it lives on the volume
+    max_size_mb: 20480       # total budget, 0 = unlimited
+    max_files: 0             # versions, 0 = unlimited
+    max_file_size_mb: 4096   # larger versions are neither staged nor cached
+    block_kb: 4096
+    stage_uploads: true      # write incoming uploads to the cache for the mirrors
+    keep_for_reads: true     # keep entries after replication, fill them from downloads
 ```
 
 Validation on load: a store used as primary of one file system may be a
@@ -513,7 +635,35 @@ validation endpoint; README sections for stores, file systems, Discord
 setup, limits and the promotion procedure; getting-started page; example
 configs; manager UI for queue and backfill progress.
 
-**Phase 5: optional, not planned.** Multi-attachment Discord messages;
+**Phase 5: local cache and multi-source reads (large).** Sections 4.10
+and 4.11, in this order so each step ships on its own:
+
+1. `LocalCache` with index, budget, LRU eviction, pins and the startup
+   sweep; the `cache` config block; write staging through the wrapped
+   upload message; `VersionBytes` as the source of `_replicate` and
+   `_reupload_one` with the download fallback; the replication worker
+   unpins on success. Delivers "mirroring without the read-back".
+2. Read cache: `get()` serves present blocks from disk, fills missing
+   whole blocks from the stores; the delete fan-out drops entries;
+   `GET /api/cache` with size, entries, pinned bytes and hit ratio and
+   `POST /api/cache/evict`; the mini app shows the same.
+3. Multi-source scheduler behind `read_parallel`: piece queue, per-store
+   slots, reorder window, per-piece failover and benching, the mapping
+   through each store's layout, `read_sources`. The Telegram-internal
+   piece split becomes one store's way of filling its slots.
+4. Docs: README sections for the cache (disk sizing, the volume, what
+   is stored and that it is ciphertext) and for parallel reads; config
+   generator fields; demo config.
+
+Tests per step against the fake channels: staging fills the cache and
+the mirror never calls `download_file`; a full cache leaves a write
+unstaged and the replication still succeeds; an evicted entry falls back
+to the download; `ENOSPC` does not fail a write; cache hits and misses
+compose into the right bytes for every range shape; pieces from several
+stores arrive in order; a failing store hands its pieces to the others;
+a benched store is not asked again in that read.
+
+**Phase 6: optional, not planned.** Multi-attachment Discord messages;
 Discord forward as a `ForwardReplicator` if the spike shows copies are
 independent; further backends. FTP and SMB from dcfs are explicitly out
 of scope for now.
@@ -538,6 +688,18 @@ of scope for now.
   carry message ids as strings.
 * **Memory per Discord upload.** One part (10 to 100 MB) per concurrent
   upload is buffered in memory; bound the concurrency per store.
+* **Cache on disk (Phase 5).** The cache holds ciphertext, so a copied
+  volume is as safe as the channel, but it is still a copy of the data
+  on the host: say so in the README. A full or slow disk must never
+  fail a transfer, which is why every cache error is a bypass. The
+  budget is enforced by tgdcfs, not by the file system; running the
+  cache dir on a volume shared with other data needs headroom for one
+  version above the budget while a staging write is in flight.
+* **Parallel reads and Discord (Phase 5).** Attachment downloads are
+  plain CDN requests and not counted against the API rate limit, but a
+  fresh URL for an expired one is an API call per message; a parallel
+  read of an old replica can burst those. `read_sources` exists to keep
+  a Discord mirror out of bulk reads where that matters.
 * **Package rename and flat copy vs. upstream tracking.** A renamed
   package in a repository without the tgfs history means tgfs fixes are
   ported as patches with a path rewrite instead of cherry-picks.
