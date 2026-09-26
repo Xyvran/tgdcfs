@@ -114,10 +114,17 @@ class ReplicationQueue:
             if items
         }
         tmp = f"{self.path}.tmp"
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, self.path)
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, self.path)
+        except OSError as ex:
+            # A full disk must not fail the write that enqueued the file:
+            # the item stays in memory and the worker still gets to it; a
+            # restart before the next successful save loses the queue
+            # entry, which the backfill task repairs.
+            logger.warning(f"Could not save the replication queue to {self.path}: {ex}")
 
     # -- queue -------------------------------------------------------------
 

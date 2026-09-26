@@ -287,6 +287,20 @@ class TestQueue:
         reloaded.done("fs", "/a.bin")
         assert [i.path for i in ReplicationQueue(path).pending("fs")] == ["/dir/b.bin"]
 
+    def test_a_full_disk_does_not_fail_the_enqueue(self, tmp_path, monkeypatch, caplog):
+        path = str(tmp_path / "queue.json")
+        queue = ReplicationQueue(path)
+
+        def full(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("tgdcfs.core.replication.os.replace", full)
+        with caplog.at_level("WARNING", logger="tgdcfs.core.replication"):
+            queue.enqueue("fs", "/dir/a.bin")
+
+        assert [i.path for i in queue.pending("fs")] == ["/dir/a.bin"]
+        assert any("Could not save" in r.message for r in caplog.records)
+
     def test_backoff_and_retry(self, tmp_path):
         queue = ReplicationQueue(str(tmp_path / "q.json"))
         queue.enqueue("fs", "/a.bin")

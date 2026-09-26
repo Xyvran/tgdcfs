@@ -260,6 +260,25 @@ export default function ReplicationDialog({
                   . Reads: {cache.hits ?? 0} served from disk,{" "}
                   {cache.misses ?? 0} fetched.
                 </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  {cache.disk_free_bytes != null
+                    ? `${formatBytes(cache.disk_free_bytes)} free on the disk`
+                    : "Free disk space unknown"}
+                  {cache.min_free_bytes
+                    ? ` (keeps ${formatBytes(cache.min_free_bytes)} free)`
+                    : ""}
+                  . Sweep:{" "}
+                  {cache.last_sweep
+                    ? `last run ${new Date(cache.last_sweep * 1000).toLocaleTimeString()}`
+                    : "not yet run"}
+                  {cache.target_bytes
+                    ? `, evicts down to ${formatBytes(cache.target_bytes)}`
+                    : ""}
+                  {cache.max_age_hours
+                    ? `, drops entries unread for ${cache.max_age_hours} h`
+                    : ""}
+                  .
+                </Typography>
                 {cache.per_filesystem &&
                   Object.entries(cache.per_filesystem).map(([name, info]) => (
                     <Typography

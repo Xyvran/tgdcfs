@@ -385,6 +385,9 @@ tgdcfs:
     block_kb: 4096           # unit the read cache fills and serves, min 64
     stage_uploads: true      # write incoming uploads to the cache for the mirrors
     keep_for_reads: true     # keep entries after replication and fill them from downloads
+    min_free_mb: 1024        # headroom left on the disk for everything else, 0 = off
+    max_age_hours: 0         # drop entries unread for this long, 0 = never
+    target_fill_percent: 90  # the sweep evicts down to this share of max_size_mb
 ```
 
 **Sizing.** `max_size_mb` is a hard ceiling for the bytes in the
@@ -403,6 +406,27 @@ Entries are sparse files: `ls -l` shows a version's full size, `du`
 shows what is on disk, and the budget counts the latter. In Docker,
 `dir` resolves inside the mounted data directory, next to
 `config.yaml`, so the volume has to have the room.
+
+**Disk headroom.** The cache shares its disk with the metadata, the
+replication queue, the Telegram session and the SFTP spool, none of
+which enjoy a full disk. `min_free_mb` (default 1 GiB) is the room the
+cache leaves them: an entry that would eat into it is evicted for or
+refused exactly like one over the budget, before any byte is written,
+so a write-back upload falls back to write-through instead of failing
+half-way. A disk error that still happens (another process filled the
+disk) drops the entry concerned and the transfer goes on; such
+warnings are logged at most once a minute.
+
+**Background sweep.** Eviction on demand keeps the budget, but nothing
+else moves on its own, so a sweep runs every 15 minutes and once at
+start. It removes orphaned files, releases pins that nobody will
+release any more (a day old with nothing queued for their file system,
+after a crash or a lost queue file; a mirror that still wants the
+version downloads it from the primary), drops entries unread for
+`max_age_hours` (off by default), and evicts, oldest first, down to
+`target_fill_percent` of the budget and to `min_free_mb` on the disk,
+so the next upload finds its room ready instead of making it first.
+`GET /api/cache` reports the free disk space and the last sweep.
 
 **Ciphertext.** With at-rest encryption on, the cache holds exactly
 what the stores hold: ciphertext. Nothing in the cache directory is

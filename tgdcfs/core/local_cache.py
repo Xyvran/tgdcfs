@@ -37,8 +37,21 @@ never exceeds the budget. ``max_files`` bounds the entries and
 access over *unpinned* entries; a pinned entry (its mirrors still need
 it) is never evicted. When the budget cannot be met a new entry is
 refused, or a fill stops caching, and the caller carries on without the
-cache. Every disk error is handled the same way: the cache steps aside,
-the transfer goes on.
+cache. ``min_free`` keeps that much of the disk free for everything else
+in the data directory: an entry that would eat into it is evicted for
+or refused like one over the budget. Every disk error is handled the
+same way: the cache steps aside, the transfer goes on.
+
+Sweep
+-----
+
+Eviction on demand keeps the budget, but nothing else moves on its own,
+so a ``CacheSweeper`` runs :meth:`LocalCache.sweep` every
+``SWEEP_INTERVAL``: orphaned files go, pins nobody will release any more
+(a day old, nothing queued for their file system) are released, entries
+unread for ``max_age`` are dropped, and the cache is evicted down to
+``target_fill`` of the budget and to ``min_free`` on the disk, so the
+next upload finds its room ready instead of making it first.
 """
 
 from __future__ import annotations
@@ -47,6 +60,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -64,6 +78,13 @@ READ_CHUNK = 1024 * 1024
 # A warning per refused entry would flood the log during a bulk upload
 # into a full cache; one every so often is enough to notice.
 REFUSAL_LOG_INTERVAL = 60.0
+# How often the background sweep runs.
+SWEEP_INTERVAL = 15 * 60.0
+# A pin this old with nothing queued for its file system belongs to a
+# replication that will never report back (a crash mid-write, a queue
+# file lost); the sweep releases it. A mirror that still wants the
+# version downloads it from the primary instead.
+STALE_PIN_SECONDS = 24 * 3600.0
 
 
 class VersionBytes(Protocol):
@@ -92,6 +113,13 @@ class CacheEntry:
     # Bytes a read-cache fill has claimed from the budget but not yet
     # marked present: the write is on its way to disk. Never persisted.
     inflight: int = 0
+    # When the entry went from unpinned to pinned; the sweep uses it to
+    # spot pins nobody will release.
+    pinned_at: float = 0.0
+
+    @property
+    def evictable(self) -> bool:
+        return self.pins == 0 and not self.writing and not self.inflight
 
     @property
     def blocks(self) -> int:
@@ -154,6 +182,7 @@ class CacheEntry:
             "block_size": self.block_size,
             "last_access": self.last_access,
             "pins": self.pins,
+            "pinned_at": self.pinned_at,
         }
 
 
@@ -194,7 +223,7 @@ class StagingWriter:
         try:
             await asyncio.to_thread(self._write_sync, data)
         except OSError as ex:
-            logger.warning(
+            self._cache._throttled_warning(
                 f"Cache: writing {self._entry.version_id} failed ({ex}); "
                 f"continuing without the cache"
             )
@@ -390,6 +419,7 @@ class LocalCache:
         self._last_refusal_log = 0.0
         self.hits = 0
         self.misses = 0
+        self.last_sweep: Optional[float] = None
 
     # -- paths and index ---------------------------------------------------
 
@@ -455,6 +485,7 @@ class LocalCache:
         if data.get("writing"):
             self._unlink(version_id)
             return None
+        pinned = int(data.get("pins", 0) or 0) > 0
         return CacheEntry(
             version_id=version_id,
             fs=str(data.get("fs", "")),
@@ -462,14 +493,17 @@ class LocalCache:
             block_size=block_size,
             present=present,
             last_access=float(data.get("last_access", mtime)),
-            pins=1 if int(data.get("pins", 0) or 0) > 0 else 0,
+            pins=1 if pinned else 0,
+            pinned_at=float(data.get("pinned_at") or mtime) if pinned else 0.0,
         )
 
-    def _sweep_orphans(self) -> None:
+    def _sweep_orphans(self) -> int:
+        """Remove data and map files no entry refers to; returns how many."""
         try:
             names = os.listdir(self.directory)
         except OSError:
-            return
+            return 0
+        removed = 0
         for name in names:
             stem, dot, ext = name.rpartition(".")
             if ext not in ("bin", "map") or not dot:
@@ -477,8 +511,10 @@ class LocalCache:
             if stem not in self._entries:
                 try:
                     os.remove(os.path.join(self.directory, name))
+                    removed += 1
                 except OSError:
                     pass
+        return removed
 
     def _save_index(self) -> None:
         data = {
@@ -537,6 +573,11 @@ class LocalCache:
             "writing_entries": sum(1 for e in self._entries.values() if e.writing),
             "hits": self.hits,
             "misses": self.misses,
+            "disk_free_bytes": self._disk_free(),
+            "min_free_bytes": self.config.min_free_bytes,
+            "target_bytes": self.config.target_bytes,
+            "max_age_hours": self.config.max_age_hours,
+            "last_sweep": self.last_sweep,
             "per_filesystem": self._per_filesystem(),
         }
 
@@ -552,6 +593,26 @@ class LocalCache:
 
     # -- budget ---------------------------------------------------------------
 
+    def _disk_free(self) -> Optional[int]:
+        """Free bytes on the disk that holds the cache; ``None`` if unknown."""
+        try:
+            return shutil.disk_usage(self.directory).free
+        except OSError:
+            return None
+
+    def _lru_victim(self, keep: Optional[CacheEntry] = None) -> Optional[CacheEntry]:
+        """The evictable entry read longest ago, if any."""
+        victims = [e for e in self._entries.values() if e.evictable and e is not keep]
+        if not victims:
+            return None
+        return min(victims, key=lambda e: e.last_access)
+
+    def _evict(self, victim: CacheEntry, why: str) -> None:
+        logger.info(
+            f"Cache: evicting {victim.version_id} ({victim.charged_bytes()} bytes) {why}"
+        )
+        self.remove(victim.version_id)
+
     def _fits(self, size: int) -> bool:
         cfg = self.config
         if cfg.max_file_size_bytes and size > cfg.max_file_size_bytes:
@@ -561,7 +622,8 @@ class LocalCache:
     def _make_room(
         self, size: int, new_entry: bool = True, keep: Optional[CacheEntry] = None
     ) -> bool:
-        """Evict unpinned entries, oldest first, until ``size`` more bytes fit.
+        """Evict unpinned entries, oldest first, until ``size`` more bytes fit
+        the budget and leave ``min_free`` on the disk.
 
         ``new_entry`` also claims one of ``max_files``; ``keep`` is the
         entry the bytes are for, which is never its own victim. Entries
@@ -575,26 +637,29 @@ class LocalCache:
             over_files = (
                 new_entry and cfg.max_files and len(self._entries) + 1 > cfg.max_files
             )
-            if not over_bytes and not over_files:
+            over_disk = False
+            if cfg.min_free_bytes:
+                free = self._disk_free()
+                over_disk = free is not None and free - size < cfg.min_free_bytes
+            if not over_bytes and not over_files and not over_disk:
                 return True
-            victims = [
-                e
-                for e in self._entries.values()
-                if e.pins == 0 and not e.writing and not e.inflight and e is not keep
-            ]
-            if not victims:
+            victim = self._lru_victim(keep)
+            if victim is None:
                 return False
-            victim = min(victims, key=lambda e: e.last_access)
-            logger.info(
-                f"Cache: evicting {victim.version_id} ({victim.charged_bytes()} bytes)"
+            self._evict(
+                victim, "for the disk headroom" if over_disk else "to make room"
             )
-            self.remove(victim.version_id)
 
     def _refuse(self, reason: str) -> None:
+        self._throttled_warning(f"Cache: not caching a version: {reason}")
+
+    def _throttled_warning(self, message: str) -> None:
+        """One warning per ``REFUSAL_LOG_INTERVAL``: a full cache or a full
+        disk would otherwise write a line per transfer."""
         now = time.monotonic()
         if now - self._last_refusal_log >= REFUSAL_LOG_INTERVAL:
             self._last_refusal_log = now
-            logger.warning(f"Cache: not caching a version: {reason}")
+            logger.warning(message)
 
     # -- entries ---------------------------------------------------------------
 
@@ -614,7 +679,10 @@ class LocalCache:
             self._refuse(f"{size} bytes exceed max_file_size")
             return None
         if not self._make_room(size):
-            self._refuse("the budget is taken by entries the mirrors still need")
+            self._refuse(
+                "the budget, or the headroom on the disk, cannot be met without "
+                "evicting entries the mirrors still need"
+            )
             return None
         entry = CacheEntry(
             version_id=version_id,
@@ -685,8 +753,8 @@ class LocalCache:
         added = sum(entry.block_length(i) for i in blocks if not entry.present[i])
         if added and not self._make_room(added, new_entry=False, keep=entry):
             self._refuse(
-                f"the budget is taken by entries the mirrors still need; "
-                f"{version_id} is only partly cached"
+                f"the budget, or the headroom on the disk, is taken by entries the "
+                f"mirrors still need; {version_id} is only partly cached"
             )
             return
         entry.inflight += added
@@ -695,7 +763,10 @@ class LocalCache:
                 self._pwrite, self.data_path(version_id), begin, data
             )
         except OSError as ex:
-            logger.warning(f"Cache: writing blocks of {version_id} failed: {ex}")
+            self._throttled_warning(
+                f"Cache: writing blocks of {version_id} failed ({ex}); "
+                f"reads go on without the cache"
+            )
             entry.inflight -= added
             self.remove(version_id)
             return
@@ -759,6 +830,8 @@ class LocalCache:
 
     def pin(self, version_id: str) -> None:
         if (entry := self._entries.get(version_id)) is not None:
+            if entry.pins == 0:
+                entry.pinned_at = time.time()
             entry.pins += 1
             self._save_index()
 
@@ -773,6 +846,7 @@ class LocalCache:
         if entry is None:
             return
         entry.pins = 0
+        entry.pinned_at = 0.0
         if not self.config.keep_for_reads:
             self.remove(version_id)
         else:
@@ -799,13 +873,120 @@ class LocalCache:
 
     def evict_unpinned(self) -> int:
         """Drop every entry no mirror is waiting for; returns how many."""
-        victims = [
-            e.version_id
-            for e in self._entries.values()
-            if e.pins == 0 and not e.writing
-        ]
+        victims = [e.version_id for e in self._entries.values() if e.evictable]
         self.remove_many(victims)
         return len(victims)
+
+    # -- sweep -----------------------------------------------------------------
+
+    def sweep(
+        self,
+        queue_empty: Optional[Callable[[str], bool]] = None,
+        now: Optional[float] = None,
+    ) -> dict:
+        """The housekeeping that admission does not do on its own.
+
+        Orphaned files are removed; a pin older than ``STALE_PIN_SECONDS``
+        is released when ``queue_empty`` says nothing is queued for its
+        file system (or when no queue is known); entries unread for
+        ``max_age`` are dropped; then the cache is evicted, oldest first,
+        down to ``target_fill`` of the budget and to ``min_free`` on the
+        disk. Returns what was done, for the log and the API.
+        """
+        cfg = self.config
+        now = time.time() if now is None else now
+        report = {"orphans": 0, "released": 0, "expired": 0, "evicted": 0}
+        report["orphans"] = self._sweep_orphans()
+
+        for entry in list(self._entries.values()):
+            if (
+                entry.pins > 0
+                and not entry.writing
+                and now - entry.pinned_at >= STALE_PIN_SECONDS
+                and (queue_empty is None or queue_empty(entry.fs))
+            ):
+                logger.info(
+                    f"Cache: releasing the pin on {entry.version_id}: nothing is "
+                    f"queued for '{entry.fs}' and the pin is a day old"
+                )
+                self.release(entry.version_id)
+                report["released"] += 1
+
+        if cfg.max_age_seconds:
+            for entry in list(self._entries.values()):
+                if entry.evictable and now - entry.last_access >= cfg.max_age_seconds:
+                    self._evict(entry, f"unread for {cfg.max_age_hours} h")
+                    report["expired"] += 1
+
+        target = cfg.target_bytes
+        while target is not None and self.used_bytes() > target:
+            victim = self._lru_victim()
+            if victim is None:
+                break
+            self._evict(victim, f"down to {cfg.target_fill_percent}% of the budget")
+            report["evicted"] += 1
+
+        while cfg.min_free_bytes:
+            free = self._disk_free()
+            if free is None or free >= cfg.min_free_bytes:
+                break
+            victim = self._lru_victim()
+            if victim is None:
+                break
+            self._evict(victim, "for the disk headroom")
+            report["evicted"] += 1
+
+        self.last_sweep = now
+        self._save_index()
+        if any(report.values()):
+            logger.info(
+                f"Cache sweep: {report['orphans']} orphaned files removed, "
+                f"{report['released']} stale pins released, {report['expired']} "
+                f"entries expired, {report['evicted']} evicted; "
+                f"{self.used_bytes()} bytes in {len(self._entries)} entries"
+            )
+        return report
+
+
+class CacheSweeper:
+    """Runs :meth:`LocalCache.sweep` in the background, every ``interval``
+    seconds and once right after start. Runs on the event loop: the cache
+    is not thread-safe and a sweep is quick."""
+
+    def __init__(
+        self,
+        cache: LocalCache,
+        queue_empty: Optional[Callable[[str], bool]] = None,
+        interval: float = SWEEP_INTERVAL,
+    ):
+        self._cache = cache
+        self._queue_empty = queue_empty
+        self._interval = interval
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self.run(), name="cache-sweeper")
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    def run_once(self) -> dict:
+        return self._cache.sweep(self._queue_empty)
+
+    async def run(self) -> None:
+        while True:
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("Cache sweep failed")
+            await asyncio.sleep(self._interval)
 
 
 class VersionCache:

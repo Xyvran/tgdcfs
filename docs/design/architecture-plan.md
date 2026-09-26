@@ -1028,6 +1028,14 @@ messages (replicas with their own part layout).
 * Docs: README "Local cache" (staging, sizing, ciphertext, write-back
   and its durability window, parallel reads, API), transfer example,
   demo config, getting-started page.
+* Follow-ups from review: the budget is a hard ceiling for read-cache
+  fills too (`CacheEntry.inflight`, claimed before the write);
+  `cache.min_free_mb` keeps headroom on the disk for the rest of the
+  data directory; disk-write warnings are throttled; the replication
+  queue tolerates a failed save; `CacheSweeper` runs
+  `LocalCache.sweep` every 15 minutes (orphans, stale pins with an
+  empty queue, `max_age_hours`, eviction down to `target_fill_percent`
+  and to the headroom). Generator and mini app carry the new fields.
 * Not done, deliberately: the SFTP write handle still spools to its own
   buffer and hands the file to the same upload path, so `write_ack:
   cache` shortens the wait at close only by the primary upload; the

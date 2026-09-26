@@ -61,6 +61,9 @@ interface CacheConfig {
   block_kb: number;
   stage_uploads: boolean;
   keep_for_reads: boolean;
+  min_free_mb: number;
+  max_age_hours: number;
+  target_fill_percent: number;
 }
 
 // The loader's defaults; a value equal to its default is left out of the
@@ -74,6 +77,9 @@ const CACHE_DEFAULTS: CacheConfig = {
   block_kb: 4096,
   stage_uploads: true,
   keep_for_reads: true,
+  min_free_mb: 1024,
+  max_age_hours: 0,
+  target_fill_percent: 90,
 };
 
 interface TransferConfig {
@@ -1465,6 +1471,55 @@ export default function ConfigGenerator() {
                         })
                       }
                       width={260}
+                    />
+                  </FieldRow>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Keep free on disk (MB, 0 = off)"
+                      type="number"
+                      value={config.tgdcfs.cache.min_free_mb}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          min_free_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      helperText="Headroom for everything else in the data directory"
+                      width={220}
+                    />
+                    <ConfigTextField
+                      label="Drop entries unread for (hours, 0 = never)"
+                      type="number"
+                      value={config.tgdcfs.cache.max_age_hours}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          max_age_hours: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={260}
+                    />
+                    <ConfigTextField
+                      label="Sweep down to (% of budget)"
+                      type="number"
+                      value={config.tgdcfs.cache.target_fill_percent}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          target_fill_percent: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      error={
+                        config.tgdcfs.cache.target_fill_percent < 1 ||
+                        config.tgdcfs.cache.target_fill_percent > 100
+                      }
+                      helperText={
+                        config.tgdcfs.cache.target_fill_percent < 1 ||
+                        config.tgdcfs.cache.target_fill_percent > 100
+                          ? "Between 1 and 100"
+                          : "100 evicts only when an upload needs the room"
+                      }
+                      width={220}
                     />
                   </FieldRow>
                   <FormControlLabel

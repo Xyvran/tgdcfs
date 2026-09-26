@@ -208,7 +208,25 @@ class TestCacheConfig:
         assert cache.block_kb == 4 * 1024
         assert cache.stage_uploads is True
         assert cache.keep_for_reads is True
+        assert cache.min_free_mb == 1024
+        assert cache.max_age_hours == 0
+        assert cache.target_fill_percent == 90
+        assert cache.target_bytes == 20 * 1024 * 1024 * 1024 * 90 // 100
         assert cache.directory.endswith("cache")
+
+    def test_sweep_settings(self):
+        cache = CacheConfig.from_dict(
+            {"min_free_mb": 0, "max_age_hours": 48, "target_fill_percent": 100}
+        )
+        assert cache.min_free_bytes == 0
+        assert cache.max_age_seconds == 48 * 3600
+        assert cache.target_bytes is None
+        assert CacheConfig.from_dict({"max_size_mb": 0}).target_bytes is None
+        for bad in (0, 101):
+            with pytest.raises(ValueError, match="target_fill_percent"):
+                CacheConfig.from_dict({"target_fill_percent": bad})
+        with pytest.raises(ValueError, match="min_free_mb"):
+            CacheConfig.from_dict({"min_free_mb": -1})
 
     def test_overrides(self):
         cache = CacheConfig.from_dict(

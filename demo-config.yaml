@@ -182,6 +182,12 @@ tgdcfs:
   # hold the uploads in flight on top of what you keep for reads. With
   # encryption on, the cache holds ciphertext. A relative ``dir`` lives in
   # the data directory, on the mounted volume in Docker.
+  #
+  # ``min_free_mb`` is headroom the cache leaves on the disk for everything
+  # else in the data directory (0 = off). A sweep every 15 minutes drops
+  # entries unread for ``max_age_hours`` (0 = never) and evicts down to
+  # ``target_fill_percent`` of ``max_size_mb`` (100 = only when an upload
+  # needs the room).
   # ---------------------------------------------------------------------------
   # cache:
   #   enabled: true
@@ -192,6 +198,9 @@ tgdcfs:
   #   block_kb: 4096
   #   stage_uploads: true
   #   keep_for_reads: true
+  #   min_free_mb: 1024
+  #   max_age_hours: 0
+  #   target_fill_percent: 90
 
   # ---------------------------------------------------------------------------
   # Optional at-rest encryption.

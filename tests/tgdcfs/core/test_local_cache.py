@@ -7,7 +7,9 @@ stores, the way ``test_replication.py`` does, and check that a staged
 upload spares the mirror every download from the primary.
 """
 
+import asyncio
 import os
+import time
 from typing import cast
 
 import pytest
@@ -15,7 +17,13 @@ import pytest
 from tgdcfs.backends.base import IStore
 from tgdcfs.config import CacheConfig
 from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
-from tgdcfs.core.local_cache import CacheEntry, LocalCache, StagedFileMessage
+from tgdcfs.core.local_cache import (
+    STALE_PIN_SECONDS,
+    CacheEntry,
+    CacheSweeper,
+    LocalCache,
+    StagedFileMessage,
+)
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker, file_path
@@ -256,8 +264,6 @@ class TestBudget:
         quarter = 256 * 1024
         assert cache.reserve("fs", "a", 4 * quarter) is not None
         started = cache.write_blocks("a", 0, b"a" * (4 * quarter))
-        import asyncio
-
         task = asyncio.ensure_future(started)
         await asyncio.sleep(0)  # the write is on its way to disk
 
@@ -265,6 +271,54 @@ class TestBudget:
         assert cache.open_staging("fs", "b", quarter) is None
         await task
         assert cache.used_bytes() == 4 * quarter
+
+    async def test_the_disk_headroom_is_kept(self, tmp_path, monkeypatch):
+        """min_free_mb is room for everything else in the data directory:
+        an entry that would eat into it is refused before any byte lands."""
+        cache = make_cache(tmp_path, min_free_mb=1)
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024 + 10)
+
+        assert cache.open_staging("fs", "a", 100) is None
+        assert cache.entry("a") is None
+
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024 + 200)
+        assert cache.open_staging("fs", "a", 100) is not None
+
+    async def test_the_headroom_evicts_before_refusing(self, tmp_path, monkeypatch):
+        cache = make_cache(tmp_path, min_free_mb=1)
+        free = 1024 * 1024 + 100
+        monkeypatch.setattr(cache, "_disk_free", lambda: free)
+        await stage(cache, "old", b"o" * 50)
+        entry_of(cache, "old").last_access = 1
+
+        # Only 50 bytes fit now; evicting "old" (as if freeing its bytes)
+        # makes the difference.
+        def freeing():
+            return free + (0 if cache.entry("old") else 50)
+
+        monkeypatch.setattr(cache, "_disk_free", freeing)
+        assert cache.open_staging("fs", "new", 120) is not None
+        assert cache.entry("old") is None
+
+    async def test_an_unknown_disk_state_does_not_block(self, tmp_path, monkeypatch):
+        cache = make_cache(tmp_path, min_free_mb=1)
+        monkeypatch.setattr(cache, "_disk_free", lambda: None)
+        assert cache.open_staging("fs", "a", 100) is not None
+
+    async def test_a_disk_write_failure_is_warned_once_a_minute(self, tmp_path, caplog):
+        cache = make_cache(tmp_path, block_kb=256)
+        quarter = 256 * 1024
+        for name in ("a", "b", "c"):
+            assert cache.reserve("fs", name, quarter) is not None
+            os.remove(cache.data_path(name))  # the write will fail
+        with caplog.at_level("WARNING", logger="tgdcfs.core.local_cache"):
+            for name in ("a", "b", "c"):
+                await cache.write_blocks(name, 0, b"x" * quarter)
+
+        assert [
+            r for r in caplog.records if "writing blocks" in r.message
+        ].__len__() == 1
+        assert cache.stats()["entries"] == 0
 
     async def test_versions_above_the_file_limit_are_not_cached(self, tmp_path):
         cache = make_cache(tmp_path, max_file_size_mb=1)
@@ -513,6 +567,154 @@ class TestInlineMirroringFromTheCache:
             await stack.put("a.bin", DATA)
 
         assert cache.stats()["entries"] == 0
+
+
+class TestSweep:
+    async def test_entries_unread_for_max_age_are_dropped(self, tmp_path):
+        cache = make_cache(tmp_path, max_age_hours=1)
+        await stage(cache, "old", b"o" * 10)
+        await stage(cache, "fresh", b"f" * 10)
+        now = time.time()
+        entry_of(cache, "old").last_access = now - 2 * 3600
+
+        report = cache.sweep(now=now)
+
+        assert report["expired"] == 1
+        assert cache.entry("old") is None and cache.entry("fresh") is not None
+
+    async def test_max_age_off_by_default(self, tmp_path):
+        cache = make_cache(tmp_path)
+        await stage(cache, "old", b"o" * 10)
+        entry_of(cache, "old").last_access = 1
+
+        assert cache.sweep()["expired"] == 0
+        assert cache.entry("old") is not None
+
+    async def test_the_sweep_evicts_down_to_the_target_fill(self, tmp_path):
+        cache = make_cache(
+            tmp_path, max_size_mb=1, block_kb=256, target_fill_percent=50
+        )
+        quarter = 256 * 1024
+        for i, name in enumerate(("a", "b", "c", "d")):
+            await stage(cache, name, bytes([i]) * quarter)
+            entry_of(cache, name).last_access = i
+
+        report = cache.sweep()
+
+        assert report["evicted"] == 2
+        assert cache.entry("a") is None and cache.entry("b") is None
+        assert cache.used_bytes() == 2 * quarter
+
+    async def test_a_target_of_100_percent_evicts_nothing(self, tmp_path):
+        cache = make_cache(
+            tmp_path, max_size_mb=1, block_kb=256, target_fill_percent=100
+        )
+        for name in ("a", "b", "c", "d"):
+            await stage(cache, name, b"x" * (256 * 1024))
+
+        assert cache.sweep()["evicted"] == 0
+        assert cache.stats()["entries"] == 4
+
+    async def test_pinned_entries_survive_the_sweep(self, tmp_path):
+        cache = make_cache(
+            tmp_path,
+            max_size_mb=1,
+            block_kb=256,
+            target_fill_percent=25,
+            max_age_hours=1,
+        )
+        await stage(cache, "pinned", b"p" * (1024 * 1024))
+        cache.pin("pinned")
+        entry_of(cache, "pinned").last_access = 1
+
+        report = cache.sweep()
+
+        assert report == {"orphans": 0, "released": 0, "expired": 0, "evicted": 0}
+        assert cache.entry("pinned") is not None
+
+    async def test_a_stale_pin_is_released_when_nothing_is_queued(self, tmp_path):
+        cache = make_cache(tmp_path)
+        await stage(cache, "v", b"v" * 10)
+        cache.pin("v")
+        now = time.time()
+        entry_of(cache, "v").pinned_at = now - STALE_PIN_SECONDS - 1
+
+        assert cache.sweep(queue_empty=lambda fs: False, now=now)["released"] == 0
+        assert entry_of(cache, "v").pins == 1
+
+        assert cache.sweep(queue_empty=lambda fs: fs == "fs", now=now)["released"] == 1
+        assert entry_of(cache, "v").pins == 0
+        assert cache.complete("v")  # kept for reads
+
+    async def test_a_young_pin_is_left_alone(self, tmp_path):
+        cache = make_cache(tmp_path)
+        await stage(cache, "v", b"v" * 10)
+        cache.pin("v")
+
+        assert cache.sweep(queue_empty=lambda fs: True)["released"] == 0
+        assert entry_of(cache, "v").pins == 1
+
+    async def test_the_pin_time_survives_a_restart(self, tmp_path):
+        cache = make_cache(tmp_path)
+        await stage(cache, "v", b"v" * 10)
+        cache.pin("v")
+        pinned_at = entry_of(cache, "v").pinned_at
+        assert pinned_at > 0
+
+        reloaded = make_cache(tmp_path)
+
+        assert entry_of(reloaded, "v").pins == 1
+        assert entry_of(reloaded, "v").pinned_at == pinned_at
+
+    async def test_orphaned_files_are_removed(self, tmp_path):
+        cache = make_cache(tmp_path)
+        await stage(cache, "v", b"v" * 10)
+        (tmp_path / "cache" / "gone.bin").write_bytes(b"x")
+        (tmp_path / "cache" / "gone.map").write_bytes(b"\x01")
+
+        assert cache.sweep()["orphans"] == 2
+        assert not (tmp_path / "cache" / "gone.bin").exists()
+        assert cache.complete("v")
+
+    async def test_the_sweep_frees_the_disk_headroom(self, tmp_path, monkeypatch):
+        cache = make_cache(tmp_path, min_free_mb=1)
+        await stage(cache, "a", b"a" * 10)
+        await stage(cache, "b", b"b" * 10)
+        entry_of(cache, "a").last_access = 1
+        free = [1024 * 1024 - 5]
+
+        def freeing():
+            return free[0] + (10 if cache.entry("a") is None else 0)
+
+        monkeypatch.setattr(cache, "_disk_free", freeing)
+        report = cache.sweep()
+
+        assert report["evicted"] == 1
+        assert cache.entry("a") is None and cache.entry("b") is not None
+
+    async def test_the_sweeper_runs_on_start_and_then_periodically(self, tmp_path):
+        cache = make_cache(tmp_path, max_age_hours=1)
+        await stage(cache, "old", b"o" * 10)
+        entry_of(cache, "old").last_access = 1
+        sweeper = CacheSweeper(cache, interval=0.01)
+
+        sweeper.start()
+        await asyncio.sleep(0.05)
+        await sweeper.stop()
+
+        assert cache.entry("old") is None
+        assert cache.last_sweep is not None
+        assert cache.stats()["last_sweep"] == cache.last_sweep
+
+    def test_stats_show_the_disk_and_the_sweep(self, tmp_path):
+        cache = make_cache(
+            tmp_path, min_free_mb=2, target_fill_percent=80, max_size_mb=10
+        )
+        stats = cache.stats()
+        assert stats["min_free_bytes"] == 2 * 1024 * 1024
+        assert stats["target_bytes"] == 8 * 1024 * 1024
+        assert stats["disk_free_bytes"] is not None and stats["disk_free_bytes"] > 0
+        assert stats["last_sweep"] is None
 
 
 class TestBackgroundReplicationFromTheCache:

@@ -43,6 +43,11 @@ export interface CacheStats {
   writing_entries?: number;
   hits?: number;
   misses?: number;
+  disk_free_bytes?: number | null;
+  min_free_bytes?: number;
+  target_bytes?: number | null;
+  max_age_hours?: number;
+  last_sweep?: number | null;
   per_filesystem?: {
     [filesystem: string]: { entries: number; bytes: number; pinned: number };
   };

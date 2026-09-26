@@ -467,6 +467,12 @@ class CacheConfig:
     cached versions (``0`` means unlimited for both), and a version above
     ``max_file_size_mb`` is never cached. ``block_kb`` is the unit the
     read cache fills and serves.
+
+    ``min_free_mb`` is headroom the cache leaves on the disk for everything
+    else in the data directory (``0`` turns the check off). A background
+    sweep drops entries unread for ``max_age_hours`` (``0`` = never) and
+    evicts down to ``target_fill_percent`` of ``max_size_mb`` so the next
+    upload finds its room ready (``100`` = only evict on demand).
     """
 
     enabled: bool
@@ -477,12 +483,34 @@ class CacheConfig:
     block_kb: int
     stage_uploads: bool
     keep_for_reads: bool
+    min_free_mb: int = 1024
+    max_age_hours: int = 0
+    target_fill_percent: int = 90
 
     DEFAULT_DIR = "cache"
     DEFAULT_MAX_SIZE_MB = 20 * 1024
     DEFAULT_MAX_FILES = 0
     DEFAULT_MAX_FILE_SIZE_MB = 4 * 1024
     DEFAULT_BLOCK_KB = 4 * 1024
+    DEFAULT_MIN_FREE_MB = 1024
+    DEFAULT_MAX_AGE_HOURS = 0
+    DEFAULT_TARGET_FILL_PERCENT = 90
+
+    @property
+    def min_free_bytes(self) -> int:
+        return self.min_free_mb * 1024 * 1024
+
+    @property
+    def max_age_seconds(self) -> int:
+        return self.max_age_hours * 3600
+
+    @property
+    def target_bytes(self) -> Optional[int]:
+        """Where a sweep evicts down to; ``None`` when there is nothing to
+        aim for (no size budget, or the target is the budget itself)."""
+        if not self.max_size_mb or self.target_fill_percent >= 100:
+            return None
+        return self.max_size_bytes * self.target_fill_percent // 100
 
     @property
     def directory(self) -> str:
@@ -517,6 +545,11 @@ class CacheConfig:
         block_kb = int(data.get("block_kb", cls.DEFAULT_BLOCK_KB))
         if block_kb < 64:
             raise ValueError(f"cache.block_kb must be at least 64, got {block_kb}")
+        target = int(data.get("target_fill_percent", cls.DEFAULT_TARGET_FILL_PERCENT))
+        if not 1 <= target <= 100:
+            raise ValueError(
+                f"cache.target_fill_percent must be between 1 and 100, got {target}"
+            )
         return cls(
             enabled=bool(data.get("enabled", False)),
             dir=str(data.get("dir") or cls.DEFAULT_DIR),
@@ -528,6 +561,9 @@ class CacheConfig:
             block_kb=block_kb,
             stage_uploads=bool(data.get("stage_uploads", True)),
             keep_for_reads=bool(data.get("keep_for_reads", True)),
+            min_free_mb=non_negative("min_free_mb", cls.DEFAULT_MIN_FREE_MB),
+            max_age_hours=non_negative("max_age_hours", cls.DEFAULT_MAX_AGE_HOURS),
+            target_fill_percent=target,
         )
 
 

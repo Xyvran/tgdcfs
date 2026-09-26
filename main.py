@@ -24,7 +24,7 @@ from tgdcfs.backends.telegram import factory as telegram
 from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
 from tgdcfs.core.client import StoreFactory
-from tgdcfs.core.local_cache import LocalCache
+from tgdcfs.core.local_cache import CacheSweeper, LocalCache
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 
 
@@ -77,6 +77,18 @@ async def create_clients(
     return clients
 
 
+def start_cache_sweeper(
+    cache: Optional[LocalCache], replication: ReplicationQueue
+) -> Optional[CacheSweeper]:
+    """The periodic cache housekeeping; a pin counts as stale only when
+    nothing is queued for its file system."""
+    if cache is None:
+        return None
+    sweeper = CacheSweeper(cache, lambda fs: not replication.pending(fs))
+    sweeper.start()
+    return sweeper
+
+
 def start_replication_workers(
     clients: Clients, config: Config, replication: ReplicationQueue
 ) -> List[ReplicationWorker]:
@@ -121,6 +133,7 @@ async def main():
     workers = start_replication_workers(clients, config, replication)
 
     app = create_app(clients, config, replication=replication, cache=cache)
+    sweeper = start_cache_sweeper(cache, replication)
 
     try:
         sftp_acceptor = await start_sftp_server(clients, config)
@@ -137,6 +150,8 @@ async def main():
     finally:
         for worker in workers:
             await worker.stop()
+        if sweeper is not None:
+            await sweeper.stop()
         if sftp_acceptor:
             sftp_acceptor.close()
             await sftp_acceptor.wait_closed()
