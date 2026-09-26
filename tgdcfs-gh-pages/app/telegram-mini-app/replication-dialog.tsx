@@ -164,6 +164,14 @@ export default function ReplicationDialog({
                     ", no mirrors"
                   )}
                   , metadata {info.metadata}
+                  {info.write_ack === "cache" ? ", write-back" : ""}
+                  {info.read_parallel
+                    ? `, parallel reads${
+                        info.read_sources && info.read_sources.length > 0
+                          ? ` from ${info.read_sources.join(", ")}`
+                          : ""
+                      }`
+                    : ""}
                 </Typography>
                 {info.mirrors.length > 0 && (
                   <>

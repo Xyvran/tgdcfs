@@ -76,6 +76,7 @@ class DiscordStore(IStore):
         self._retry_interval = retry_interval
         self._upload_slots = asyncio.Semaphore(max_concurrent_uploads)
         self._download_slots = asyncio.Semaphore(max_concurrent_downloads)
+        self._max_concurrent_downloads = max_concurrent_downloads
 
     @property
     def backend(self) -> str:
@@ -258,6 +259,10 @@ class DiscordStore(IStore):
             raise
         finally:
             await file_msg.close()
+
+    @property
+    def read_slots(self) -> int:
+        return self._max_concurrent_downloads
 
     async def download_file(
         self, message_id: int, begin: int, end: int

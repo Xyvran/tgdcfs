@@ -264,20 +264,24 @@ class StoreFDRepository(IFDRepository):
 
         # A pending version is readable on the instance whose cache holds
         # it; elsewhere it counts as invalid, like a version whose parts
-        # are gone. The newest readable version is the one served, so the
-        # latest pointer is moved off an unreadable one (in memory only:
-        # the pointer is derived, never written).
-        readable = [
-            v
-            for v in fd.get_versions(sort=True)
-            if (v.is_valid() and v.part_sizes) or self._readable_locally(v)
-        ]
-        if not readable:
-            readable = [v for v in fd.get_versions(sort=True) if v.is_valid()]
+        # are gone. The version served is the latest one, so when that one
+        # is unreadable the pointer moves to the newest readable version
+        # (in memory only: the pointer is derived, never written). A
+        # readable latest version is left alone, ties and all.
+        def readable(version: TGFSFileVersion) -> bool:
+            return version.is_valid() or self._readable_locally(version)
+
         if any(self._readable_locally(v) for v in fd.get_versions()):
             has_valid_version = True
-        if readable and fd.latest_version_id != readable[0].id:
-            fd.latest_version_id = readable[0].id
+        current = fd.versions.get(fd.latest_version_id)
+        if current is None or not readable(current):
+            candidates = [v for v in fd.versions.values() if readable(v)]
+            if candidates:
+                # ``max`` keeps the first of equally dated versions, as
+                # ``from_dict`` does when it derives the pointer.
+                fd.latest_version_id = max(
+                    candidates, key=lambda v: v.updated_at_timestamp
+                ).id
 
         return fd if has_valid_version else TGFSFileDesc.empty(fd.name)
 

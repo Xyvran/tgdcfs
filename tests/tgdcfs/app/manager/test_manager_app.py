@@ -82,6 +82,9 @@ class TestManagerApp:
                 "sync": "inline",
                 "strict": False,
                 "read_preference": [],
+                "read_parallel": False,
+                "read_sources": [],
+                "write_ack": "primary",
                 "metadata": "pinned_message",
                 "primary_dead": False,
             }

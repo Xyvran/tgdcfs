@@ -349,8 +349,13 @@ class TransferConfig:
     # when the source is seekable (a version in the local cache). A stream
     # is read front to back and always goes part by part.
     upload_parts_in_flight: int = 1
+    # Multi-source reads: how many pieces may be complete and waiting for
+    # their turn; the memory bound of one such read is this times the
+    # piece size.
+    read_parallel_window: int = 8
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
+    DEFAULT_READ_PARALLEL_WINDOW = 8
     DEFAULT_UPLOAD_WORKERS_SMALL = 3
     DEFAULT_UPLOAD_WORKERS_BIG = 8
     # 512 KiB is the largest part Telegram accepts and is valid for any file
@@ -440,6 +445,9 @@ class TransferConfig:
             ),
             upload_parts_in_flight=positive(
                 "upload_parts_in_flight", cls.DEFAULT_UPLOAD_PARTS_IN_FLIGHT
+            ),
+            read_parallel_window=positive(
+                "read_parallel_window", cls.DEFAULT_READ_PARALLEL_WINDOW
             ),
         )
 
@@ -832,6 +840,11 @@ class FilesystemConfig:
     # a worker moves them into the primary and the mirrors afterwards.
     # Requires the cache and is refused with ``strict``.
     write_ack: WriteAck = "primary"
+    # Spread the pieces of one download over every store that holds the
+    # version (design plan 4.11); ``read_sources`` limits the stores that
+    # take part (store names, a subset of primary and mirrors).
+    read_parallel: bool = False
+    read_sources: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "FilesystemConfig":
@@ -893,6 +906,8 @@ class FilesystemConfig:
             allow_shared_store=bool(data.get("allow_shared_store", False)),
             sync_is_default=sync_is_default,
             write_ack=write_ack,  # type: ignore[arg-type]
+            read_parallel=bool(data.get("read_parallel", False)),
+            read_sources=[str(s) for s in (data.get("read_sources") or [])],
         )
 
     @property
@@ -1007,6 +1022,12 @@ def _validate_filesystems(
             if store_name not in fs.store_names:
                 raise ValueError(
                     f"filesystems.{fs.name}: read_preference names '{store_name}', "
+                    f"which is neither its primary nor one of its mirrors"
+                )
+        for store_name in fs.read_sources:
+            if store_name not in fs.store_names:
+                raise ValueError(
+                    f"filesystems.{fs.name}: read_sources names '{store_name}', "
                     f"which is neither its primary nor one of its mirrors"
                 )
         if (other := primaries.get(fs.primary)) is not None:

@@ -24,6 +24,10 @@ export interface FilesystemConfig {
   sync: SyncMode;
   strict: boolean;
   write_ack: WriteAck;
+  // Multi-source reads: spread one download over every store that holds
+  // the version; read_sources limits the stores that take part.
+  read_parallel: boolean;
+  read_sources: string[];
   allow_shared_store: boolean;
   metadata: {
     type: MetadataType;

@@ -106,6 +106,11 @@ class Client:
             read_preference=read_preference,
             cache=cache,
             cache_scope=filesystem.name,
+            read_parallel=filesystem.read_parallel,
+            read_sources=[config.stores[name].key for name in filesystem.read_sources],
+            piece_size=config.tgdcfs.transfer.download_piece_size_bytes,
+            parallel_threshold=config.tgdcfs.transfer.parallel_download_threshold_bytes,
+            read_window=config.tgdcfs.transfer.read_parallel_window,
         )
 
         # Wrap the file-content repository in an encryption decorator if

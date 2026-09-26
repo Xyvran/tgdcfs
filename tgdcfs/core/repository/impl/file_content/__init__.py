@@ -1,11 +1,12 @@
 import logging
 from dataclasses import dataclass
-from typing import AsyncIterator, Generator, Iterable, List, Optional, Sequence
+from typing import AsyncIterator, Dict, Generator, Iterable, List, Optional, Sequence
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSFileVersion
+from tgdcfs.core.multisource import MultiSourceRead, StoreView, read_slots
 from tgdcfs.core.repository.interface import IFileContentRepository
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import (
@@ -60,9 +61,23 @@ class StoreFileContentRepository(IFileContentRepository):
         read_preference: Optional[Sequence[str]] = None,
         cache: Optional[LocalCache] = None,
         cache_scope: str = "",
+        read_parallel: bool = False,
+        read_sources: Optional[Sequence[str]] = None,
+        piece_size: int = 4 * 1024 * 1024,
+        parallel_threshold: int = 10 * 1024 * 1024,
+        read_window: int = 8,
     ):
         self._store = store
         self._mirror_group = mirror_group
+        # Multi-source reads (design plan 4.11): a range above the
+        # threshold is cut into pieces of ``piece_size`` that every store
+        # holding the version fetches side by side; ``read_sources`` (store
+        # keys) limits the stores that take part.
+        self._read_parallel = read_parallel
+        self._read_sources = list(read_sources or [])
+        self._piece_size = piece_size
+        self._parallel_threshold = parallel_threshold
+        self._read_window = read_window
         # False: writes record the primary copy only and the replication
         # queue copies to the mirrors later (``sync: background``).
         self._inline_mirroring = inline_mirroring
@@ -414,11 +429,64 @@ class StoreFileContentRepository(IFileContentRepository):
             return self._stream_through_cache(fv, layouts, begin, last, name)
         return self._stream_layouts(layouts, fv.id, begin, end, name)
 
+    def _store_views(self, layouts: List[Layout]) -> List[StoreView]:
+        """Every store that holds the version completely, with its layout.
+
+        The primary layout yields one view per store that has a candidate
+        for every part; each replica layout yields its store. Read
+        preference decides the order, ``read_sources`` who takes part.
+        """
+        views: List[StoreView] = []
+        seen: set[str] = set()
+        for layout in layouts:
+            per_store: Dict[str, List[int]] = {}
+            stores: Dict[str, IStore] = {}
+            for sources in layout.candidates:
+                for store, mid in sources:
+                    per_store.setdefault(store.key, []).append(mid)
+                    stores[store.key] = store
+            for key, ids in per_store.items():
+                if key in seen or len(ids) != len(layout.part_sizes):
+                    continue
+                if self._read_sources and key not in self._read_sources:
+                    continue
+                seen.add(key)
+                views.append(
+                    StoreView(
+                        stores[key],
+                        ids,
+                        list(layout.part_sizes),
+                        slots=read_slots(stores[key]),
+                    )
+                )
+        views.sort(key=lambda view: self._preference_rank(view.key))
+        return views
+
     def _stream_layouts(
         self, layouts: List[Layout], version_id: str, begin: int, end: int, name: str
     ) -> FileContent:
         """Stream ``[begin, end]`` from the first layout that can serve it,
-        failing over to the next from the byte where the previous stopped."""
+        failing over to the next from the byte where the previous stopped.
+
+        With ``read_parallel`` and more than one store holding the version,
+        a range above the threshold is shared between the stores instead.
+        """
+        size = layouts[0].size
+        last = size - 1 if end < 0 or end >= size else end
+        if self._read_parallel and last - begin + 1 > self._parallel_threshold:
+            views = self._store_views(layouts)
+            if len(views) > 1:
+                return MultiSourceRead(
+                    views,
+                    size,
+                    version_id,
+                    begin,
+                    last,
+                    self._piece_size,
+                    self._read_window,
+                    self._map_range,
+                    name,
+                ).stream()
 
         async def stream() -> AsyncIterator[bytes]:
             served = 0

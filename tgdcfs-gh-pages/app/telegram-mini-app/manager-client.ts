@@ -55,6 +55,9 @@ export interface FilesystemInfo {
   sync: string;
   strict: boolean;
   read_preference: string[];
+  read_parallel?: boolean;
+  read_sources?: string[];
+  write_ack?: string;
   metadata: string;
   primary_dead: boolean;
 }

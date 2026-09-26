@@ -168,6 +168,8 @@ const newFilesystem = (name: string, primary: string): FilesystemConfig => ({
   sync: "inline",
   strict: false,
   write_ack: "primary",
+  read_parallel: false,
+  read_sources: [],
   allow_shared_store: false,
   metadata: {
     type: "pinned_message",
@@ -361,6 +363,7 @@ export default function ConfigGenerator() {
       ...fs,
       primary: fs.primary === removed ? "" : fs.primary,
       mirrors: fs.mirrors.filter((m) => m !== removed),
+      read_sources: fs.read_sources.filter((m) => m !== removed),
     }));
     setConfig({ ...config, stores, filesystems });
   };
@@ -380,6 +383,7 @@ export default function ConfigGenerator() {
         ...fs,
         primary: fs.primary === oldName ? value : fs.primary,
         mirrors: fs.mirrors.map((m) => (m === oldName ? value : m)),
+        read_sources: fs.read_sources.map((m) => (m === oldName ? value : m)),
       }));
     }
     setConfig({ ...config, stores, filesystems });
@@ -454,6 +458,10 @@ export default function ConfigGenerator() {
     const fs = { ...filesystems[index], [field]: value };
     if (field === "primary") {
       fs.mirrors = fs.mirrors.filter((m) => m !== value);
+    }
+    if (field === "primary" || field === "mirrors") {
+      const held = [fs.primary, ...fs.mirrors];
+      fs.read_sources = fs.read_sources.filter((m) => held.includes(m));
     }
     if (field === "sync" && value === "background") {
       fs.strict = false;
@@ -567,6 +575,8 @@ export default function ConfigGenerator() {
         sync?: string;
         strict?: boolean;
         write_ack?: string;
+        read_parallel?: boolean;
+        read_sources?: string[];
         allow_shared_store?: boolean;
         metadata: {
           type: string;
@@ -596,6 +606,14 @@ export default function ConfigGenerator() {
                 ...(fs.sync !== derivedSync ? { sync: fs.sync } : {}),
                 ...(fs.strict ? { strict: true } : {}),
                 ...(fs.allow_shared_store ? { allow_shared_store: true } : {}),
+                ...(fs.read_parallel ? { read_parallel: true } : {}),
+                ...(fs.read_parallel && fs.read_sources.length > 0
+                  ? {
+                      read_sources: fs.read_sources.filter((s) =>
+                        [fs.primary, ...mirrors].includes(s)
+                      ),
+                    }
+                  : {}),
               }
             : {}),
           ...(writeBack ? { write_ack: "cache" } : {}),

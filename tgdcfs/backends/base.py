@@ -132,6 +132,11 @@ class IStore(metaclass=ABCMeta):
         """
         pass
 
+    @property
+    def read_slots(self) -> int:
+        """Pieces of one multi-source read this store keeps in flight."""
+        return 2
+
     def plan_parts(self, size: int) -> List[int]:
         """The part sizes ``upload`` would cut ``size`` bytes into.
 

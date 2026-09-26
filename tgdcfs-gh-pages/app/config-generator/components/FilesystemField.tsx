@@ -297,6 +297,65 @@ export function FilesystemField({
               </>
             )}
           </Typography>
+          <FormControlLabel
+            label="Read from every store in parallel (pieces of one download are shared between the stores)"
+            control={
+              <Checkbox
+                checked={filesystem.read_parallel}
+                onChange={(e) => onUpdate("read_parallel", e.target.checked)}
+              />
+            }
+          />
+          {filesystem.read_parallel && (
+            <>
+              <FormControl size="small" sx={{ minWidth: 300, mb: 1 }}>
+                <InputLabel>Stores taking part (empty: all)</InputLabel>
+                <Select
+                  multiple
+                  value={filesystem.read_sources.filter((name) =>
+                    [filesystem.primary, ...filesystem.mirrors].includes(name)
+                  )}
+                  label="Stores taking part (empty: all)"
+                  input={<OutlinedInput label="Stores taking part (empty: all)" />}
+                  onChange={(e) =>
+                    onUpdate(
+                      "read_sources",
+                      (typeof e.target.value === "string"
+                        ? e.target.value.split(",")
+                        : e.target.value) as string[]
+                    )
+                  }
+                  renderValue={(selected) => (
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5 }}>
+                      {(selected as string[]).map((value) => (
+                        <Chip key={value} label={value} size="small" />
+                      ))}
+                    </Box>
+                  )}
+                >
+                  {namedStores
+                    .filter((s) =>
+                      [filesystem.primary, ...filesystem.mirrors].includes(s.name)
+                    )
+                    .map((store) => (
+                      <MenuItem key={store.name} value={store.name}>
+                        {storeLabel(store)}
+                      </MenuItem>
+                    ))}
+                </Select>
+              </FormControl>
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mb: 1, pl: 2 }}
+              >
+                Only pays off with more than one store holding the file: a
+                fast store simply takes more pieces than a slow one. Small
+                reads stay on a single store. Leave a Discord mirror out to
+                spare its rate limit for bulk reads.
+              </Typography>
+            </>
+          )}
           {cacheEnabled && (
             <>
               <FormControl size="small" sx={{ minWidth: 260, mb: 1 }}>

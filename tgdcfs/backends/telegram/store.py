@@ -294,6 +294,11 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
 
+    @property
+    def read_slots(self) -> int:
+        # The same fan-out the store uses for its own split downloads.
+        return _transfer().download_pieces_in_flight
+
     def _part_size_for(self, size: int) -> tuple[int, bool]:
         """The part size for ``size`` bytes and whether the account uploads."""
         premium_upload = size > PART_SIZE_DEFAULT and self._premium_upload

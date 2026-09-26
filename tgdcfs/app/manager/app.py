@@ -92,6 +92,9 @@ def create_manager_app(
                 "sync": fs.sync,
                 "strict": fs.strict,
                 "read_preference": list(fs.read_preference),
+                "read_parallel": fs.read_parallel,
+                "read_sources": list(fs.read_sources),
+                "write_ack": fs.write_ack,
                 "metadata": fs.metadata.type.value,
                 "primary_dead": bool(
                     client
