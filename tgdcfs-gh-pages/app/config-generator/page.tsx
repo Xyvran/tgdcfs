@@ -1350,7 +1350,7 @@ export default function ConfigGenerator() {
                       width={240}
                     />
                     <ConfigTextField
-                      label="Max size per version (MB, 0 = unlimited)"
+                      label="Max staged version (MB, 0 = unlimited)"
                       type="number"
                       value={config.tgdcfs.cache.max_file_size_mb}
                       onChange={(e) =>

@@ -320,10 +320,91 @@ class TestBudget:
         assert len(warnings) == 1
         assert cache.stats()["entries"] == 0
 
-    async def test_versions_above_the_file_limit_are_not_cached(self, tmp_path):
+    async def test_versions_above_the_file_limit_are_not_staged(self, tmp_path):
         cache = make_cache(tmp_path, max_file_size_mb=1)
         assert cache.open_staging("fs", "huge", 2 * 1024 * 1024) is None
         assert cache.open_staging("fs", "small", 1024) is not None
+
+    async def test_a_read_fill_ignores_the_file_limit(self, tmp_path):
+        """A read fill is admitted per block: the entry costs nothing until
+        a block lands, so a version above max_file_size_mb is cached for
+        the blocks a reader touches."""
+        cache = make_cache(tmp_path, max_file_size_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        huge = 8 * quarter  # 2 MiB, twice the limit
+        entry = cache.reserve("fs", "huge", huge)
+        assert entry is not None
+        assert cache.used_bytes() == 0
+
+        await cache.write_blocks("huge", 4 * quarter, b"h" * quarter)
+
+        assert cache.used_bytes() == quarter
+        assert cache.has_range("huge", 4 * quarter, 5 * quarter - 1)
+        assert not cache.has_range("huge", 0, quarter - 1)
+        assert await read_all(cache, "huge", 4 * quarter, 5 * quarter - 1) == (
+            b"h" * quarter
+        )
+
+    async def test_a_read_fill_of_a_version_larger_than_the_budget(self, tmp_path):
+        """The budget is claimed block by block, so a version that would
+        never fit whole is still cached up to the budget and read from the
+        stores for the rest."""
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        assert cache.reserve("fs", "huge", 16 * quarter) is not None  # 4 MiB
+
+        for i in range(16):
+            await cache.write_blocks("huge", i * quarter, bytes([i]) * quarter)
+            assert cache.used_bytes() <= cache.config.max_size_bytes
+
+        entry = entry_of(cache, "huge")
+        # The entry is never its own victim: the first four blocks stayed,
+        # later ones found no room and were not written.
+        assert entry.present_bytes() == 4 * quarter
+        assert list(entry.present[:4]) == [1, 1, 1, 1]
+        assert not any(entry.present[4:])
+        assert await read_all(cache, "huge", 0, quarter - 1) == bytes([0]) * quarter
+
+    async def test_a_read_fill_is_not_measured_against_the_headroom_whole(
+        self, tmp_path, monkeypatch
+    ):
+        cache = make_cache(tmp_path, min_free_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024 + 2 * quarter)
+
+        # A whole copy would eat into the headroom; blocks are admitted
+        # one at a time until they would.
+        assert cache.open_staging("fs", "staged", 16 * quarter) is None
+        assert cache.reserve("fs", "huge", 16 * quarter) is not None
+        await cache.write_blocks("huge", 0, b"a" * quarter)
+        await cache.write_blocks("huge", quarter, b"b" * quarter)
+        assert cache.used_bytes() == 2 * quarter
+
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024)
+        await cache.write_blocks("huge", 2 * quarter, b"c" * quarter)
+        assert cache.used_bytes() == 2 * quarter
+        assert not cache.has_range("huge", 2 * quarter, 3 * quarter - 1)
+
+    async def test_max_files_still_bounds_read_fills(self, tmp_path):
+        cache = make_cache(tmp_path, max_files=1)
+        assert cache.reserve("fs", "a", 10) is not None
+        cache.pin("a")
+        assert cache.reserve("fs", "b", 10) is None
+        cache.release("a")
+        assert cache.reserve("fs", "b", 10) is not None
+        assert cache.entry("a") is None
+
+    async def test_a_reserved_entry_survives_a_restart_empty(self, tmp_path):
+        cache = make_cache(tmp_path, block_kb=256)
+        quarter = 256 * 1024
+        assert cache.reserve("fs", "huge", 8 * quarter) is not None
+        await cache.write_blocks("huge", quarter, b"x" * quarter)
+
+        again = make_cache(tmp_path, block_kb=256)
+        entry = entry_of(again, "huge")
+        assert entry.size == 8 * quarter
+        assert list(entry.present) == [0, 1, 0, 0, 0, 0, 0, 0]
+        assert again.used_bytes() == quarter
 
     async def test_release_without_keep_for_reads_drops_the_entry(self, tmp_path):
         cache = make_cache(tmp_path, keep_for_reads=False)
@@ -886,7 +967,38 @@ class TestReadCache:
         version = await stack.version("a.bin")
 
         assert await stack.read("a.bin") == BIG
-        assert cache.entry(version.id) is None
+        # The entry is admitted (it costs nothing), but no block found room.
+        assert entry_of(cache, version.id).present_bytes() == 0
+        assert cache.used_bytes() == 1024 * 1024
+
+    async def test_a_version_above_the_file_limit_is_read_through_the_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """max_file_size_mb keeps a large version from being staged whole,
+        not from being cached block by block as it is read."""
+        cache = make_cache(tmp_path, stage_uploads=False)
+        # The limit is whole megabytes; the test file is smaller, so lower
+        # the limit itself to one block.
+        monkeypatch.setattr(
+            CacheConfig, "max_file_size_bytes", property(lambda self: BLOCK)
+        )
+        assert cache.open_staging("fs", "whole", len(BIG)) is None
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        assert cache.entry(version.id) is None  # nothing staged, nothing filled
+        fr = stack.root.find_file("a.bin")
+
+        async def read(begin, end):
+            stream = await stack.file_api.retrieve(fr, begin, end, "a.bin")
+            return b"".join([c async for c in stream])
+
+        assert await read(BLOCK + 10, BLOCK + 99) == BIG[BLOCK + 10 : BLOCK + 100]
+        assert list(entry_of(cache, version.id).present) == [0, 1, 0, 0]
+
+        stack.primary.downloaded.clear()
+        assert await read(BLOCK + 200, 2 * BLOCK - 1) == BIG[BLOCK + 200 : 2 * BLOCK]
+        assert downloaded_parts(stack.primary, version) == []
 
     async def test_the_metadata_blob_is_never_cached(self, tmp_path):
         cache = make_cache(tmp_path)

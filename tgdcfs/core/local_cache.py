@@ -33,7 +33,11 @@ full size from the moment it is admitted, a read-cache entry is charged
 the blocks it holds plus the blocks a fill is writing right now, and
 every write claims its bytes before it touches the disk, so the sum
 never exceeds the budget. ``max_files`` bounds the entries and
-``max_file_size`` the largest version cached. Eviction is LRU by last
+``max_file_size`` the largest version *staged* (an upload or a mirror
+download, which land whole and are charged whole). A read-cache fill
+is admitted per block: the entry costs nothing until a block lands, so
+a version above ``max_file_size``, or larger than the whole budget, is
+still cached for the blocks a reader touches. Eviction is LRU by last
 access over *unpinned* entries; a pinned entry (its mirrors still need
 it) is never evicted. When the budget cannot be met a new entry is
 refused, or a fill stops caching, and the caller carries on without the
@@ -668,8 +672,10 @@ class LocalCache:
     ) -> Optional[StagingWriter]:
         """Start an entry for ``version_id`` to be written front to back.
 
-        ``None`` when the cache is off, the version is too large or the
-        budget cannot be met without evicting pinned entries.
+        The whole version lands, so the whole size is charged up front:
+        ``None`` when the cache is off, the version is above
+        ``max_file_size`` or the budget cannot be met without evicting
+        pinned entries. Read-cache fills go through :meth:`reserve`.
         """
         if not self.config.enabled or size < 0:
             return None
@@ -693,19 +699,26 @@ class LocalCache:
             last_access=time.time(),
             writing=True,
         )
-        try:
-            os.makedirs(self.directory, exist_ok=True)
-            with open(self.data_path(version_id), "wb") as fh:
-                fh.truncate(size)
-            with open(self.map_path(version_id), "wb") as fh:
-                fh.write(bytes(entry.present))
-        except OSError as ex:
-            self._refuse(f"cannot create files in {self.directory}: {ex}")
-            self._unlink(version_id)
+        if not self._create_files(entry):
             return None
         self._entries[version_id] = entry
         self._save_index()
         return StagingWriter(self, entry)
+
+    def _create_files(self, entry: CacheEntry) -> bool:
+        """The sparse data file at the version's size and the empty block
+        map; ``False`` (with the files removed) when the disk refuses."""
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            with open(self.data_path(entry.version_id), "wb") as fh:
+                fh.truncate(entry.size)
+            with open(self.map_path(entry.version_id), "wb") as fh:
+                fh.write(bytes(entry.present))
+        except OSError as ex:
+            self._refuse(f"cannot create files in {self.directory}: {ex}")
+            self._unlink(entry.version_id)
+            return False
+        return True
 
     def _mark_present(self, entry: CacheEntry, blocks: Iterable[int]) -> None:
         if self._entries.get(entry.version_id) is not entry:
@@ -787,12 +800,38 @@ class LocalCache:
             os.close(fd)
 
     def reserve(self, fs: str, version_id: str, size: int) -> Optional[CacheEntry]:
-        """An empty entry for read-cache fills; ``None`` when it does not fit."""
-        writer = self.open_staging(fs, version_id, size)
-        if writer is None:
+        """An empty entry for read-cache fills; ``None`` when the cache is off
+        or the entry cannot be created.
+
+        Admission is per block, not per version: nothing is charged here,
+        every block claims its own bytes in :meth:`write_blocks`, so a
+        version larger than ``max_file_size`` or than the whole budget is
+        still cached for the blocks a reader actually touches. The data
+        file is sparse, its logical size is the version's. ``max_files``
+        still bounds the entries.
+        """
+        if not self.config.enabled or size < 0:
             return None
-        entry = self._entries[version_id]
-        entry.writing = False
+        if version_id in self._entries:
+            self.remove(version_id)
+        if not self._make_room(0):
+            self._refuse(
+                "max_files, the budget or the headroom on the disk is taken by "
+                f"entries the mirrors still need; {version_id} is read without "
+                "the cache"
+            )
+            return None
+        entry = CacheEntry(
+            version_id=version_id,
+            fs=fs,
+            size=size,
+            block_size=self.config.block_bytes,
+            present=bytearray(blocks_for(size, self.config.block_bytes)),
+            last_access=time.time(),
+        )
+        if not self._create_files(entry):
+            return None
+        self._entries[version_id] = entry
         self._save_index()
         return entry
 

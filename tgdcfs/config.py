@@ -465,8 +465,9 @@ class CacheConfig:
 
     ``max_size_mb`` bounds the bytes on disk, ``max_files`` the number of
     cached versions (``0`` means unlimited for both), and a version above
-    ``max_file_size_mb`` is never cached. ``block_kb`` is the unit the
-    read cache fills and serves.
+    ``max_file_size_mb`` is never staged whole; reads of it are still
+    cached block by block, since a read fill is admitted per block.
+    ``block_kb`` is the unit the read cache fills and serves.
 
     ``min_free_mb`` is headroom the cache leaves on the disk for everything
     else in the data directory (``0`` turns the check off). A background

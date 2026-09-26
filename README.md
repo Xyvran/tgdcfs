@@ -381,7 +381,7 @@ tgdcfs:
     dir: cache               # relative paths land in the data directory
     max_size_mb: 20480       # total budget, 0 = unlimited
     max_files: 0             # cached versions, 0 = unlimited
-    max_file_size_mb: 4096   # larger versions are neither staged nor cached
+    max_file_size_mb: 4096   # larger versions are not staged whole; reads still cache per block
     block_kb: 4096           # unit the read cache fills and serves, min 64
     stage_uploads: true      # write incoming uploads to the cache for the mirrors
     keep_for_reads: true     # keep entries after replication and fill them from downloads
@@ -391,11 +391,22 @@ tgdcfs:
 ```
 
 **Sizing.** `max_size_mb` is a hard ceiling for the bytes in the
-directory; `max_files` and `max_file_size_mb` bound the count and the
-largest single version. A staged upload is charged its full size the
-moment it is admitted, a read-cache entry is charged the blocks it
-holds, and every block claims its bytes before it is written, so the
-sum never exceeds the budget. Eviction is least-recently-used over the
+directory; `max_files` bounds the count of cached versions and
+`max_file_size_mb` the largest version that is staged whole (an upload,
+or a mirror download that fills the cache on the way). A staged upload
+is charged its full size the moment it is admitted, a read-cache entry
+is charged the blocks it holds, and every block claims its bytes before
+it is written, so the sum never exceeds the budget.
+
+**Reads are admitted per block.** A read-cache entry costs nothing
+until a block lands, so a version above `max_file_size_mb`, or larger
+than the whole budget, is still cached for the blocks a reader actually
+touches: a few seeks into a 500 GB file leave a few blocks on disk, not
+a refusal. The data file is sparse at the version's full size (`ls -l`
+shows it, `du` and the budget count the blocks present), so the cache
+directory needs a file system with sparse files, which every Docker
+volume on ext4, xfs or btrfs is. Eviction is still per version: when
+such an entry is the oldest, all of its blocks go at once. Eviction is least-recently-used over the
 entries no mirror is waiting for; an entry a mirror still needs is
 *pinned* and never evicted, so the budget has to hold the uploads that
 are still in flight to their mirrors on top of what you want to keep

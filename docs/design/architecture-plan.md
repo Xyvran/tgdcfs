@@ -444,9 +444,12 @@ keep working the way they do now; the in-memory chunk cache of the
 Telegram store stays as the hot layer in front of the disk.
 
 **Budget and eviction.** `max_size_mb`, `max_files` (versions) and
-`max_file_size_mb` (larger versions are neither staged nor cached).
-Eviction is LRU by last access over unpinned versions; partial entries
-count their present bytes. Pinned versions are never evicted. When the
+`max_file_size_mb` (larger versions are not staged whole). A staged
+copy is charged its full size on admission; a read-cache fill is
+admitted per block and charged block by block, so a version above
+`max_file_size_mb` or larger than the budget is still cached for the
+blocks a reader touches. Eviction is LRU by last access over unpinned
+versions; partial entries count their present bytes. Pinned versions are never evicted. When the
 budget is exhausted by pinned entries a new upload is not staged (one
 warning, then the download path) rather than throwing away work that
 already sits on disk. `ENOSPC` or any other disk error is treated the
@@ -650,7 +653,7 @@ tgdcfs:
     dir: cache               # relative to the data dir, so it lives on the volume
     max_size_mb: 20480       # total budget, 0 = unlimited
     max_files: 0             # versions, 0 = unlimited
-    max_file_size_mb: 4096   # larger versions are neither staged nor cached
+    max_file_size_mb: 4096   # larger versions are not staged whole; reads still cache per block
     block_kb: 4096
     stage_uploads: true      # write incoming uploads to the cache for the mirrors
     keep_for_reads: true     # keep entries after replication, fill them from downloads

@@ -177,7 +177,8 @@ tgdcfs:
   # when no unpinned entry can be evicted, a version is simply not
   # cached and the transfer goes on without the cache. ``max_files`` bounds
   # the number of cached versions (0 = unlimited) and a version above
-  # ``max_file_size_mb`` is neither staged nor cached. Entries a mirror is
+  # ``max_file_size_mb`` is not staged whole; reads of it are still cached
+  # block by block, as a read fill is admitted per block. Entries a mirror is
   # still waiting for are pinned and never evicted, so the budget has to
   # hold the uploads in flight on top of what you keep for reads. With
   # encryption on, the cache holds ciphertext. A relative ``dir`` lives in
