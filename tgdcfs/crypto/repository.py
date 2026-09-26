@@ -25,7 +25,7 @@ just with the ciphertext sizes substituted.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Optional
 
 from tgdcfs.core.repository.interface import IFileContentRepository
 from tgdcfs.crypto.cipher import (
@@ -144,6 +144,9 @@ class EncryptingFileContentRepository(IFileContentRepository):
         encrypted = EncryptingFileMessage.wrap(file_msg, file_key, header)
         encrypted.version_id = version_id
         return await self._inner.stage(encrypted, version_id)
+
+    async def forget(self, version_ids: Iterable[str]) -> None:
+        await self._inner.forget(version_ids)
 
     # -- update ------------------------------------------------------------
 

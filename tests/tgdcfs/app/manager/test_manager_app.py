@@ -114,6 +114,39 @@ class TestManagerApp:
         assert client.get("/replication/queue").json() == {}
         assert client.post("/replication/retry").status_code == 400
 
+    def test_cache_endpoints(self, mock_clients, mock_config, tmp_path):
+        from tgdcfs.config import CacheConfig
+        from tgdcfs.core.local_cache import LocalCache
+
+        cache = LocalCache(
+            CacheConfig.from_dict({"enabled": True, "block_kb": 64}),
+            directory=str(tmp_path / "cache"),
+        )
+        cache.load()
+        writer = cache.open_staging("Test-Channel", "v1", 3)
+        assert writer is not None
+        import asyncio
+
+        asyncio.run(writer.write(b"abc"))
+        asyncio.run(writer.close())
+        client = TestClient(create_manager_app(mock_clients, mock_config, cache=cache))
+
+        stats = client.get("/cache").json()
+        assert stats["enabled"] is True and stats["entries"] == 1
+        assert stats["used_bytes"] == 3
+        assert stats["per_filesystem"] == {
+            "Test-Channel": {"entries": 1, "bytes": 3, "pinned": 0}
+        }
+
+        response = client.post("/cache/evict")
+        assert response.status_code == 200
+        assert response.json()["evicted"] == 1 and response.json()["entries"] == 0
+
+    def test_cache_endpoints_without_a_cache(self, mock_clients, mock_config):
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+        assert client.get("/cache").json() == {"enabled": False}
+        assert client.post("/cache/evict").status_code == 400
+
     def test_get_redundancy_without_mirrors(self, mock_clients, mock_config):
         client = TestClient(create_manager_app(mock_clients, mock_config))
 

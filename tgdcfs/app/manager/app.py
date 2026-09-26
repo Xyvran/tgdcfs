@@ -148,6 +148,20 @@ def create_manager_app(
         replication.retry_now(filesystem)
         return {"message": "Retry scheduled"}
 
+    @app.get("/cache")
+    async def get_cache():
+        """The local cache: budget, entries, pinned bytes, hit ratio."""
+        if cache is None:
+            return {"enabled": False}
+        return cache.stats()
+
+    @app.post("/cache/evict")
+    async def evict_cache():
+        """Drop every cache entry no mirror is waiting for."""
+        if cache is None:
+            raise HTTPException(status_code=400, detail="The local cache is off")
+        return {"evicted": cache.evict_unpinned(), **cache.stats()}
+
     @app.get("/redundancy")
     async def get_redundancy():
         """Redundancy overview per file system, keyed by mirror store key.

@@ -129,4 +129,10 @@ class FileDescApi:
     ) -> FDRepositoryResp:
         fd = await self.get_file_desc(fr)
         fd.delete_version(version_id)
-        return await self.__fd_repo.save(fd, fr)
+        resp = await self.__fd_repo.save(fd, fr)
+        await self.__fc_repo.forget([version_id])
+        return resp
+
+    async def forget_versions(self, version_ids: List[str]) -> None:
+        """Drop what the content repository kept locally for deleted versions."""
+        await self.__fc_repo.forget(version_ids)

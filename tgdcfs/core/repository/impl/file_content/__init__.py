@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import AsyncIterator, Generator, List, Optional, Sequence
+from typing import AsyncIterator, Generator, Iterable, List, Optional, Sequence
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
@@ -403,13 +403,30 @@ class StoreFileContentRepository(IFileContentRepository):
             )
         )
 
+        size = layouts[0].size
+        last = size - 1 if end < 0 or end >= size else end
+        if (
+            self._cache is not None
+            and self._cache.config.keep_for_reads
+            and fv.cacheable
+            and fv.id
+        ):
+            return self._stream_through_cache(fv, layouts, begin, last, name)
+        return self._stream_layouts(layouts, fv.id, begin, end, name)
+
+    def _stream_layouts(
+        self, layouts: List[Layout], version_id: str, begin: int, end: int, name: str
+    ) -> FileContent:
+        """Stream ``[begin, end]`` from the first layout that can serve it,
+        failing over to the next from the byte where the previous stopped."""
+
         async def stream() -> AsyncIterator[bytes]:
             served = 0
             last_ex: Optional[Exception] = None
             for layout in layouts:
                 try:
                     async for chunk in self._stream_layout(
-                        layout, fv.id, begin + served, end
+                        layout, version_id, begin + served, end
                     ):
                         yield chunk
                         served += len(chunk)
@@ -417,13 +434,118 @@ class StoreFileContentRepository(IFileContentRepository):
                 except Exception as ex:
                     last_ex = ex
                     logger.warning(
-                        f"Layout '{layout.label}' of {name}@{fv.id} failed after "
+                        f"Layout '{layout.label}' of {name}@{version_id} failed after "
                         f"{served} bytes: {ex}; trying the next one"
                     )
             if last_ex:
                 raise last_ex
 
         return stream()
+
+    def _stream_through_cache(
+        self,
+        fv: TGFSFileVersion,
+        layouts: List[Layout],
+        begin: int,
+        end: int,
+        name: str,
+    ) -> FileContent:
+        """Serve ``[begin, end]`` with the read cache in front of the stores.
+
+        Blocks already on disk are read from there; every missing run is
+        fetched from the stores widened to whole blocks, stored block by
+        block as it arrives, and only the requested bytes are handed out.
+        A cache that refuses the entry (budget, size) leaves the read on
+        the plain store path.
+        """
+        cache = self._cache
+        if cache is None:  # pragma: no cover - callers check first
+            return self._stream_layouts(layouts, fv.id, begin, end, name)
+        size = layouts[0].size
+
+        async def stream() -> AsyncIterator[bytes]:
+            entry = cache.entry(fv.id)
+            if entry is None:
+                entry = cache.reserve(self._cache_scope, fv.id, size)
+            if entry is None:
+                async for chunk in self._stream_layouts(
+                    layouts, fv.id, begin, end, name
+                ):
+                    yield chunk
+                return
+
+            position = begin
+            for run_begin, run_end in entry.missing_runs(begin, end):
+                # Whatever is on disk before this run.
+                if position < run_begin:
+                    cache.hits += 1
+                    async for chunk in cache.read(fv.id, position, run_begin - 1):
+                        yield chunk
+                    position = run_begin
+                cache.misses += 1
+                async for chunk in self._fetch_run(
+                    fv.id,
+                    entry.block_size,
+                    layouts,
+                    run_begin,
+                    run_end,
+                    begin,
+                    end,
+                    name,
+                ):
+                    yield chunk
+                position = min(run_end, end) + 1
+            if position <= end:
+                cache.hits += 1
+                async for chunk in cache.read(fv.id, position, end):
+                    yield chunk
+
+        return stream()
+
+    async def _fetch_run(
+        self,
+        version_id: str,
+        block_size: int,
+        layouts: List[Layout],
+        run_begin: int,
+        run_end: int,
+        begin: int,
+        end: int,
+        name: str,
+    ) -> AsyncIterator[bytes]:
+        """Fetch the block-aligned run ``[run_begin, run_end]`` from the
+        stores, store each completed block, yield the part inside
+        ``[begin, end]``."""
+        cache = self._cache
+        if cache is None:  # pragma: no cover - callers check first
+            raise TechnicalError("no cache to fetch into")
+        block: bytearray = bytearray()
+        block_begin = run_begin
+        position = run_begin
+        async for chunk in self._stream_layouts(
+            layouts, version_id, run_begin, run_end, name
+        ):
+            # Hand out only the requested bytes of this chunk.
+            chunk_end = position + len(chunk) - 1
+            lo, hi = max(position, begin), min(chunk_end, end)
+            if lo <= hi:
+                yield bytes(chunk[lo - position : hi - position + 1])
+            position = chunk_end + 1
+            # Store whole blocks as they complete.
+            block.extend(chunk)
+            while len(block) >= block_size:
+                await cache.write_blocks(
+                    version_id, block_begin, bytes(block[:block_size])
+                )
+                del block[:block_size]
+                block_begin += block_size
+        if block and position > run_end:
+            # The final, short block of the version.
+            await cache.write_blocks(version_id, block_begin, bytes(block))
+
+    async def forget(self, version_ids: Iterable[str]) -> None:
+        if self._cache is not None:
+            self._cache.remove_many(version_ids)
 
     @staticmethod
     async def _empty() -> AsyncIterator[bytes]:

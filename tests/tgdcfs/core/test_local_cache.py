@@ -526,3 +526,151 @@ class TestBackgroundReplicationFromTheCache:
 
         assert downloaded_parts(stack.primary, await stack.version("a.bin")) != []
         assert await stack.read("a.bin") == DATA
+
+
+BIG = bytes(range(256)) * 900  # 230400 bytes: 3 full 64 KiB blocks and a tail
+
+
+class TestReadCache:
+    async def test_the_first_read_fills_the_cache_and_the_second_reads_from_disk(
+        self, tmp_path
+    ):
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        # Inline mirroring filled the entry from its own download; start
+        # from an empty cache, as a read of an older file would.
+        cache.remove(version.id)
+
+        assert await stack.read("a.bin") == BIG
+
+        assert cache.complete(version.id)
+        stack.primary.downloaded.clear()
+        assert await stack.read("a.bin") == BIG
+        assert downloaded_parts(stack.primary, version) == []
+        assert cache.hits >= 1 and cache.misses >= 1
+
+    async def test_a_small_read_fetches_whole_blocks_and_serves_the_neighbours(
+        self, tmp_path
+    ):
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        cache.remove(version.id)
+        fr = stack.root.find_file("a.bin")
+
+        async def read(begin, end):
+            stream = await stack.file_api.retrieve(fr, begin, end, "a.bin")
+            return b"".join([c async for c in stream])
+
+        assert await read(BLOCK + 10, BLOCK + 99) == BIG[BLOCK + 10 : BLOCK + 100]
+        entry = entry_of(cache, version.id)
+        assert list(entry.present) == [0, 1, 0, 0]
+
+        stack.primary.downloaded.clear()
+        assert await read(BLOCK + 200, 2 * BLOCK - 1) == BIG[BLOCK + 200 : 2 * BLOCK]
+        assert downloaded_parts(stack.primary, version) == []
+
+        # A range that straddles a cached and an uncached block.
+        assert await read(BLOCK + 5, 2 * BLOCK + 5) == BIG[BLOCK + 5 : 2 * BLOCK + 6]
+        assert list(entry_of(cache, version.id).present) == [0, 1, 1, 0]
+
+    async def test_the_tail_block_is_cached_short(self, tmp_path):
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        cache.remove(version.id)
+        fr = stack.root.find_file("a.bin")
+
+        stream = await stack.file_api.retrieve(fr, len(BIG) - 10, -1, "a.bin")
+        assert b"".join([c async for c in stream]) == BIG[-10:]
+
+        assert list(entry_of(cache, version.id).present) == [0, 0, 0, 1]
+        assert (
+            await read_all(cache, version.id, 3 * BLOCK, len(BIG) - 1)
+            == BIG[3 * BLOCK :]
+        )
+
+    async def test_a_staged_upload_is_read_from_disk_right_away(self, tmp_path):
+        cache = make_cache(tmp_path)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        stack.primary.downloaded.clear()
+
+        assert await stack.read("a.bin") == BIG
+
+        assert downloaded_parts(stack.primary, version) == []
+
+    async def test_without_keep_for_reads_reads_bypass_the_cache(self, tmp_path):
+        cache = make_cache(tmp_path, keep_for_reads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+
+        assert await stack.read("a.bin") == BIG
+
+        assert cache.entry(version.id) is None
+        assert downloaded_parts(stack.primary, version) != []
+
+    async def test_a_full_cache_leaves_the_read_on_the_stores(self, tmp_path):
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256, stage_uploads=False)
+        hog = cache.open_staging("fs", "hog", 1024 * 1024)
+        assert hog is not None
+        await hog.write(b"h" * (1024 * 1024))
+        await hog.close()
+        cache.pin("hog")
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+
+        assert await stack.read("a.bin") == BIG
+        assert cache.entry(version.id) is None
+
+    async def test_the_metadata_blob_is_never_cached(self, tmp_path):
+        cache = make_cache(tmp_path)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", DATA)
+        version = await stack.version("a.bin")
+
+        assert set(cache._entries) == {version.id}
+
+    async def test_a_cached_read_falls_over_like_a_plain_one(self, tmp_path):
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        stack.primary.fail.update({"download_file"})
+
+        assert await stack.read("a.bin") == BIG
+
+
+class TestDeleteFanOut:
+    async def test_removing_a_file_drops_its_entries(self, tmp_path):
+        cache = make_cache(tmp_path)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", DATA)
+        await stack.put("a.bin", DATA[:100])
+        fr = stack.root.find_file("a.bin")
+        fd = await stack.fd_repo.get(fr, include_all_versions=True)
+        ids = {v.id for v in fd.get_versions()}
+        assert len(ids) == 2 and ids <= set(cache._entries)
+
+        await stack.file_api.rm(fr)
+
+        assert not ids & set(cache._entries)
+
+    async def test_removing_a_version_drops_its_entry_only(self, tmp_path):
+        cache = make_cache(tmp_path)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", DATA)
+        old = await stack.version("a.bin")
+        await stack.put("a.bin", DATA[:100])
+        new = await stack.version("a.bin")
+
+        await stack.file_api.rm(stack.root.find_file("a.bin"), version_id=old.id)
+
+        assert cache.entry(old.id) is None
+        assert cache.entry(new.id) is not None

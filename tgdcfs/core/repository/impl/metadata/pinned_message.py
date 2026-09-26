@@ -112,6 +112,8 @@ class PinnedMessageMetadataRepository(IMetaDataRepository):
         temp_fv = TGFSFileVersion.from_sent_file_message(
             SentFileMessage(pinned_message.message_id, pinned_message.document.size)
         )
+        # A throwaway version around the metadata blob: never cache it.
+        temp_fv.cacheable = False
 
         metadata = TGFSMetadata.from_dict(
             json.loads(

@@ -1,6 +1,6 @@
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from tgdcfs.core.model import (
     TGFSDirectory,
@@ -53,6 +53,11 @@ class IFileContentRepository(metaclass=ABCMeta):
         return ``None``.
         """
         return None
+
+    async def forget(self, version_ids: Iterable[str]) -> None:
+        """The versions were deleted: drop whatever the repository kept
+        for them locally (cache entries). Nothing to do by default."""
+        return
 
     async def content_length(self, fv: TGFSFileVersion) -> int:
         """Logical size of the file as seen by the caller.

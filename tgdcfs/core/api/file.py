@@ -76,10 +76,12 @@ class FileApi:
         return primary
 
     async def collect_all_message_ids(
-        self, fr: TGFSFileRef
+        self, fr: TGFSFileRef, version_ids: Optional[List[str]] = None
     ) -> Tuple[List[int], MirrorMessageIds]:
         """Like :meth:`collect_message_ids`, but also returns the message
-        ids of every mirrored copy, grouped by mirror store."""
+        ids of every mirrored copy, grouped by mirror store. With
+        ``version_ids`` given, the ids of the versions seen are appended
+        to it (for dropping their local cache entries)."""
         ids: List[int] = []
         mirror_ids: MirrorMessageIds = {}
         try:
@@ -97,6 +99,8 @@ class FileApi:
             return ids, mirror_ids
         for version in fd.get_versions():
             self._collect_version_ids(version, ids, mirror_ids)
+            if version_ids is not None:
+                version_ids.append(version.id)
         return ids, mirror_ids
 
     @property
@@ -184,12 +188,13 @@ class FileApi:
         }
 
     async def collect_deletable_message_ids(
-        self, frs: Sequence[TGFSFileRef]
+        self, frs: Sequence[TGFSFileRef], version_ids: Optional[List[str]] = None
     ) -> Tuple[List[int], MirrorMessageIds]:
         """Message ids that become garbage once ``frs`` are removed.
 
         Refs whose descriptor is still referenced by a file outside ``frs``
         contribute nothing: their messages are shared and must stay.
+        ``version_ids`` collects the ids of the versions that go with them.
         """
         shared = self._descriptors_referenced_elsewhere(frs)
         ids: List[int] = []
@@ -201,7 +206,7 @@ class FileApi:
                     f"(descriptor {fr.message_id}): another file still refers to them"
                 )
                 continue
-            fr_ids, fr_mirror_ids = await self.collect_all_message_ids(fr)
+            fr_ids, fr_mirror_ids = await self.collect_all_message_ids(fr, version_ids)
             ids.extend(fr_ids)
             for channel_key, channel_ids in fr_mirror_ids.items():
                 mirror_ids.setdefault(channel_key, []).extend(channel_ids)
@@ -363,11 +368,16 @@ class FileApi:
 
     async def rm(self, fr: TGFSFileRef, version_id: Optional[str] = None) -> None:
         if not version_id:
-            message_ids, mirror_ids = await self.collect_deletable_message_ids([fr])
+            version_ids: List[str] = []
+            message_ids, mirror_ids = await self.collect_deletable_message_ids(
+                [fr], version_ids
+            )
             fr.delete()
             await self._metadata_api.push()
             await self._message_api.delete_messages(message_ids)
             await self.delete_mirrored(mirror_ids)
+            if version_ids:
+                await self._file_desc_api.forget_versions(version_ids)
         else:
             message_ids, mirror_ids = await self._collect_version_message_ids(
                 fr, version_id

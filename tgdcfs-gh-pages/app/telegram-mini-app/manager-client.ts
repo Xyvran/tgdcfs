@@ -30,6 +30,24 @@ export interface ReplicationItem {
 // File system name -> files waiting for background replication.
 export type ReplicationQueue = { [filesystem: string]: ReplicationItem[] };
 
+export interface CacheStats {
+  enabled: boolean;
+  directory?: string;
+  entries?: number;
+  complete_entries?: number;
+  used_bytes?: number;
+  max_size_bytes?: number;
+  max_files?: number;
+  pinned_entries?: number;
+  pinned_bytes?: number;
+  writing_entries?: number;
+  hits?: number;
+  misses?: number;
+  per_filesystem?: {
+    [filesystem: string]: { entries: number; bytes: number; pinned: number };
+  };
+}
+
 export interface FilesystemInfo {
   primary: string;
   mirrors: string[];
@@ -123,6 +141,17 @@ export default class ManagerClient {
 
   async getReplicationQueue(): Promise<ReplicationQueue> {
     return this.makeRequest<ReplicationQueue>("/replication/queue");
+  }
+
+  async getCacheStats(): Promise<CacheStats> {
+    return this.makeRequest<CacheStats>("/cache");
+  }
+
+  async evictCache(): Promise<number> {
+    const result = await this.makeRequest<{ evicted: number }>("/cache/evict", {
+      method: "POST",
+    });
+    return result.evicted;
   }
 
   async retryReplication(filesystem?: string): Promise<void> {

@@ -104,6 +104,12 @@ class TGFSFileVersion:
     # are gone, and serves the previous one until distribution completes.
     pending: bool = False
 
+    # Whether reads of this version may go through the local read cache.
+    # Not serialized: it is False only for the throwaway versions the
+    # metadata repository builds around the pinned metadata blob, which
+    # changes on every push and would only pollute the cache.
+    cacheable: bool = field(default=True, compare=False, repr=False)
+
     @property
     def updated_at_timestamp(self) -> int:
         return ts(self.updated_at)
