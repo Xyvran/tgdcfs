@@ -315,9 +315,8 @@ class TestBudget:
             for name in ("a", "b", "c"):
                 await cache.write_blocks(name, 0, b"x" * quarter)
 
-        assert [
-            r for r in caplog.records if "writing blocks" in r.message
-        ].__len__() == 1
+        warnings = [r for r in caplog.records if "writing blocks" in r.message]
+        assert len(warnings) == 1
         assert cache.stats()["entries"] == 0
 
     async def test_versions_above_the_file_limit_are_not_cached(self, tmp_path):
