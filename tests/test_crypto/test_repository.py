@@ -60,6 +60,9 @@ class _InMemoryRepo(IFileContentRepository):
         self._files: dict[int, bytes] = {}
         self._next_msg_id = 1000
         self._part_size = part_size
+        # One entry per ``get``, so a test can tell which reads asked to be
+        # admitted to the read cache.
+        self.admits: List[bool] = []
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         # Read the whole ciphertext into memory in chunks, mimicking what
@@ -87,10 +90,13 @@ class _InMemoryRepo(IFileContentRepository):
         self._files[msg_id] = ciphertext
         return [SentFileMessage(message_id=msg_id, size=len(ciphertext))]
 
-    async def get(self, fv, begin: int, end: int, name: str) -> FileContent:
+    async def get(
+        self, fv, begin: int, end: int, name: str, *, admit: bool = True
+    ) -> FileContent:
         # Single-part files only in this fake, so use the first message id.
         # ``end`` follows the codebase-wide INCLUSIVE convention (matches the
         # real Telegram ``download_file`` API: bytes_to_read = end - begin + 1).
+        self.admits.append(admit)
         ciphertext = self._files[fv.message_ids[0]]
         if end < 0:
             end = len(ciphertext) - 1
@@ -538,3 +544,76 @@ async def test_detection_cached_across_calls() -> None:
 
     hit, entry = repo._cache.lookup(fv.id)
     assert hit and entry is None  # cached as plaintext
+
+
+# --- the header probe and the read cache -----------------------------------
+
+
+async def test_the_header_probe_does_not_ask_to_be_cached() -> None:
+    """A PROPFIND wants the length of every listed file.
+
+    The probe reads the first few bytes and abandons the stream, so the read
+    cache must not open an entry for it -- it would be sized to the whole
+    version and never receive a block. The entry only makes sense once
+    somebody reads the content.
+    """
+    repo = _make_repo(chunk_size=4096)
+    inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
+    fv = await _save_and_get_fv(repo, os.urandom(4096 * 3 + 17))
+    inner.admits.clear()
+
+    await repo.content_length(fv)
+
+    assert inner.admits == [False]
+
+
+async def test_a_plaintext_probe_does_not_ask_to_be_cached() -> None:
+    """Same for a legacy file: the probe is what decides it is plaintext."""
+    repo = _make_repo(chunk_size=4096)
+    inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
+    fv = _seed_plaintext(repo, os.urandom(1024))
+    inner.admits.clear()
+
+    await repo.content_length(fv)
+
+    assert inner.admits == [False]
+
+
+async def test_a_real_read_is_admitted() -> None:
+    """Reading content is exactly what the cache is for."""
+    repo = _make_repo(chunk_size=4096)
+    inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
+    plaintext = os.urandom(4096 * 3 + 17)
+    fv = await _save_and_get_fv(repo, plaintext)
+    inner.admits.clear()
+
+    assert await _collect(await repo.get(fv, 0, -1, "test.bin")) == plaintext
+
+    # The probe first (not admitted), then the range itself (admitted).
+    assert inner.admits == [False, True]
+
+
+async def test_a_read_passes_its_own_refusal_on() -> None:
+    repo = _make_repo(chunk_size=4096)
+    inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
+    plaintext = os.urandom(4096 * 3 + 17)
+    fv = await _save_and_get_fv(repo, plaintext)
+    inner.admits.clear()
+
+    out = await _collect(await repo.get(fv, 0, -1, "test.bin", admit=False))
+
+    assert out == plaintext
+    assert inner.admits == [False, False]
+
+
+async def test_a_plaintext_read_passes_its_own_refusal_on() -> None:
+    repo = _make_repo(chunk_size=4096)
+    inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
+    plaintext = os.urandom(1024)
+    fv = _seed_plaintext(repo, plaintext)
+    inner.admits.clear()
+
+    out = await _collect(await repo.get(fv, 0, -1, "legacy.bin", admit=False))
+
+    assert out == plaintext
+    assert inner.admits == [False, False]

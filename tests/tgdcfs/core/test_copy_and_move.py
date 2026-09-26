@@ -118,7 +118,7 @@ class FakeFileContentRepository(IFileContentRepository):
         size = file_msg.get_size()
         return [SentFileMessage(self.channel.send_document(size), size)]
 
-    async def get(self, fv, begin, end, name):
+    async def get(self, fv, begin, end, name, *, admit: bool = True):
         raise NotImplementedError
 
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:

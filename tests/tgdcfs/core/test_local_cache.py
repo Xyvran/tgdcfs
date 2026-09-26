@@ -32,6 +32,7 @@ from tgdcfs.core.repository.impl import (
     StoreFDRepository,
     StoreFileContentRepository,
 )
+from tgdcfs.crypto.repository import EncryptingFileContentRepository
 from tgdcfs.reqres import FileMessageFromBuffer
 from tests.fakes.store import FakeStore
 
@@ -902,6 +903,62 @@ class TestReadCache:
         stack.primary.fail.update({"download_file"})
 
         assert await stack.read("a.bin") == BIG
+
+
+class TestTheContentLengthProbe:
+    """A PROPFIND asks the encryption decorator for the length of every
+    listed file, and the decorator answers by reading the first bytes of
+    the version and abandoning the stream. That probe must not open a
+    read-cache entry: the entry would be sized to the whole version and
+    never receive a single block, so a directory listing would leave one
+    empty entry per file behind.
+    """
+
+    def _crypto(self, stack: Stack) -> EncryptingFileContentRepository:
+        return EncryptingFileContentRepository(
+            stack.fc_repo, b"\x11" * 32, chunk_size=4096
+        )
+
+    async def test_a_probe_opens_no_entry(self, tmp_path):
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        # Inline mirroring filled the entry from its own download; start
+        # from an empty cache, the way a listing of an older file would.
+        cache.remove(version.id)
+
+        assert await self._crypto(stack).content_length(version) == len(BIG)
+
+        assert cache.entry(version.id) is None
+
+    async def test_a_read_after_a_probe_still_caches(self, tmp_path):
+        """The refusal is scoped to the probe, not to the file."""
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        cache.remove(version.id)
+        crypto = self._crypto(stack)
+        await crypto.content_length(version)
+
+        stream = await crypto.get(version, 0, -1, "a.bin")
+        assert b"".join([c async for c in stream]) == BIG
+
+        assert cache.complete(version.id)
+
+    async def test_a_probe_reads_through_an_entry_that_exists(self, tmp_path):
+        """An entry that is already there is served from disk, not refused."""
+        cache = make_cache(tmp_path, stage_uploads=False)
+        stack = await Stack(telegram_like(), discord_like(), cache).init()
+        await stack.put("a.bin", BIG)
+        version = await stack.version("a.bin")
+        assert cache.complete(version.id)
+        stack.primary.downloaded.clear()
+
+        assert await self._crypto(stack).content_length(version) == len(BIG)
+
+        assert downloaded_parts(stack.primary, version) == []
 
 
 class TestDeleteFanOut:

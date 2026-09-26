@@ -38,7 +38,12 @@ from tgdcfs.crypto.header import HEADER_SIZE, MAGIC, FileHeader, InvalidHeaderEr
 from tgdcfs.crypto.kdf import derive_file_key
 from tgdcfs.crypto.names import derive_name_key, encrypt_name
 from tgdcfs.crypto.stream import EncryptingFileMessage
-from tgdcfs.reqres import FileContent, SentFileMessage, UploadableFileMessage
+from tgdcfs.reqres import (
+    FileContent,
+    SentFileMessage,
+    UploadableFileMessage,
+    aclose_content,
+)
 
 if TYPE_CHECKING:
     # Only used for type hints; pulling the runtime symbol would drag in
@@ -181,6 +186,8 @@ class EncryptingFileContentRepository(IFileContentRepository):
         begin: int,
         end: int,
         name: str,
+        *,
+        admit: bool = True,
     ) -> FileContent:
         if fv.size <= 0:
             # Empty file -- the inner repo returns an empty iterator; we
@@ -197,7 +204,7 @@ class EncryptingFileContentRepository(IFileContentRepository):
         # through so reads keep working across an encryption-enabled boundary.
         detected = await self._detect(fv, name)
         if detected is None:
-            return await self._inner.get(fv, begin, end, name)
+            return await self._inner.get(fv, begin, end, name, admit=admit)
 
         header, file_key = detected
         cipher = ChunkedAESGCM(
@@ -257,7 +264,9 @@ class EncryptingFileContentRepository(IFileContentRepository):
             ct_end_inclusive,
         )
 
-        inner_stream = await self._inner.get(fv, ct_begin, ct_end_inclusive, name)
+        inner_stream = await self._inner.get(
+            fv, ct_begin, ct_end_inclusive, name, admit=admit
+        )
         return _decrypting_stream(
             inner_stream,
             cipher,
@@ -307,13 +316,21 @@ class EncryptingFileContentRepository(IFileContentRepository):
 
         probe_target = min(HEADER_SIZE, fv.size)
         # Inner ``get`` uses inclusive ends, so the last byte index is one
-        # less than the count.
-        stream = await self._inner.get(fv, 0, probe_target - 1, name)
+        # less than the count. ``admit=False``: the loop below abandons the
+        # stream after the header, so admitting this read to the cache would
+        # reserve the whole version and never fill a block of it -- a
+        # PROPFIND asks for the content length of every listed file.
+        stream = await self._inner.get(fv, 0, probe_target - 1, name, admit=False)
         buf = bytearray()
-        async for piece in stream:
-            buf += piece
-            if len(buf) >= probe_target:
-                break
+        try:
+            async for piece in stream:
+                buf += piece
+                if len(buf) >= probe_target:
+                    break
+        finally:
+            # The probe walks away mid-stream, so close the stream here
+            # instead of leaving it to the garbage collector.
+            await aclose_content(stream)
 
         if len(buf) < len(MAGIC) or bytes(buf[: len(MAGIC)]) != MAGIC:
             self._cache.put(fv.id, None)

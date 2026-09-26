@@ -13,6 +13,7 @@ from tgdcfs.reqres import (
     FileContent,
     SentFileMessage,
     UploadableFileMessage,
+    aclose_content,
 )
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
@@ -381,7 +382,13 @@ class StoreFileContentRepository(IFileContentRepository):
         return prefetching_chain(parts, concurrency=PART_PREFETCH_CONCURRENCY)
 
     async def get(
-        self, fv: TGFSFileVersion, begin: int, end: int, name: str
+        self,
+        fv: TGFSFileVersion,
+        begin: int,
+        end: int,
+        name: str,
+        *,
+        admit: bool = True,
     ) -> FileContent:
         logger.info(f"Retrieving file content for {name}@{fv.id} from {begin} to {end}")
         if fv.pending:
@@ -426,7 +433,9 @@ class StoreFileContentRepository(IFileContentRepository):
             and fv.cacheable
             and fv.id
         ):
-            return self._stream_through_cache(fv, layouts, begin, last, name)
+            return self._stream_through_cache(
+                fv, layouts, begin, last, name, admit=admit
+            )
         return self._stream_layouts(layouts, fv.id, begin, end, name)
 
     def _store_views(self, layouts: List[Layout]) -> List[StoreView]:
@@ -517,6 +526,8 @@ class StoreFileContentRepository(IFileContentRepository):
         begin: int,
         end: int,
         name: str,
+        *,
+        admit: bool = True,
     ) -> FileContent:
         """Serve ``[begin, end]`` with the read cache in front of the stores.
 
@@ -525,6 +536,10 @@ class StoreFileContentRepository(IFileContentRepository):
         block as it arrives, and only the requested bytes are handed out.
         A cache that refuses the entry (budget, size) leaves the read on
         the plain store path.
+
+        ``admit=False`` reads through an entry that exists but opens none:
+        a probe that abandons the stream after a few bytes would leave an
+        entry sized to the whole version and never fill a block of it.
         """
         cache = self._cache
         if cache is None:  # pragma: no cover - callers check first
@@ -533,13 +548,17 @@ class StoreFileContentRepository(IFileContentRepository):
 
         async def stream() -> AsyncIterator[bytes]:
             entry = cache.entry(fv.id)
-            if entry is None:
+            if entry is None and admit:
                 entry = cache.reserve(self._cache_scope, fv.id, size)
             if entry is None:
-                async for chunk in self._stream_layouts(
-                    layouts, fv.id, begin, end, name
-                ):
-                    yield chunk
+                plain = self._stream_layouts(layouts, fv.id, begin, end, name)
+                try:
+                    async for chunk in plain:
+                        yield chunk
+                finally:
+                    # A probe reading a few bytes with ``admit=False`` lands
+                    # here and abandons the stream.
+                    await aclose_content(plain)
                 return
 
             position = begin

@@ -36,7 +36,17 @@ class IFileContentRepository(metaclass=ABCMeta):
         begin: int,
         end: int,
         name: str,
+        *,
+        admit: bool = True,
     ) -> FileContent:
+        """Bytes ``[begin, end]`` of the version, both ends inclusive.
+
+        ``admit=False`` asks for the range without letting it open a new
+        read-cache entry. An internal probe reads a handful of bytes and
+        abandons the stream; admitting it would reserve the whole version
+        and leave an entry behind that never receives a block. An entry
+        that already exists is still read from and filled.
+        """
         pass
 
     @abstractmethod

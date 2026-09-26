@@ -155,6 +155,20 @@ class DownloadFileReq(Chat, Message):
 FileContent = AsyncIterator[bytes]
 
 
+async def aclose_content(stream: FileContent) -> None:
+    """Close a stream a caller walks away from.
+
+    Reads that stop early (a header probe, a client hanging up) leave an
+    async generator suspended, and closing the generator that only iterates
+    over it does not close it -- the interpreter then reports "coroutine
+    method 'aclose' ... was never awaited" when it is collected. Iterators
+    without ``aclose`` need nothing.
+    """
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 @dataclass
 class DownloadFileResp:
     chunks: FileContent
