@@ -56,6 +56,12 @@ command line and `sshfs` work against the SFTP interface as well.
 * Live streaming of videos
 * **Optional at-rest encryption** (AES-256-GCM, see below)
 * **Optional channel redundancy** (RAID-1-style mirroring to extra channels, see below)
+* **Optional local cache** on the data volume: uploads are staged once for
+  every mirror, repeated reads are served from disk, and per file system
+  uploads can be acknowledged as soon as they are on the local disk and
+  distributed to every store in parallel (see below)
+* **Optional multi-source downloads**: one download pulls pieces from
+  the primary and every mirror at once (see below)
 
 
 ## SFTP interface
@@ -345,6 +351,143 @@ store's key, `<backend prefix>:<channel id as configured>`, for example
 they are read as Telegram keys and written back with the prefix. Store
 *names* never reach the metadata, so a store can be renamed freely.
 
+## Local cache
+
+The local cache is an optional directory on the data volume, off by
+default. With it on, three things change, each with its own switch:
+
+* **Uploads are staged for the mirrors.** A PUT still streams to the
+  primary store, but the bytes are also written to the cache as they
+  pass. A mirror that has to re-upload (Discord, another backend,
+  `mode: reupload`) then reads them from disk instead of downloading the
+  file from the primary again, and mirrors that already had to
+  re-upload in the background do so with the network cost of one
+  upload, not one download plus one upload per mirror.
+* **Repeated reads come from disk** (`keep_for_reads`). Entries stay
+  after replication, and downloads fill the cache block by block, so a
+  second read of the same version, a video seek or an SFTP client
+  walking a file in small reads no longer goes to the store. A read
+  through the cache serves what is there and fetches only the missing
+  blocks; a disk error simply bypasses the cache.
+* **Write-back uploads** (`write_ack: cache` per file system) answer the
+  client once the bytes are in the cache and move them into the primary
+  and every mirror afterwards, all at the same time. See below before
+  turning this on.
+
+```yaml
+tgdcfs:
+  cache:
+    enabled: true
+    dir: cache               # relative paths land in the data directory
+    max_size_mb: 20480       # total budget, 0 = unlimited
+    max_files: 0             # cached versions, 0 = unlimited
+    max_file_size_mb: 4096   # larger versions are neither staged nor cached
+    block_kb: 4096           # unit the read cache fills and serves, min 64
+    stage_uploads: true      # write incoming uploads to the cache for the mirrors
+    keep_for_reads: true     # keep entries after replication and fill them from downloads
+```
+
+**Sizing.** `max_size_mb` is the hard ceiling for the directory;
+`max_files` and `max_file_size_mb` bound the count and the largest
+single version. Eviction is least-recently-used over the entries no
+mirror is waiting for; an entry a mirror still needs is *pinned* and
+never evicted, so the budget has to hold the uploads that are still in
+flight to their mirrors on top of what you want to keep for reads. A
+version that does not fit is not cached, and an upload the cache cannot
+take is mirrored the old way. Pins survive a restart. In Docker, `dir`
+resolves inside the mounted data directory, next to `config.yaml`, so
+the volume has to have the room.
+
+**Ciphertext.** With at-rest encryption on, the cache holds exactly
+what the stores hold: ciphertext. Nothing in the cache directory is
+readable without the passphrase.
+
+### Write-back uploads
+
+By default (`write_ack: primary`) a PUT lasts as long as the upload to
+the primary store, and the client's 201 means the primary has the
+bytes. With `write_ack: cache` the PUT lands in the cache, the client
+is answered as soon as the body is on the local disk, and a
+distribution worker uploads the version from the cache file into the
+primary and, concurrently, into every mirror that re-uploads. Mirrors
+that forward server-side wait for the primary's message ids as before.
+
+```yaml
+filesystems:
+  media:
+    primary: tg-main
+    mirrors: [dc-mirror]
+    write_ack: cache         # primary (default) | cache; needs tgdcfs.cache.enabled
+```
+
+What it buys: the client's upload runs at the speed of the link to the
+tgdcfs host, a FloodWait or a Discord rate limit never stalls a client,
+and primary and mirrors fill in parallel from one local file. Together
+with `transfer.upload_parts_in_flight` the Telegram store can push
+several parts of one version at once, which the streaming path cannot
+do because a stream is read once, front to back.
+
+What it costs: **between the client's 201 and the primary's copy the
+bytes exist only on this instance's disk.** The version is recorded in
+the metadata as *pending* (size and date, no message ids yet). The
+instance that holds the cache serves it to readers at once; every other
+reader of the channel (a second tgdcfs instance, tgsaver, the mini app's
+import) sees the previous version until distribution completes. On a
+restart, pending versions resume from the cache file. If the cache file
+is gone (disk lost, directory cleared), the version cannot be
+materialised any more: it is dropped, the file falls back to its
+previous version, the loss is logged at error level and shows up as a
+failed distribution task in the task list.
+
+Leave it off when the client's confirmation has to mean "it is in
+Telegram" (backup jobs), when the data directory is not on persistent
+storage, or when the disk cannot hold the uploads that are waiting for
+distribution. It is refused with `strict: true`, which promises the
+mirror copy at the time of the answer, and when the cache is disabled.
+An upload the cache cannot take (over budget, above `max_file_size_mb`)
+falls back to the write-through path for that upload.
+
+### Parallel reads
+
+A version that is complete in more than one store can be read from all
+of them at once. With `read_parallel: true` a download above
+`parallel_download_threshold_mb` is cut into pieces of
+`download_piece_size_kb`, and every readable store runs a few workers
+that take the next piece not yet claimed, so a fast store simply takes
+more pieces than a slow one. Output stays in order through a reorder
+window of `transfer.read_parallel_window` pieces, which also bounds the
+memory one download can hold. A piece that fails on one store is
+fetched from another; a store that fails twice in a row is benched for
+the rest of the read. The read fails only when no store can serve a
+piece.
+
+```yaml
+filesystems:
+  media:
+    primary: tg-main
+    mirrors: [tg-spare, dc-mirror]
+    read_parallel: true
+    read_sources: [tg-main, tg-spare]   # optional; default: every store with a complete copy
+```
+
+`read_sources` limits the participants to the named stores of the file
+system, useful to keep a small Discord mirror out of bulk downloads or
+to spare a store's rate limit. A store without a complete copy of the
+version never takes part; a version complete in only one store is read
+as before. Small reads stay on one store.
+
+### Manager API and web frontend
+
+* `GET /api/cache` reports budget, entries, pinned bytes and the hit
+  ratio; `POST /api/cache/evict` drops every entry no mirror is waiting
+  for. Both answer 400 while the cache is off.
+* `GET /api/filesystems` includes `write_ack`, `read_parallel` and
+  `read_sources` per file system.
+* The config generator has a "Local Cache (Optional)" section and, per
+  file system, the write acknowledgement and parallel-read settings.
+  The mini app's "Mirrors and replication" dialog shows the cache and
+  offers "Drop unpinned entries".
+
 ## At-rest encryption
 
 When ``encryption.enabled: true`` is set in ``config.yaml``, every byte
@@ -552,6 +695,8 @@ tgdcfs:
     chunk_cache_mb: 0
     chunk_cache_readahead: 2
     chunk_cache_block_kb: 1024
+    upload_parts_in_flight: 1
+    read_parallel_window: 8
 ```
 
 **Downloads** are cut into pieces and several are fetched at once. Bytes
@@ -573,6 +718,13 @@ kilobytes pulls a whole `chunk_cache_block_kb` block, so a larger block
 serves more of the reads that follow it and wastes more on readers that
 jump around. `chunk_cache_readahead` additionally pulls that many blocks
 past each request so the next sequential read is already in memory.
+
+**Parallel parts and multi-source reads.** `upload_parts_in_flight` is
+how many parts of one version the Telegram store uploads at once when
+the source is a cache file (write-back uploads and distribution to the
+mirrors; a streamed upload is always sequential). `read_parallel_window`
+is the reorder window of a multi-source read. Both are described under
+[Local cache](#local-cache).
 
 **Rate limits.** More parallelism means more requests per second. Telegram
 answers a flood with a wait, which TGDCFS honours; if uploads start logging

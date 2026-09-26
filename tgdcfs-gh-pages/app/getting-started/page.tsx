@@ -259,6 +259,22 @@ export default function GettingStarted() {
                   them and pick where the directory metadata lives. A config
                   written for tgfs also still loads.
                 </Typography>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Two optional sections are worth a look once the basics
+                  work. The <b>local cache</b> stages every upload on the
+                  data volume so mirrors are filled from disk instead of
+                  downloading the file from the primary again, keeps
+                  entries for repeated reads, and lets a file system
+                  acknowledge uploads as soon as they are on the local disk
+                  (write acknowledgement &quot;cache&quot;; the bytes then live
+                  only on this host until they reach the primary). With
+                  <b>parallel reads</b> a large download pulls pieces from
+                  the primary and every mirror at once. Both are off by
+                  default; the README explains sizing and the trade-offs.
+                </Typography>
                 <div style={{ marginBottom: "24px" }}>
                   <Link
                     href="/config-generator"

@@ -55,6 +55,15 @@ stores:
 # forwarding. ``strict: true`` fails an upload when mirroring fails and
 # requires ``sync: inline``.
 #
+# ``write_ack``: primary (default; the PUT lasts until the primary has
+# the bytes) | cache (answer once the bytes are in the local cache and
+# distribute them to primary and mirrors in parallel afterwards; needs
+# ``tgdcfs.cache.enabled`` and is refused with ``strict: true``). Between
+# the answer and the primary's copy the bytes live only on this host.
+# ``read_parallel``: read large files from every store that holds a
+# complete copy at once; ``read_sources`` restricts that to the named
+# stores of this file system.
+#
 # Requirements for mirrors: your bot(s) must be admin in every mirror
 # channel; a primary with "Restrict saving content" enabled needs
 # ``mode: reupload`` or ``auto``. Files that existed before a mirror was
@@ -67,6 +76,9 @@ filesystems:
     # mode: auto
     # sync: inline
     # strict: false
+    # write_ack: primary
+    # read_parallel: false
+    # read_sources: []
     metadata:
       type: github_repo
       github_repo:
@@ -148,6 +160,36 @@ tgdcfs:
   #   chunk_cache_mb: 0
   #   chunk_cache_readahead: 2
   #   chunk_cache_block_kb: 1024
+  #   upload_parts_in_flight: 1   # parts of one version sent at once from a cache file
+  #   read_parallel_window: 8     # reorder window of a multi-source read, in pieces
+
+  # ---------------------------------------------------------------------------
+  # Optional local cache, off by default. See the README, "Local cache".
+  #
+  # Uploads are staged into ``dir`` as they stream to the primary, so a
+  # mirror that has to re-upload reads them from disk instead of
+  # downloading the file from the primary again. With ``keep_for_reads``
+  # the entries stay afterwards and downloads fill them block by block,
+  # so repeated reads are served from disk. The cache is also what makes
+  # ``write_ack: cache`` and parallel uploads to Telegram possible.
+  #
+  # ``max_size_mb`` bounds the directory (0 = unlimited), ``max_files``
+  # the number of cached versions (0 = unlimited) and a version above
+  # ``max_file_size_mb`` is neither staged nor cached. Entries a mirror is
+  # still waiting for are pinned and never evicted, so the budget has to
+  # hold the uploads in flight on top of what you keep for reads. With
+  # encryption on, the cache holds ciphertext. A relative ``dir`` lives in
+  # the data directory, on the mounted volume in Docker.
+  # ---------------------------------------------------------------------------
+  # cache:
+  #   enabled: true
+  #   dir: cache
+  #   max_size_mb: 20480
+  #   max_files: 0
+  #   max_file_size_mb: 4096
+  #   block_kb: 4096
+  #   stage_uploads: true
+  #   keep_for_reads: true
 
   # ---------------------------------------------------------------------------
   # Optional at-rest encryption.

@@ -977,3 +977,59 @@ messages (replicas with their own part layout).
 * Not done, deliberately: the mini app still imports messages by
   Telegram channel id only (`/message`, `/import`), which is what the
   Telegram Mini App is for.
+
+### Phase 5 (done)
+
+* `tgdcfs/core/local_cache.py`: `LocalCache` on the data volume
+  (entries keyed by version id, sparse `<id>.bin` plus a `<id>.map`
+  block map, `index.json`; budget by size, count and largest version;
+  LRU over unpinned entries, pins survive a restart, disk errors are a
+  bypass). `StagingWriter` tees an upload into the cache while it
+  streams to the primary; `FileMessageFromCache` is the seekable source
+  the stores upload from; `version_cache_for` hands the read side a
+  per-version filler. The cache sits below the encryption decorator, so
+  it holds ciphertext. Config: `tgdcfs.cache` (`CacheConfig`).
+* Mirroring reads from the cache: `MirrorGroup.mirror_parts`,
+  `_replicate` and `_copy_to` take the cache and re-upload from disk
+  when the version is there, downloading only the missing ranges.
+* Write-back (`write_ack: cache` per file system, refused with
+  `strict: true` or without the cache): `StoreFileContentRepository.stage`
+  writes the body into a pinned entry, `FileDescApi._new_version` records
+  a pending version (`"pending": true`, no message ids, size from the
+  descriptor), `backfill._distribute_pending` uploads it into the
+  primary and every re-uploading mirror concurrently from the cache
+  file and materialises the version; a lost cache file drops the
+  version, logs at error level and records a failed `DISTRIBUTION`
+  task. `StoreFDRepository._validate_fv` accepts a pending version the
+  local cache can serve and moves the latest pointer only when the
+  current one is unreadable. `transfer.upload_parts_in_flight` lets the
+  Telegram store send several parts of one version at once from a
+  seekable source.
+* Read cache (`keep_for_reads`): `get()` serves through the cache and
+  fetches only the missing blocks; pending versions are served from the
+  cache on the instance that holds it; pinned metadata blobs are never
+  cached (`cacheable = False`).
+* Multi-source reads (`tgdcfs/core/multisource.py`): `MultiSourceRead`
+  cuts a range into pieces, every `StoreView` runs `read_slots` workers
+  that steal the next unclaimed piece, output is reordered through a
+  window of `transfer.read_parallel_window` pieces, a failed piece moves
+  to another store, a store is benched after two consecutive failures.
+  Wired in `_stream_layouts` above `parallel_download_threshold_mb` when
+  more than one store holds a complete copy; `read_parallel` and
+  `read_sources` per file system.
+* Manager API: `GET /cache`, `POST /cache/evict`; `/filesystems` reports
+  `write_ack`, `read_parallel`, `read_sources`.
+* Config generator: "Local Cache (Optional)" section, per file system
+  the write acknowledgement and parallel-read settings, emitted only
+  when they differ from the defaults; `strict` resets the write
+  acknowledgement; renaming or removing a store keeps `read_sources`
+  consistent. Mini app: cache panel in the "Mirrors and replication"
+  dialog with "Drop unpinned entries".
+* Docs: README "Local cache" (staging, sizing, ciphertext, write-back
+  and its durability window, parallel reads, API), transfer example,
+  demo config, getting-started page.
+* Not done, deliberately: the SFTP write handle still spools to its own
+  buffer and hands the file to the same upload path, so `write_ack:
+  cache` shortens the wait at close only by the primary upload; the
+  spool is not yet the cache entry itself (4.12, "Interaction with the
+  SFTP interface"). Phase 6 stays optional.
