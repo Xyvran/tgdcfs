@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # be split across bots, so this multiplies with the per-message
 # concurrency -- keep it small.
 PART_PREFETCH_CONCURRENCY = 2
+# How much of a write-back upload is taken off the request at a time.
+STAGE_READ_CHUNK = 1024 * 1024
 
 
 @dataclass
@@ -121,6 +123,50 @@ class StoreFileContentRepository(IFileContentRepository):
             if self._cache is not None and version_id:
                 self._cache.release(version_id)
         return res
+
+    async def stage(
+        self, file_msg: UploadableFileMessage, version_id: str
+    ) -> Optional[int]:
+        """Write the whole upload into the cache; no store is touched.
+
+        The entry is pinned until the distribution worker has moved the
+        bytes into every store. ``None`` when the cache refuses the entry
+        up front (off, over budget, too large): the caller then uploads
+        the stream directly. A disk error while the body is already being
+        consumed cannot fall back -- the body is gone -- so it fails the
+        write, which is the honest answer.
+        """
+        if self._cache is None:
+            return None
+        size = file_msg.get_size()
+        writer = self._cache.open_staging(self._cache_scope, version_id, size)
+        if writer is None:
+            return None
+        self._cache.pin(version_id)
+        await file_msg.open()
+        try:
+            remaining = size
+            while remaining > 0:
+                chunk = await file_msg.read(min(STAGE_READ_CHUNK, remaining))
+                if not chunk:
+                    break
+                await writer.write(chunk)
+                remaining -= len(chunk)
+                if writer.failed:
+                    break
+        except BaseException:
+            await writer.abort()
+            raise
+        finally:
+            await file_msg.close()
+        await writer.close()
+        if writer.failed or remaining > 0:
+            self._cache.remove(version_id)
+            raise TechnicalError(
+                f"Could not stage version {version_id} in the local cache "
+                f"({size - remaining} of {size} bytes written)"
+            )
+        return size
 
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:
         return await self._store.replace_document(message_id, buffer, name)
@@ -323,6 +369,21 @@ class StoreFileContentRepository(IFileContentRepository):
         self, fv: TGFSFileVersion, begin: int, end: int, name: str
     ) -> FileContent:
         logger.info(f"Retrieving file content for {name}@{fv.id} from {begin} to {end}")
+        if fv.pending:
+            # No store has the bytes yet; the instance that accepted the
+            # upload serves them from its cache, nobody else can.
+            if self._cache is not None and self._cache.complete(fv.id):
+                if fv.size <= 0:
+                    return self._empty()
+                last = fv.size - 1 if end < 0 else min(end, fv.size - 1)
+                if begin < 0 or begin > last:
+                    raise TechnicalError(
+                        f"Invalid range {begin}-{end} for {name}@{fv.id} ({fv.size} bytes)"
+                    )
+                return self._cache.read(fv.id, begin, last)
+            raise TechnicalError(
+                f"{name}@{fv.id} is still being distributed from another instance"
+            )
         layouts = self._layouts(fv)
         if not layouts:
             if fv.size <= 0:

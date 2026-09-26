@@ -271,11 +271,13 @@ class Stack:
         cache: LocalCache | None,
         inline: bool = True,
         queue: ReplicationQueue | None = None,
+        write_ack: str = "primary",
     ):
         self.name = "fs"
         self.primary = primary
         self.mirror = mirror
         self.cache = cache
+        self.store = primary
         self.mirror_group = MirrorGroup(
             primary=primary,
             stores=[MirrorStore(key=mirror.key, store=mirror)],
@@ -289,7 +291,11 @@ class Stack:
             cache=cache,
             cache_scope=self.name,
         )
-        self.fd_repo = StoreFDRepository(primary, mirror_group=self.mirror_group)
+        self.fd_repo = StoreFDRepository(
+            primary,
+            mirror_group=self.mirror_group,
+            local_versions=cache.complete if cache is not None else None,
+        )
         self.metadata_repo = PinnedMessageMetadataRepository(
             primary, self.fc_repo, mirror_group=self.mirror_group
         )
@@ -302,7 +308,7 @@ class Stack:
 
         self.file_api = FileApi(
             self.metadata_api,
-            FileDescApi(self.fd_repo, self.fc_repo),
+            FileDescApi(self.fd_repo, self.fc_repo, write_ack=write_ack),  # type: ignore[arg-type]
             cast(IStore, primary),
             mirror_group=self.mirror_group,
             inline_mirroring=inline,
@@ -343,6 +349,7 @@ class Stack:
                 "metadata_api": self.metadata_api,
                 "dir_api": self.dir_api,
                 "cache": self.cache,
+                "store": self.primary,
             },
         )()
 

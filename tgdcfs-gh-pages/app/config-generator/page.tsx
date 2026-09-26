@@ -167,6 +167,7 @@ const newFilesystem = (name: string, primary: string): FilesystemConfig => ({
   mode: "auto",
   sync: "inline",
   strict: false,
+  write_ack: "primary",
   allow_shared_store: false,
   metadata: {
     type: "pinned_message",
@@ -457,6 +458,11 @@ export default function ConfigGenerator() {
     if (field === "sync" && value === "background") {
       fs.strict = false;
     }
+    if (field === "strict" && value === true) {
+      // Strict promises the mirror copy when the write is answered;
+      // write-back answers before any store has the bytes.
+      fs.write_ack = "primary";
+    }
     // Same default as the loader: a mirror that re-uploads must not hold
     // up the write. Only ever nudges towards background, never back.
     if (
@@ -560,6 +566,7 @@ export default function ConfigGenerator() {
         mode?: string;
         sync?: string;
         strict?: boolean;
+        write_ack?: string;
         allow_shared_store?: boolean;
         metadata: {
           type: string;
@@ -578,6 +585,8 @@ export default function ConfigGenerator() {
         // choice that differs from the derived default is written.
         const derivedSync: SyncMode =
           needsReupload(fs, config.stores) && !fs.strict ? "background" : "inline";
+        const writeBack =
+          config.tgdcfs.cache.enabled && !fs.strict && fs.write_ack === "cache";
         filesystems[fs.name.trim()] = {
           primary: fs.primary,
           ...(mirrors.length > 0
@@ -589,6 +598,7 @@ export default function ConfigGenerator() {
                 ...(fs.allow_shared_store ? { allow_shared_store: true } : {}),
               }
             : {}),
+          ...(writeBack ? { write_ack: "cache" } : {}),
           metadata: {
             type: fs.metadata.type,
             ...(fs.metadata.type === "github_repo"
@@ -866,6 +876,7 @@ export default function ConfigGenerator() {
                   primaryErrors={getFilesystemPrimaryErrors(index)}
                   mirrorErrors={getFilesystemMirrorErrors(index)}
                   needsSharedStore={filesystemNeedsSharedStore(index)}
+                  cacheEnabled={config.tgdcfs.cache.enabled}
                 />
               ))}
               <Button

@@ -19,6 +19,7 @@ import {
   MirrorMode,
   StoreConfig,
   SyncMode,
+  WriteAck,
   needsReupload,
 } from "../types";
 import { ConfigTextField } from "./ConfigTextField";
@@ -40,6 +41,8 @@ interface FilesystemFieldProps {
   mirrorErrors?: string[];
   // Set when a mirror is the primary of another file system.
   needsSharedStore?: boolean;
+  // Whether the local cache is on; write-back (write_ack: cache) needs it.
+  cacheEnabled?: boolean;
 }
 
 const storeLabel = (store: StoreConfig) =>
@@ -55,6 +58,7 @@ export function FilesystemField({
   primaryErrors = [],
   mirrorErrors = [],
   needsSharedStore = false,
+  cacheEnabled = false,
 }: FilesystemFieldProps) {
   const namedStores = stores.filter((s) => s.name.trim() !== "");
   const mirrorCandidates = namedStores.filter(
@@ -293,6 +297,41 @@ export function FilesystemField({
               </>
             )}
           </Typography>
+          {cacheEnabled && (
+            <>
+              <FormControl size="small" sx={{ minWidth: 260, mb: 1 }}>
+                <InputLabel>Write acknowledgement</InputLabel>
+                <Select
+                  value={filesystem.write_ack}
+                  label="Write acknowledgement"
+                  disabled={filesystem.strict}
+                  onChange={(e) =>
+                    onUpdate("write_ack", e.target.value as WriteAck)
+                  }
+                >
+                  <MenuItem value="primary">
+                    When the primary store has the file
+                  </MenuItem>
+                  <MenuItem value="cache">
+                    When the local cache has the file (write-back)
+                  </MenuItem>
+                </Select>
+              </FormControl>
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mb: 1, pl: 2 }}
+              >
+                Write-back answers an upload as soon as it is on the local
+                disk; a worker then fills the primary and every mirror at
+                once from that copy. Until the primary has it, the file
+                exists only on this host: a lost disk in that window loses
+                the version. Leave it on &quot;primary&quot; for a
+                single-disk host holding the only copy of irreplaceable
+                data. Not available with Strict.
+              </Typography>
+            </>
+          )}
           <FormControlLabel
             label="Strict: fail an upload when a mirror copy fails (needs inline sync)"
             control={

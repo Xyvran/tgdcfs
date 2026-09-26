@@ -345,7 +345,12 @@ class TransferConfig:
     chunk_cache_mb: int
     chunk_cache_readahead: int
     chunk_cache_block_kb: int
+    # How many parts of one version the Telegram store uploads at once
+    # when the source is seekable (a version in the local cache). A stream
+    # is read front to back and always goes part by part.
+    upload_parts_in_flight: int = 1
 
+    DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_UPLOAD_WORKERS_SMALL = 3
     DEFAULT_UPLOAD_WORKERS_BIG = 8
     # 512 KiB is the largest part Telegram accepts and is valid for any file
@@ -432,6 +437,9 @@ class TransferConfig:
             ),
             chunk_cache_block_kb=positive(
                 "chunk_cache_block_kb", cls.DEFAULT_CHUNK_CACHE_BLOCK_KB
+            ),
+            upload_parts_in_flight=positive(
+                "upload_parts_in_flight", cls.DEFAULT_UPLOAD_PARTS_IN_FLIGHT
             ),
         )
 
@@ -786,6 +794,9 @@ class StoreConfig:
 
 MirrorMode = Literal["auto", "forward", "reupload"]
 SyncMode = Literal["inline", "background"]
+# When a write is acknowledged: once the primary store has it (today's
+# behaviour) or once the local cache has it (write-back, section 4.12).
+WriteAck = Literal["primary", "cache"]
 
 
 @dataclass
@@ -817,6 +828,10 @@ class FilesystemConfig:
     # True when ``sync`` was not configured and may be replaced by the
     # value derived from the stores.
     sync_is_default: bool = False
+    # ``cache``: a PUT is answered once the bytes are on the local disk and
+    # a worker moves them into the primary and the mirrors afterwards.
+    # Requires the cache and is refused with ``strict``.
+    write_ack: WriteAck = "primary"
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "FilesystemConfig":
@@ -848,6 +863,17 @@ class FilesystemConfig:
             raise ValueError(
                 f"filesystems.{name}: 'strict: true' requires 'sync: inline'"
             )
+        write_ack = str(data.get("write_ack", "primary"))
+        if write_ack not in ("primary", "cache"):
+            raise ValueError(
+                f"filesystems.{name}: unknown write_ack '{write_ack}', "
+                f"available options: primary, cache"
+            )
+        if strict and write_ack == "cache":
+            raise ValueError(
+                f"filesystems.{name}: 'strict: true' promises the mirror copy when "
+                f"the write is answered and cannot be combined with 'write_ack: cache'"
+            )
         metadata_data: MetadataConfigDict = {
             "name": name,
             "type": MetadataType.PINNED_MESSAGE.value,
@@ -866,6 +892,7 @@ class FilesystemConfig:
             metadata=metadata,
             allow_shared_store=bool(data.get("allow_shared_store", False)),
             sync_is_default=sync_is_default,
+            write_ack=write_ack,  # type: ignore[arg-type]
         )
 
     @property
@@ -1118,6 +1145,12 @@ class Config:
                     f"'backends.telegram' block"
                 )
         _validate_filesystems(stores, filesystems)
+        for fs in filesystems.values():
+            if fs.write_ack == "cache" and not app.cache.enabled:
+                raise ValueError(
+                    f"filesystems.{fs.name}: 'write_ack: cache' needs "
+                    f"'tgdcfs.cache.enabled: true'"
+                )
         return cls(
             telegram=telegram,
             tgdcfs=app,

@@ -15,12 +15,17 @@ mirror store, which is harmless.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from tgdcfs.core.local_cache import version_cache_for
-from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef
+from tgdcfs.core.mirror import MirrorStore
+from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
+from tgdcfs.core.repository.interface import FDRepositoryResp
+from tgdcfs.errors import TechnicalError
+from tgdcfs.reqres import Replica, SentFileMessage
 from tgdcfs.tasks import task_store
 from tgdcfs.tasks.models import TaskStatus, TaskType
 
@@ -36,6 +41,8 @@ class BackfillReport:
     versions_checked: int = 0
     versions_mirrored: int = 0
     versions_promoted: int = 0
+    # Write-back uploads moved from the local cache into the primary.
+    versions_distributed: int = 0
     fds_mirrored: int = 0
     failures: List[str] = field(default_factory=list)
 
@@ -94,6 +101,96 @@ async def _verify_mirrors(client: "Client", fd: TGFSFileDesc) -> None:
                 version.replicas.pop(store_key, None)
 
 
+async def _distribute_pending(
+    client: "Client",
+    fr: TGFSFileRef,
+    fd: TGFSFileDesc,
+    version: TGFSFileVersion,
+    report: BackfillReport,
+) -> bool:
+    """Move a write-back upload from the local cache into the stores.
+
+    The primary and every mirror that gets a replica are filled at the
+    same time from the one local file; aligned mirrors follow through the
+    usual path once the primary's ids exist. The primary's ids are
+    committed as soon as they exist -- that is the moment the durability
+    window of ``write_ack: cache`` closes. Returns whether the descriptor
+    changed.
+    """
+    cache = getattr(client, "cache", None)
+    local = cache.local(version.id) if cache is not None else None
+    if local is None:
+        # The window this mode admits: the bytes were only here, and here
+        # they are gone. Say so loudly; the file falls back to its
+        # previous version.
+        message = (
+            f"{fr.name}@{version.id}: the pending version is not in the local "
+            f"cache any more; its {version.size} bytes are lost and the file "
+            f"falls back to its previous version"
+        )
+        logger.error(message)
+        try:
+            task_id = await task_store.add_task(
+                task_type=TaskType.DISTRIBUTION,
+                path=f"/{client.name}{fr.location.absolute_path}/{fr.name}",
+                filename=fr.name,
+                size_total=version.size,
+            )
+            await task_store.update_task_progress(
+                task_id, status=TaskStatus.FAILED, error_message=message
+            )
+        except Exception as ex:  # pragma: no cover - reporting must not fail the worker
+            logger.warning(f"Could not record the lost version as a task: {ex}")
+        fd.delete_version(version.id)
+        return True
+
+    primary = client.store
+    group = client.mirror_group
+    planned = primary.plan_parts(local.size)
+    replica_targets = (
+        [ch for ch in group.stores if group.needs_replica(ch, planned)]
+        if group is not None
+        else []
+    )
+    replica_targets = [ch for ch in replica_targets if not version.has_copy_in(ch.key)]
+
+    async def upload_primary() -> List[SentFileMessage]:
+        from tgdcfs.core.local_cache import FileMessageFromCache
+
+        return await primary.upload(FileMessageFromCache.new(local, fr.name))
+
+    async def replicate(ch: MirrorStore) -> tuple[str, Replica]:
+        if group is None:  # pragma: no cover - replica_targets is empty then
+            raise TechnicalError("no mirror group")
+        return ch.key, await group.replicate_local(ch, local, fr.name)
+
+    primary_task = asyncio.create_task(upload_primary())
+    replica_tasks = [asyncio.create_task(replicate(ch)) for ch in replica_targets]
+    await asyncio.gather(primary_task, *replica_tasks, return_exceptions=True)
+
+    changed = False
+    for ch, task in zip(replica_targets, replica_tasks):
+        if (error := task.exception()) is not None:
+            report.failures.append(
+                f"{fr.name}@{version.id}: could not replicate to {ch.key} ({error})"
+            )
+        else:
+            key, replica = task.result()
+            version.replicas[key] = replica
+            changed = True
+    if (error := primary_task.exception()) is not None:
+        report.failures.append(
+            f"{fr.name}@{version.id}: could not upload to the primary ({error})"
+        )
+        return changed
+    sent = primary_task.result()
+    version.materialize(
+        primary.key, [m.message_id for m in sent], [m.size for m in sent]
+    )
+    report.versions_distributed += 1
+    return True
+
+
 async def backfill_file(
     client: "Client", fr: TGFSFileRef, verify: bool, report: BackfillReport
 ) -> None:
@@ -101,7 +198,7 @@ async def backfill_file(
     backfill task and the replication queue."""
     mirror_group = client.mirror_group
     fd_repo = client.fd_repo
-    if mirror_group is None or fd_repo is None:
+    if fd_repo is None:
         return
 
     fd = await fd_repo.get(fr, include_all_versions=True)  # type: ignore[call-arg]
@@ -109,6 +206,28 @@ async def backfill_file(
         # Unreadable or fully invalid descriptor (fd_repo.get returns an
         # empty FD in that case). Never save it back -- that would
         # overwrite the real descriptor message with an empty one.
+        return
+
+    # Write-back uploads first: a pending version has no store copy at all
+    # yet. Its ids are committed on their own so a mirror failure later
+    # cannot keep the primary's copy out of the metadata.
+    pending = [v for v in fd.get_versions() if v.pending]
+    if pending:
+        distributed = False
+        for version in pending:
+            distributed |= await _distribute_pending(client, fr, fd, version, report)
+        if distributed:
+            resp = await fd_repo.save(fd, fr)
+            _sync_ref(fr, resp)
+        if mirror_group is None:
+            cache = getattr(client, "cache", None)
+            if cache is not None:
+                for version in pending:
+                    if not version.pending:
+                        cache.release(version.id)
+            return
+
+    if mirror_group is None:
         return
     if verify:
         await _verify_mirrors(client, fd)
@@ -173,16 +292,20 @@ async def backfill_file(
         # Commit point: the (possibly updated) mirrors map is persisted
         # in the FD message, and the FD itself gets its mirror copies.
         resp = await fd_repo.save(fd, fr)
-        if (
-            resp.mirrors != fr.mirrors
-            or resp.message_id != fr.message_id
-            or resp.store != fr.store
-        ):
-            fr.message_id = resp.message_id
-            fr.mirrors = dict(resp.mirrors)
-            fr.store = resp.store
+        _sync_ref(fr, resp)
         if fd_missing:
             report.fds_mirrored += 1
+
+
+def _sync_ref(fr: TGFSFileRef, resp: "FDRepositoryResp") -> None:
+    if (
+        resp.mirrors != fr.mirrors
+        or resp.message_id != fr.message_id
+        or resp.store != fr.store
+    ):
+        fr.message_id = resp.message_id
+        fr.mirrors = dict(resp.mirrors)
+        fr.store = resp.store
 
 
 async def backfill_mirrors(

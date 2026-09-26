@@ -294,20 +294,57 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
 
+    def _part_size_for(self, size: int) -> tuple[int, bool]:
+        """The part size for ``size`` bytes and whether the account uploads."""
+        premium_upload = size > PART_SIZE_DEFAULT and self._premium_upload
+        return (
+            PART_SIZE_PREMIUM if premium_upload else PART_SIZE_DEFAULT
+        ), premium_upload
+
+    def plan_parts(self, size: int) -> List[int]:
+        part_size, _ = self._part_size_for(size)
+        return list(self._partition(size, part_size))
+
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         """Upload ``file_msg`` in parts of at most one Telegram document.
 
         Files above the bot limit go through the premium account when the
-        deployment allows it, in 4 GiB parts.
+        deployment allows it, in 4 GiB parts. A seekable source (a version
+        in the local cache) can have ``transfer.upload_parts_in_flight``
+        parts in the air at once, each through its own bot; a stream is
+        read front to back and goes part by part.
         """
         size = file_msg.get_size()
         file_name = file_msg.name or "unnamed"
+        part_size, premium_upload = self._part_size_for(size)
+        parts = list(self._partition(size, part_size))
 
-        premium_upload = size > PART_SIZE_DEFAULT and self._premium_upload
-        part_size = PART_SIZE_PREMIUM if premium_upload else PART_SIZE_DEFAULT
+        in_flight = _transfer().upload_parts_in_flight
+        part_of = getattr(file_msg, "part", None)
+        if len(parts) > 1 and in_flight > 1 and callable(part_of):
+            slots = asyncio.Semaphore(in_flight)
+            offsets = [sum(parts[:i]) for i in range(len(parts))]
+
+            async def send(index: int) -> SentFileMessage:
+                async with slots:
+                    part_msg = part_of(offsets[index], parts[index])
+                    part_msg.name = f"[part{index + 1}]{file_name}"
+                    part_msg.size = parts[index]
+                    return await self._send_file(
+                        part_msg, use_account_api=premium_upload
+                    )
+
+            tasks = [asyncio.create_task(send(i)) for i in range(len(parts))]
+            try:
+                return list(await asyncio.gather(*tasks))
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         res: List[SentFileMessage] = []
-        for i, part in enumerate(self._partition(size, part_size)):
+        for i, part in enumerate(parts):
             file_msg.name = f"[part{i + 1}]{file_name}"
             file_msg.size = part
             res.append(await self._send_file(file_msg, use_account_api=premium_upload))

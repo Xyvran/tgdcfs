@@ -257,6 +257,7 @@ class TestTransferConfig:
         assert config.transfer.download_pieces_in_flight == 4
         assert config.transfer.connection_pool_size == 1
         assert config.transfer.chunk_cache_mb == 0
+        assert config.transfer.upload_parts_in_flight == 1
 
     def test_overrides(self):
         config = TransferConfig.from_dict(

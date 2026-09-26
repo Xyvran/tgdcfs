@@ -25,6 +25,9 @@ class TGFSFileVersionSerialized(TypedDict, total=False):
     # Store key -> copy of the version with that store's own part layout.
     # Absent when no such copy exists.
     replicas: Dict[str, ReplicaSerialized]
+    # True while the bytes live only in the accepting instance's local
+    # cache (write_ack: cache). Absent otherwise.
+    pending: bool
     # Store key that messageIds belong to. Absent for versions written by
     # tgfs (they belong to the configured primary).
     store: str

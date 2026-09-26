@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Dict, Iterable, List, Optional, Protocol
 
 from tgdcfs.config import CacheConfig
-from tgdcfs.reqres import UploadableFileMessage
+from tgdcfs.reqres import FileTags, UploadableFileMessage
 
 logger = logging.getLogger(__name__)
 
@@ -304,11 +304,75 @@ class CachedVersionBytes:
         self._entry = entry
 
     @property
+    def version_id(self) -> str:
+        return self._entry.version_id
+
+    @property
     def size(self) -> int:
         return self._entry.size
 
     def read(self, begin: int, end: int) -> AsyncIterator[bytes]:
         return self._cache.read(self._entry.version_id, begin, end)
+
+    async def read_bytes(self, begin: int, end: int) -> bytes:
+        return await self._cache.read_bytes(self._entry.version_id, begin, end)
+
+
+@dataclass
+class FileMessageFromCache(UploadableFileMessage):
+    """An upload message over a complete cache entry.
+
+    Seekable, unlike a stream: ``part`` cuts out an independent message
+    for one part, which is what lets a store upload several parts of the
+    same version at once.
+    """
+
+    source: "VersionBytes" = field(init=False)
+    begin: int = field(default=0, init=False)
+
+    @classmethod
+    def new(
+        cls,
+        source: "VersionBytes",
+        name: str,
+        begin: int = 0,
+        size: Optional[int] = None,
+    ) -> "FileMessageFromCache":
+        obj = cls(
+            name=name,
+            size=source.size - begin if size is None else size,
+            caption="",
+            tags=FileTags(),
+            _offset=0,
+            _read_size=0,
+            task_tracker=None,
+        )
+        obj.source = source
+        obj.begin = begin
+        return obj
+
+    @property
+    def seekable(self) -> bool:
+        return True
+
+    def part(self, offset: int, size: int) -> "FileMessageFromCache":
+        """An independent message for ``size`` bytes from ``offset`` of this one."""
+        return FileMessageFromCache.new(
+            self.source, self.name, begin=self.begin + offset, size=size
+        )
+
+    async def read(self, length: int) -> bytes:
+        position = self.begin + self._offset + self._read_size
+        end = min(position + length, self.begin + self.get_size()) - 1
+        if end < position:
+            return b""
+        read_bytes = getattr(self.source, "read_bytes", None)
+        if read_bytes is not None:
+            data = await read_bytes(position, end)
+        else:
+            data = b"".join([c async for c in self.source.read(position, end)])
+        self._read_size += len(data)
+        return data
 
 
 class LocalCache:
@@ -378,9 +442,9 @@ class LocalCache:
             logger.warning(f"Cache: dropping entry {version_id}: {ex}")
             self._unlink(version_id)
             return None
-        # Pins are re-derived by the replication queue after a restart; an
-        # entry that was still being written when the process died holds
-        # an unknown tail and is dropped like any short write.
+        # An entry that was still being written when the process died holds
+        # an unknown tail and is dropped like any short write. Pins survive
+        # the restart: the replication queue that will release them does.
         if data.get("writing"):
             self._unlink(version_id)
             return None
@@ -391,7 +455,7 @@ class LocalCache:
             block_size=block_size,
             present=present,
             last_access=float(data.get("last_access", mtime)),
-            pins=0,
+            pins=1 if int(data.get("pins", 0) or 0) > 0 else 0,
         )
 
     def _sweep_orphans(self) -> None:
@@ -645,6 +709,10 @@ class LocalCache:
             offset += len(chunk)
             yield chunk
 
+    async def read_bytes(self, version_id: str, begin: int, end: int) -> bytes:
+        """``[begin, end]`` of an entry in one piece; the range must be present."""
+        return b"".join([chunk async for chunk in self.read(version_id, begin, end)])
+
     @staticmethod
     def _pread(path: str, offset: int, length: int) -> bytes:
         fd = os.open(path, os.O_RDONLY)
@@ -656,6 +724,7 @@ class LocalCache:
     def pin(self, version_id: str) -> None:
         if (entry := self._entries.get(version_id)) is not None:
             entry.pins += 1
+            self._save_index()
 
     def unpin(self, version_id: str) -> None:
         if (entry := self._entries.get(version_id)) is not None:

@@ -1,7 +1,7 @@
 import json
 import logging
 from itertools import chain
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
@@ -27,9 +27,21 @@ class StoreFDRepository(IFDRepository):
         self,
         store: IStore,
         mirror_group: Optional[MirrorGroup] = None,
+        local_versions: Optional[Callable[[str], bool]] = None,
     ):
         self._message_api = store
         self._mirror_group = mirror_group
+        # Whether this instance's local cache holds a pending version in
+        # full (``write_ack: cache``). Such a version is readable here and
+        # nowhere else.
+        self._local_versions = local_versions
+
+    def _readable_locally(self, version: TGFSFileVersion) -> bool:
+        return (
+            version.pending
+            and self._local_versions is not None
+            and self._local_versions(version.id)
+        )
 
     @property
     def key(self) -> str:
@@ -248,7 +260,24 @@ class StoreFDRepository(IFDRepository):
                 has_valid_version = True
                 if not include_all_versions:
                     # Found a valid version, no need to check further
-                    return fd
+                    break
+
+        # A pending version is readable on the instance whose cache holds
+        # it; elsewhere it counts as invalid, like a version whose parts
+        # are gone. The newest readable version is the one served, so the
+        # latest pointer is moved off an unreadable one (in memory only:
+        # the pointer is derived, never written).
+        readable = [
+            v
+            for v in fd.get_versions(sort=True)
+            if (v.is_valid() and v.part_sizes) or self._readable_locally(v)
+        ]
+        if not readable:
+            readable = [v for v in fd.get_versions(sort=True) if v.is_valid()]
+        if any(self._readable_locally(v) for v in fd.get_versions()):
+            has_valid_version = True
+        if readable and fd.latest_version_id != readable[0].id:
+            fd.latest_version_id = readable[0].id
 
         return fd if has_valid_version else TGFSFileDesc.empty(fd.name)
 

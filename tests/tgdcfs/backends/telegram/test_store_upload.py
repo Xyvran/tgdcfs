@@ -131,6 +131,84 @@ class TestPartition:
         assert list(TelegramStore._partition(part_size, part_size)) == [part_size]
 
 
+class SeekableMockFileMessage(MockFileMessage):
+    """A source that can hand out independent messages per part, like a
+    version in the local cache."""
+
+    def __init__(self, name: str, size: int, offset: int = 0):
+        super().__init__(name, size)
+        self.offset = offset
+
+    def part(self, offset: int, size: int) -> "SeekableMockFileMessage":
+        return SeekableMockFileMessage(self.name, size, self.offset + offset)
+
+
+class TestParallelParts:
+    @pytest.fixture
+    def two_in_flight(self, mocker):
+        from tgdcfs.config import TransferConfig
+
+        transfer = TransferConfig.from_dict({"upload_parts_in_flight": 2})
+        mocker.patch("tgdcfs.backends.telegram.store._transfer", return_value=transfer)
+        return transfer
+
+    @pytest.mark.asyncio
+    async def test_a_seekable_source_uploads_parts_concurrently(
+        self, store, mock_uploader, mocker, two_in_flight
+    ):
+        size = int(2.5 * PART_SIZE_DEFAULT)  # three parts
+        file_msg = SeekableMockFileMessage("big.bin", size)
+        seen: list[tuple[str, int, int]] = []
+
+        def build_uploader(api, msg):
+            seen.append((msg.name, msg.offset, msg.size))
+            return mock_uploader
+
+        mocker.patch(
+            "tgdcfs.backends.telegram.store.FileUploader", side_effect=build_uploader
+        )
+
+        result = await store.upload(file_msg)
+
+        assert len(result) == 3
+        assert sorted(seen) == [
+            ("[part1]big.bin", 0, PART_SIZE_DEFAULT),
+            ("[part2]big.bin", PART_SIZE_DEFAULT, PART_SIZE_DEFAULT),
+            ("[part3]big.bin", 2 * PART_SIZE_DEFAULT, size - 2 * PART_SIZE_DEFAULT),
+        ]
+        # The source itself was never advanced: every part read its own slice.
+        assert file_msg._offset == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stream_still_goes_part_by_part(
+        self, store, mock_uploader, mocker, two_in_flight
+    ):
+        size = int(2.5 * PART_SIZE_DEFAULT)
+        file_msg = MockFileMessage("big.bin", size)
+        seen = []
+
+        def build_uploader(api, msg):
+            seen.append(msg.name)
+            return mock_uploader
+
+        mocker.patch(
+            "tgdcfs.backends.telegram.store.FileUploader", side_effect=build_uploader
+        )
+
+        result = await store.upload(file_msg)
+
+        assert len(result) == 3
+        assert seen == ["[part1]big.bin", "[part2]big.bin", "[part3]big.bin"]
+        assert file_msg._offset == size
+
+    def test_plan_parts_matches_the_partitioning(self, store):
+        size = int(2.5 * PART_SIZE_DEFAULT)
+        assert store.plan_parts(size) == list(
+            TelegramStore._partition(size, PART_SIZE_DEFAULT)
+        )
+        assert store.plan_parts(10) == [10]
+
+
 class TestUpload:
     @pytest.mark.asyncio
     async def test_upload_single_part_file(self, store, mock_uploader):

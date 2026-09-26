@@ -134,7 +134,11 @@ class Client:
 
                 path_name_key = derive_path_name_key(master.key)
 
-        fd_repo = StoreFDRepository(store, mirror_group=mirror_group)
+        fd_repo = StoreFDRepository(
+            store,
+            mirror_group=mirror_group,
+            local_versions=cache.complete if cache is not None else None,
+        )
 
         metadata_cfg = filesystem.metadata
         if metadata_cfg.type == MetadataType.PINNED_MESSAGE:
@@ -155,13 +159,20 @@ class Client:
                 github_repo_config, name_key=path_name_key
             )
 
-        fd_api = FileDescApi(fd_repo, fc_repo)
+        write_back = filesystem.write_ack == "cache" and cache is not None
+        fd_api = FileDescApi(
+            fd_repo, fc_repo, write_ack="cache" if write_back else "primary"
+        )
 
         metadata_api = MetaDataApi(metadata_repo)
         await metadata_api.init()
 
         on_written = None
-        if not inline and mirror_group is not None and replication is not None:
+        # Every write goes to the queue when the mirrors are filled in the
+        # background or when the bytes still have to leave the cache.
+        if replication is not None and (
+            (not inline and mirror_group is not None) or write_back
+        ):
             queue = replication
             name = filesystem.name
 

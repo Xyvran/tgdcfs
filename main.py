@@ -84,7 +84,10 @@ def start_replication_workers(
     workers: List[ReplicationWorker] = []
     for filesystem in config.filesystems.values():
         client = clients.get(filesystem.name)
-        if client is None or filesystem.sync != "background" or not filesystem.mirrors:
+        if client is None:
+            continue
+        background = filesystem.sync == "background" and filesystem.mirrors
+        if not background and filesystem.write_ack != "cache":
             continue
         worker = ReplicationWorker(client, replication)
         worker.start()

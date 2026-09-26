@@ -7,6 +7,8 @@ class TaskType(str, Enum):
     UPLOAD = "upload"
     DOWNLOAD = "download"
     MIRROR_BACKFILL = "mirror_backfill"
+    # Moving a write-back upload from the local cache into the stores.
+    DISTRIBUTION = "distribution"
 
 
 class TaskStatus(str, Enum):

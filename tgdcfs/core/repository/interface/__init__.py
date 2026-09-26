@@ -43,6 +43,17 @@ class IFileContentRepository(metaclass=ABCMeta):
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:
         pass
 
+    async def stage(
+        self, file_msg: UploadableFileMessage, version_id: str
+    ) -> Optional[int]:
+        """Take the whole upload into the local cache without touching a
+        store (``write_ack: cache``); returns the bytes on disk, or
+        ``None`` when the cache cannot take it and the caller has to
+        upload the way it always did. Repositories without a cache
+        return ``None``.
+        """
+        return None
+
     async def content_length(self, fv: TGFSFileVersion) -> int:
         """Logical size of the file as seen by the caller.
 

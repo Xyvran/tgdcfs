@@ -97,6 +97,13 @@ class TGFSFileVersion:
     # the version relative to the new primary.
     store: Optional[str] = None
 
+    # True while the bytes live only in the local cache of the instance
+    # that accepted the upload (``write_ack: cache``): no store has them
+    # yet, so ``message_ids`` is empty. Every reader but that instance
+    # treats the version as invalid, exactly like a version whose parts
+    # are gone, and serves the previous one until distribution completes.
+    pending: bool = False
+
     @property
     def updated_at_timestamp(self) -> int:
         return ts(self.updated_at)
@@ -133,7 +140,30 @@ class TGFSFileVersion:
             }
         if self.store:
             res["store"] = self.store
+        if self.pending:
+            res["pending"] = True
         return res
+
+    @staticmethod
+    def pending_version(version_id: str, size: int) -> "TGFSFileVersion":
+        """A version whose bytes sit in the local cache, not yet in a store."""
+        return TGFSFileVersion(
+            id=version_id,
+            updated_at=datetime.datetime.now(),
+            _size=size,
+            message_ids=[],
+            pending=True,
+        )
+
+    def materialize(
+        self, store: str, message_ids: List[int], part_sizes: List[int]
+    ) -> None:
+        """The primary store has the bytes: the version stops being pending."""
+        self.message_ids = list(message_ids)
+        self.part_sizes = list(part_sizes)
+        self.store = store
+        self.pending = False
+        self._size = INVALID_FILE_SIZE
 
     @staticmethod
     def empty() -> "TGFSFileVersion":
@@ -177,9 +207,17 @@ class TGFSFileVersion:
                 message_ids = [message_id]
             else:
                 message_ids = []
+        pending = bool(data.get("pending"))
         return TGFSFileVersion(
             id=data["id"],
             updated_at=updated_at,
+            # A pending version's size is only known from the descriptor.
+            _size=(
+                int(data.get("size", INVALID_FILE_SIZE))
+                if pending
+                else INVALID_FILE_SIZE
+            ),
+            pending=pending,
             message_ids=message_ids,
             part_sizes=[],  # part sizes are not serialized
             # Keys written by tgfs are bare Telegram channel ids; they are

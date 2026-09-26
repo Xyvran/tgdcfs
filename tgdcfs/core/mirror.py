@@ -182,6 +182,28 @@ class MirrorGroup:
                 self._handle_write_error(ch.key, "content parts", ex)
         return res
 
+    @property
+    def stores(self) -> List[MirrorStore]:
+        return list(self._stores)
+
+    def needs_replica(self, target: MirrorStore, part_sizes: List[int]) -> bool:
+        """Whether ``target`` gets a replica (own layout) rather than an
+        aligned copy of parts of these sizes from the primary."""
+        return not self._fits_aligned(target.store, self._primary, part_sizes)
+
+    async def replicate_local(
+        self, target: MirrorStore, local: "VersionBytes", name: str
+    ) -> Replica:
+        """Upload a version that sits in the local cache into ``target`` as
+        a replica, independent of the primary (write-back distribution)."""
+        from tgdcfs.core.local_cache import FileMessageFromCache
+
+        sent = await target.store.upload(FileMessageFromCache.new(local, name))
+        return Replica(
+            message_ids=[m.message_id for m in sent],
+            part_sizes=[m.size for m in sent],
+        )
+
     async def copy_into_primary(self, version: "TGFSFileVersion") -> bool:
         """Copy a version that lives in a former primary into the current one.
 

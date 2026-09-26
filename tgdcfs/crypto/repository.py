@@ -133,6 +133,18 @@ class EncryptingFileContentRepository(IFileContentRepository):
         )
         return await self._inner.save(encrypted)
 
+    async def stage(
+        self, file_msg: UploadableFileMessage, version_id: str
+    ) -> Optional[int]:
+        # Same wrapping as ``save``: the cache below holds ciphertext.
+        if self._name_key is not None and file_msg.name:
+            file_msg.name = encrypt_name(self._name_key, file_msg.name)
+        header = FileHeader.new(chunk_size=self._chunk_size)
+        file_key = derive_file_key(self._master_key, header.file_salt)
+        encrypted = EncryptingFileMessage.wrap(file_msg, file_key, header)
+        encrypted.version_id = version_id
+        return await self._inner.stage(encrypted, version_id)
+
     # -- update ------------------------------------------------------------
 
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:

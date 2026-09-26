@@ -132,6 +132,19 @@ class IStore(metaclass=ABCMeta):
         """
         pass
 
+    def plan_parts(self, size: int) -> List[int]:
+        """The part sizes ``upload`` would cut ``size`` bytes into.
+
+        Lets a caller decide, before anything is uploaded, whether a mirror
+        can hold the primary's parts one to one. The default cuts at the
+        store's largest part; a store with a smarter rule overrides it.
+        """
+        part = self.caps.max_part_bytes
+        if size <= 0:
+            return [0]
+        parts = (size + part - 1) // part
+        return [part] * (parts - 1) + [size - (parts - 1) * part]
+
     @abstractmethod
     async def download_file(
         self, message_id: int, begin: int, end: int
