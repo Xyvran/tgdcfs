@@ -145,7 +145,9 @@ class TGFSFileVersion:
 
     @staticmethod
     def from_sent_file_message(
-        *messages: SentFileMessage, store: Optional[str] = None
+        *messages: SentFileMessage,
+        store: Optional[str] = None,
+        version_id: Optional[str] = None,
     ) -> "TGFSFileVersion":
         mirrors: Dict[str, List[int]] = {}
         for channel in {ch for msg in messages for ch in msg.mirrors}:
@@ -154,7 +156,7 @@ class TGFSFileVersion:
         for msg in messages:
             replicas.update(msg.replicas)
         return TGFSFileVersion(
-            id=str(uuid()),
+            id=version_id or str(uuid()),
             updated_at=datetime.datetime.now(),
             message_ids=[msg.message_id for msg in messages],
             part_sizes=[msg.size for msg in messages],
@@ -374,8 +376,10 @@ class TGFSFileDesc:
             self.created_at = when
         return latest
 
-    def add_version_from_sent_file_message(self, *msg: SentFileMessage):
-        version = TGFSFileVersion.from_sent_file_message(*msg)
+    def add_version_from_sent_file_message(
+        self, *msg: SentFileMessage, version_id: Optional[str] = None
+    ):
+        version = TGFSFileVersion.from_sent_file_message(*msg, version_id=version_id)
         self.add_version(version)
         return self.versions[self.latest_version_id]
 

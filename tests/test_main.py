@@ -50,7 +50,7 @@ class TestMain:
         created = {}
 
         async def fake_client_create(
-            filesystem, cfg, factory, encryption_cfg=None, replication=None
+            filesystem, cfg, factory, encryption_cfg=None, replication=None, cache=None
         ):
             assert cfg is config
             assert encryption_cfg is config.tgdcfs.encryption
@@ -159,6 +159,7 @@ class TestMain:
         mock_config = mocker.Mock()
         mock_config.tgdcfs.server.host = "0.0.0.0"
         mock_config.tgdcfs.server.port = 9000
+        mock_config.tgdcfs.cache.enabled = False
         mock_config.replication_queue_file = None
 
         mock_clients = mocker.Mock()

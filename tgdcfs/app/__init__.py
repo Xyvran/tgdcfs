@@ -12,6 +12,7 @@ from tgdcfs.auth import auth_basic, auth_bearer
 from tgdcfs.auth import login as login_bearer
 from tgdcfs.config import Config
 from tgdcfs.core.client import Clients
+from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.replication import ReplicationQueue
 
 from .manager import create_manager_app
@@ -32,7 +33,10 @@ def cors(app: FastAPI):
 
 
 def create_app(
-    clients: Clients, config: Config, replication: Optional[ReplicationQueue] = None
+    clients: Clients,
+    config: Config,
+    replication: Optional[ReplicationQueue] = None,
+    cache: Optional[LocalCache] = None,
 ) -> FastAPI:
     app = FastAPI()
     cors(app)
@@ -98,7 +102,9 @@ def create_app(
         except Exception as e:
             return UNAUTHORIZED(str(e))
 
-    manager_app = cors(create_manager_app(clients, config, replication=replication))
+    manager_app = cors(
+        create_manager_app(clients, config, replication=replication, cache=cache)
+    )
     app.mount("/api", manager_app)
 
     webdav_app = cors(create_webdav_app(clients, "/webdav"))

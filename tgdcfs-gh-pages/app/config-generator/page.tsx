@@ -52,6 +52,30 @@ interface SftpConfig {
   upload_buffer_size_mb: number;
 }
 
+interface CacheConfig {
+  enabled: boolean;
+  dir: string;
+  max_size_mb: number;
+  max_files: number;
+  max_file_size_mb: number;
+  block_kb: number;
+  stage_uploads: boolean;
+  keep_for_reads: boolean;
+}
+
+// The loader's defaults; a value equal to its default is left out of the
+// YAML so the server's default keeps applying.
+const CACHE_DEFAULTS: CacheConfig = {
+  enabled: false,
+  dir: "cache",
+  max_size_mb: 20480,
+  max_files: 0,
+  max_file_size_mb: 4096,
+  block_kb: 4096,
+  stage_uploads: true,
+  keep_for_reads: true,
+};
+
 interface TransferConfig {
   // UI only: when off, no transfer block is written at all and the
   // application falls back to its own defaults.
@@ -101,6 +125,7 @@ interface ConfigData {
     sftp: SftpConfig;
     transfer: TransferConfig;
     encryption: EncryptionConfig;
+    cache: CacheConfig;
   };
 }
 
@@ -122,6 +147,7 @@ type ConfigUpdatePaths = {
   "tgdcfs.sftp": SftpConfig;
   "tgdcfs.transfer": TransferConfig;
   "tgdcfs.encryption": EncryptionConfig;
+  "tgdcfs.cache": CacheConfig;
 };
 
 const generateRandomSecret = (): string => {
@@ -197,6 +223,7 @@ export default function ConfigGenerator() {
         authorized_keys_dir: "",
         upload_buffer_size_mb: 64,
       },
+      cache: { ...CACHE_DEFAULTS },
       transfer: {
         enabled: false,
         upload_workers_small: 3,
@@ -265,6 +292,8 @@ export default function ConfigGenerator() {
         newConfig.tgdcfs.transfer = value as TransferConfig;
       } else if (path === "tgdcfs.encryption") {
         newConfig.tgdcfs.encryption = value as EncryptionConfig;
+      } else if (path === "tgdcfs.cache") {
+        newConfig.tgdcfs.cache = value as CacheConfig;
       }
 
       setConfig(newConfig);
@@ -656,6 +685,18 @@ export default function ConfigGenerator() {
           const settings = { ...transfer } as Partial<TransferConfig>;
           delete settings.enabled;
           return { transfer: settings };
+        })(),
+        ...(() => {
+          const cache = config.tgdcfs.cache;
+          if (!cache.enabled) return {};
+          // Only what differs from the loader's defaults, plus the switch.
+          const block: Partial<CacheConfig> = { enabled: true };
+          (Object.keys(CACHE_DEFAULTS) as (keyof CacheConfig)[]).forEach((key) => {
+            if (key !== "enabled" && cache[key] !== CACHE_DEFAULTS[key]) {
+              (block as Record<string, unknown>)[key] = cache[key];
+            }
+          });
+          return { cache: block };
         })(),
         encryption: (() => {
           const enc = config.tgdcfs.encryption;
@@ -1301,6 +1342,132 @@ export default function ConfigGenerator() {
                   })
                 }
               />
+            </FormSection>
+
+            <FormSection title="Local Cache (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                A cache on the data volume. Uploads are staged into it while
+                they stream to the primary store, so the mirrors read the
+                file from disk instead of downloading it from the primary
+                again; kept after replication, it also serves repeated
+                reads. It holds what the stores hold: ciphertext when
+                encryption is on, never plaintext. Keep the directory on the
+                mounted data volume so it survives a container restart, and
+                give it room for the budget plus one upload in flight.
+              </Typography>
+              <FormControlLabel
+                label="Enable the local cache"
+                control={
+                  <Checkbox
+                    checked={config.tgdcfs.cache.enabled}
+                    onChange={(e) =>
+                      updateConfig("tgdcfs.cache", {
+                        ...config.tgdcfs.cache,
+                        enabled: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              {config.tgdcfs.cache.enabled && (
+                <>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Directory (relative to the data dir)"
+                      value={config.tgdcfs.cache.dir}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          dir: e.target.value,
+                        })
+                      }
+                      width={260}
+                    />
+                    <ConfigTextField
+                      label="Block size (KiB)"
+                      type="number"
+                      value={config.tgdcfs.cache.block_kb}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          block_kb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      error={config.tgdcfs.cache.block_kb < 64}
+                      helperText={
+                        config.tgdcfs.cache.block_kb < 64 ? "At least 64 KiB" : undefined
+                      }
+                      width={160}
+                    />
+                  </FieldRow>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Total budget (MB, 0 = unlimited)"
+                      type="number"
+                      value={config.tgdcfs.cache.max_size_mb}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          max_size_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={220}
+                    />
+                    <ConfigTextField
+                      label="Max cached versions (0 = unlimited)"
+                      type="number"
+                      value={config.tgdcfs.cache.max_files}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          max_files: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={240}
+                    />
+                    <ConfigTextField
+                      label="Max size per version (MB, 0 = unlimited)"
+                      type="number"
+                      value={config.tgdcfs.cache.max_file_size_mb}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.cache", {
+                          ...config.tgdcfs.cache,
+                          max_file_size_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={260}
+                    />
+                  </FieldRow>
+                  <FormControlLabel
+                    label="Stage uploads for the mirrors (the mirrors read the local copy instead of the primary)"
+                    control={
+                      <Checkbox
+                        checked={config.tgdcfs.cache.stage_uploads}
+                        onChange={(e) =>
+                          updateConfig("tgdcfs.cache", {
+                            ...config.tgdcfs.cache,
+                            stage_uploads: e.target.checked,
+                          })
+                        }
+                      />
+                    }
+                  />
+                  <FormControlLabel
+                    label="Keep entries for reads (evicted least-recently-used within the budget)"
+                    control={
+                      <Checkbox
+                        checked={config.tgdcfs.cache.keep_for_reads}
+                        onChange={(e) =>
+                          updateConfig("tgdcfs.cache", {
+                            ...config.tgdcfs.cache,
+                            keep_for_reads: e.target.checked,
+                          })
+                        }
+                      />
+                    }
+                  />
+                </>
+              )}
             </FormSection>
 
             <FormSection title="Transfer Performance (Optional)">

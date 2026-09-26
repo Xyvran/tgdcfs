@@ -1,5 +1,6 @@
 import datetime
 from typing import List, Optional
+from uuid import uuid4 as uuid
 
 from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.repository.interface import (
@@ -60,8 +61,13 @@ class FileDescApi:
         fd = await self.get_file_desc(fr) if fr else TGFSFileDesc(name=file_msg.name)
 
         if isinstance(file_msg, UploadableFileMessage | FileMessageImported):
+            # The version id is chosen before the bytes move so the content
+            # repository can stage them in the local cache under it.
+            version_id = str(uuid())
+            if isinstance(file_msg, UploadableFileMessage):
+                file_msg.version_id = version_id
             sent_file_msg = await self.get_sent_file_message(file_msg)
-            fd.add_version_from_sent_file_message(*sent_file_msg)
+            fd.add_version_from_sent_file_message(*sent_file_msg, version_id=version_id)
         else:
             fd.add_empty_version()
 
@@ -72,9 +78,12 @@ class FileDescApi:
     ) -> FDRepositoryResp:
         fd = await self.get_file_desc(fr)
         if isinstance(file_msg, UploadableFileMessage | FileMessageImported):
+            if isinstance(file_msg, UploadableFileMessage):
+                file_msg.version_id = version_id
             sent_file_msg = await self.get_sent_file_message(file_msg)
-            fv = TGFSFileVersion.from_sent_file_message(*sent_file_msg)
-            fv.id = version_id
+            fv = TGFSFileVersion.from_sent_file_message(
+                *sent_file_msg, version_id=version_id
+            )
             fd.update_version(version_id, fv)
         else:
             fv = fd.get_version(version_id)

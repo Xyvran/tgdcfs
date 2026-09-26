@@ -46,6 +46,7 @@ from tgdcfs.errors import MessageNotFound, TechnicalError
 from tgdcfs.reqres import FileMessageFromStream, Replica
 
 if TYPE_CHECKING:
+    from tgdcfs.core.local_cache import VersionBytes, VersionCache
     from tgdcfs.core.model import TGFSFileVersion
 
 logger = logging.getLogger(__name__)
@@ -144,13 +145,17 @@ class MirrorGroup:
         part_sizes: Optional[List[int]] = None,
         only_stores: Optional[List[str]] = None,
         source: Optional[IStore] = None,
+        cache: Optional["VersionCache"] = None,
     ) -> MirrorResult:
         """Copy the given parts into the mirror stores.
 
         ``message_ids`` name messages of ``source`` (the primary unless
         given). ``part_sizes`` decide whether a store gets an aligned copy
         or a replica; when omitted they are looked up from the source.
-        Returns the copies per store that succeeded.
+        With ``cache`` the bytes come from the local copy of the version
+        when there is one, and a download that has to happen anyway fills
+        the cache for the stores that follow. Returns the copies per
+        store that succeeded.
         """
         res = MirrorResult()
         if not message_ids:
@@ -166,10 +171,12 @@ class MirrorGroup:
                 if sizes is None or len(sizes) != len(message_ids):
                     sizes = await self._part_sizes(source, message_ids)
                 if self._fits_aligned(ch.store, source, sizes):
-                    res.mirrors[ch.key] = await self._copy_to(ch, source, message_ids)
+                    res.mirrors[ch.key] = await self._copy_to(
+                        ch, source, message_ids, sizes, cache
+                    )
                 else:
                     res.replicas[ch.key] = await self._replicate(
-                        ch, source, message_ids, sizes
+                        ch, source, message_ids, sizes, cache
                     )
             except Exception as ex:
                 self._handle_write_error(ch.key, "content parts", ex)
@@ -227,7 +234,12 @@ class MirrorGroup:
         return sizes
 
     async def _copy_to(
-        self, target: MirrorStore, source: IStore, message_ids: List[int]
+        self,
+        target: MirrorStore,
+        source: IStore,
+        message_ids: List[int],
+        part_sizes: Optional[List[int]] = None,
+        cache: Optional["VersionCache"] = None,
     ) -> List[int]:
         """Aligned copy of ``source`` messages into ``target`` per ``mode``."""
         if not message_ids:
@@ -250,25 +262,49 @@ class MirrorGroup:
                     f"Store {target.key} cannot receive server-side copies from "
                     f"{source.key}; use mode 'auto' or 'reupload'"
                 )
-        return [await self._reupload_one(target, source, mid) for mid in message_ids]
+        # A complete local copy spares the download of every part; the
+        # part offsets into it follow from the part sizes.
+        local = cache.local() if cache is not None else None
+        offsets: List[Optional[tuple["VersionBytes", int, int]]] = [None] * len(
+            message_ids
+        )
+        if local is not None and part_sizes and len(part_sizes) == len(message_ids):
+            begin = 0
+            for i, size in enumerate(part_sizes):
+                offsets[i] = (local, begin, begin + size - 1)
+                begin += size
+        return [
+            await self._reupload_one(target, source, mid, local_range)
+            for mid, local_range in zip(message_ids, offsets)
+        ]
 
     async def _reupload_one(
-        self, target: MirrorStore, source: IStore, message_id: int
+        self,
+        target: MirrorStore,
+        source: IStore,
+        message_id: int,
+        local_range: Optional[tuple["VersionBytes", int, int]] = None,
     ) -> int:
         """Bandwidth-bound aligned copy: stream one part down and up again.
 
         Bytes are copied verbatim -- this sits below the encryption
         decorator, so ciphertext stays ciphertext. The caller has checked
-        that the part fits one message of the target.
+        that the part fits one message of the target. With ``local_range``
+        the part is read from the local cache instead of the source.
         """
-        message = (await source.get_messages([message_id]))[0]
-        if not message or not message.document:
-            raise MessageNotFound(message_id=message_id)
-        size = message.document.size
-        resp = await source.download_file(message_id, 0, size - 1)
+        if local_range is not None:
+            local, begin, end = local_range
+            size = end - begin + 1
+            chunks = local.read(begin, end)
+        else:
+            message = (await source.get_messages([message_id]))[0]
+            if not message or not message.document:
+                raise MessageNotFound(message_id=message_id)
+            size = message.document.size
+            chunks = (await source.download_file(message_id, 0, size - 1)).chunks
         sent = await target.store.upload(
             FileMessageFromStream.new(
-                stream=resp.chunks, size=size, name=f"part-{message_id}"
+                stream=chunks, size=size, name=f"part-{message_id}"
             )
         )
         if len(sent) != 1:
@@ -284,21 +320,32 @@ class MirrorGroup:
         source: IStore,
         message_ids: List[int],
         part_sizes: List[int],
+        cache: Optional["VersionCache"] = None,
     ) -> Replica:
         """Re-partitioned copy: stream the whole version through the target.
 
         The target cuts the byte stream at its own part size; the result
-        is a replica with the target's layout.
+        is a replica with the target's layout. The bytes come from the
+        local cache when it holds the version; a download that has to
+        happen fills the cache on the way when the cache keeps entries.
         """
         total = sum(part_sizes)
+        local = cache.local() if cache is not None else None
+        filler = cache.filler() if cache is not None and local is None else None
 
         async def content() -> AsyncGenerator[bytes, None]:
+            if local is not None:
+                async for chunk in local.read(0, total - 1):
+                    yield chunk
+                return
             for mid, size in zip(message_ids, part_sizes):
                 if size <= 0:
                     continue
                 resp = await source.download_file(mid, 0, size - 1)
                 try:
                     async for chunk in resp.chunks:
+                        if filler is not None:
+                            await filler.write(chunk)
                         yield chunk
                 finally:
                     if (aclose := getattr(resp.chunks, "aclose", None)) is not None:
@@ -315,6 +362,8 @@ class MirrorGroup:
             # The target reads exactly ``total`` bytes and leaves the
             # generator suspended; close it so its downloads are released.
             await stream.aclose()
+            if filler is not None:
+                await filler.close()
         return Replica(
             message_ids=[m.message_id for m in sent],
             part_sizes=[m.size for m in sent],

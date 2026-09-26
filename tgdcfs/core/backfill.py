@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+from tgdcfs.core.local_cache import version_cache_for
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef
 from tgdcfs.tasks import task_store
 from tgdcfs.tasks.models import TaskStatus, TaskType
@@ -132,14 +133,22 @@ async def backfill_file(
                     f"{fr.name}@{version.id}: could not copy into the primary ({ex})"
                 )
 
+        cache = version_cache_for(
+            getattr(client, "cache", None), client.name, version.id, version.size
+        )
         missing = mirror_group.missing_stores(version)
         if not missing:
+            if cache is not None:
+                cache.release()
             continue
         if not version.owned_by(mirror_group.primary.key):
             # No primary copy to mirror from yet; the next run retries.
             continue
         copies = await mirror_group.mirror_parts(
-            version.message_ids, version.part_sizes or None, only_stores=missing
+            version.message_ids,
+            version.part_sizes or None,
+            only_stores=missing,
+            cache=cache,
         )
         if copies.store_keys:
             copies.apply_to(version)
@@ -151,6 +160,10 @@ async def backfill_file(
                 f"{fr.name}@{version.id}: could not mirror to "
                 f"{', '.join(still_missing)}"
             )
+        elif cache is not None:
+            # Every mirror has its copy: the staged bytes are no longer
+            # needed for replication.
+            cache.release()
 
     fd_missing = set(mirror_group.store_keys) - {
         key for key, mid in fr.mirrors.items() if mid > 0

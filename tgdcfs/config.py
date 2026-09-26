@@ -437,6 +437,85 @@ class TransferConfig:
 
 
 @dataclass
+class CacheConfig:
+    """The local cache on the data volume (design plan, section 4.10).
+
+    Off by default. When on, uploads are staged into ``dir`` alongside
+    the upload to the primary store so the mirrors read them from disk
+    instead of downloading them from the primary again; with
+    ``keep_for_reads`` the entries stay after replication and serve
+    repeated reads. The cache holds what the stores hold, ciphertext when
+    encryption is on.
+
+    ``max_size_mb`` bounds the bytes on disk, ``max_files`` the number of
+    cached versions (``0`` means unlimited for both), and a version above
+    ``max_file_size_mb`` is never cached. ``block_kb`` is the unit the
+    read cache fills and serves.
+    """
+
+    enabled: bool
+    dir: str
+    max_size_mb: int
+    max_files: int
+    max_file_size_mb: int
+    block_kb: int
+    stage_uploads: bool
+    keep_for_reads: bool
+
+    DEFAULT_DIR = "cache"
+    DEFAULT_MAX_SIZE_MB = 20 * 1024
+    DEFAULT_MAX_FILES = 0
+    DEFAULT_MAX_FILE_SIZE_MB = 4 * 1024
+    DEFAULT_BLOCK_KB = 4 * 1024
+
+    @property
+    def directory(self) -> str:
+        return expand_path(self.dir)
+
+    @property
+    def max_size_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def block_bytes(self) -> int:
+        return self.block_kb * 1024
+
+    @classmethod
+    def disabled(cls) -> "CacheConfig":
+        return cls.from_dict(None)
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "CacheConfig":
+        data = data or {}
+
+        def non_negative(key: str, default: int) -> int:
+            value = int(data.get(key, default))
+            if value < 0:
+                raise ValueError(f"cache.{key} must not be negative, got {value}")
+            return value
+
+        block_kb = int(data.get("block_kb", cls.DEFAULT_BLOCK_KB))
+        if block_kb < 64:
+            raise ValueError(f"cache.block_kb must be at least 64, got {block_kb}")
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            dir=str(data.get("dir") or cls.DEFAULT_DIR),
+            max_size_mb=non_negative("max_size_mb", cls.DEFAULT_MAX_SIZE_MB),
+            max_files=non_negative("max_files", cls.DEFAULT_MAX_FILES),
+            max_file_size_mb=non_negative(
+                "max_file_size_mb", cls.DEFAULT_MAX_FILE_SIZE_MB
+            ),
+            block_kb=block_kb,
+            stage_uploads=bool(data.get("stage_uploads", True)),
+            keep_for_reads=bool(data.get("keep_for_reads", True)),
+        )
+
+
+@dataclass
 class TGFSConfig:
     users: dict[str, UserConfig]
     jwt: JWTConfig
@@ -445,6 +524,7 @@ class TGFSConfig:
     encryption: EncryptionConfig
     sftp: SFTPConfig
     transfer: TransferConfig
+    cache: CacheConfig = field(default_factory=lambda: CacheConfig.disabled())
 
     @classmethod
     def from_dict(cls, data: Dict) -> Self:
@@ -467,6 +547,7 @@ class TGFSConfig:
             encryption=EncryptionConfig.from_dict(data.get("encryption")),
             sftp=SFTPConfig.from_dict(data.get("sftp")),
             transfer=TransferConfig.from_dict(data.get("transfer")),
+            cache=CacheConfig.from_dict(data.get("cache")),
         )
 
 

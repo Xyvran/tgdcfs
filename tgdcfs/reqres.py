@@ -187,6 +187,11 @@ class UploadableFileMessage(FileMessage):
 
     task_tracker: Optional[TaskTracker]
 
+    # Id of the version this upload becomes, set by the file-desc API
+    # before the bytes move so the content repository can stage them in
+    # the local cache under the same id the metadata will carry.
+    version_id: Optional[str] = field(default=None, kw_only=True)
+
     def _get_size(self) -> int:
         return 0
 

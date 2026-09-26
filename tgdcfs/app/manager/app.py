@@ -11,6 +11,7 @@ from tgdcfs.app.utils import split_global_path
 from tgdcfs.config import Config
 from tgdcfs.core import Clients
 from tgdcfs.core.backfill import backfill_mirrors, count_files, create_backfill_task
+from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.ops import Ops
 from tgdcfs.core.replication import ReplicationQueue
 from tgdcfs.reqres import MessageRespWithDocument
@@ -20,7 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 def create_manager_app(
-    clients: Clients, config: Config, replication: Optional[ReplicationQueue] = None
+    clients: Clients,
+    config: Config,
+    replication: Optional[ReplicationQueue] = None,
+    cache: Optional[LocalCache] = None,
 ) -> FastAPI:
     ops = {name: Ops(client) for name, client in clients.items()}
 

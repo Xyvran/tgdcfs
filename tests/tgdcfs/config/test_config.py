@@ -1,6 +1,7 @@
 import pytest
 
 from tgdcfs.config import (
+    CacheConfig,
     Config,
     GithubRepoConfig,
     JWTConfig,
@@ -186,6 +187,57 @@ class TestSFTPConfig:
     def test_rejects_negative_buffer_size(self):
         with pytest.raises(ValueError):
             SFTPConfig.from_dict({"upload_buffer_size_mb": -1})
+
+
+class TestCacheConfig:
+    def test_off_and_defaults_when_absent(self):
+        config = TGFSConfig.from_dict(
+            {
+                "users": {},
+                "jwt": {"secret": "test", "algorithm": "HS256", "life": 1800},
+                "server": {"host": "localhost", "port": 3000},
+            }
+        )
+
+        cache = config.cache
+        assert cache.enabled is False
+        assert cache.dir == "cache"
+        assert cache.max_size_mb == 20 * 1024
+        assert cache.max_files == 0
+        assert cache.max_file_size_mb == 4 * 1024
+        assert cache.block_kb == 4 * 1024
+        assert cache.stage_uploads is True
+        assert cache.keep_for_reads is True
+        assert cache.directory.endswith("cache")
+
+    def test_overrides(self):
+        cache = CacheConfig.from_dict(
+            {
+                "enabled": True,
+                "dir": "staging",
+                "max_size_mb": 100,
+                "max_files": 5,
+                "max_file_size_mb": 0,
+                "block_kb": 1024,
+                "stage_uploads": False,
+                "keep_for_reads": False,
+            }
+        )
+        assert cache.enabled is True
+        assert cache.max_size_bytes == 100 * 1024 * 1024
+        assert cache.max_files == 5
+        assert cache.max_file_size_bytes == 0
+        assert cache.block_bytes == 1024 * 1024
+        assert cache.stage_uploads is False
+        assert cache.keep_for_reads is False
+
+    def test_negative_budget_rejected(self):
+        with pytest.raises(ValueError, match="max_size_mb"):
+            CacheConfig.from_dict({"max_size_mb": -1})
+
+    def test_tiny_block_rejected(self):
+        with pytest.raises(ValueError, match="block_kb"):
+            CacheConfig.from_dict({"block_kb": 16})
 
 
 class TestTransferConfig:

@@ -24,6 +24,7 @@ from tgdcfs.backends.telegram import factory as telegram
 from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
 from tgdcfs.core.client import StoreFactory
+from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 
 
@@ -47,8 +48,19 @@ async def create_store_factory(config: Config) -> StoreFactory:
     return create_store
 
 
+def create_cache(config: Config) -> Optional[LocalCache]:
+    """The local cache when the config turns it on; loaded from disk."""
+    if not config.tgdcfs.cache.enabled:
+        return None
+    cache = LocalCache(config.tgdcfs.cache)
+    cache.load()
+    return cache
+
+
 async def create_clients(
-    config: Config, replication: Optional[ReplicationQueue] = None
+    config: Config,
+    replication: Optional[ReplicationQueue] = None,
+    cache: Optional[LocalCache] = None,
 ) -> Clients:
     store_factory = await create_store_factory(config)
 
@@ -60,6 +72,7 @@ async def create_clients(
             store_factory,
             encryption_cfg=config.tgdcfs.encryption,
             replication=replication,
+            cache=cache,
         )
     return clients
 
@@ -100,10 +113,11 @@ async def main():
     config = get_config()
 
     replication = ReplicationQueue(config.replication_queue_file)
-    clients = await create_clients(config, replication)
+    cache = create_cache(config)
+    clients = await create_clients(config, replication, cache)
     workers = start_replication_workers(clients, config, replication)
 
-    app = create_app(clients, config, replication=replication)
+    app = create_app(clients, config, replication=replication, cache=cache)
 
     try:
         sftp_acceptor = await start_sftp_server(clients, config)

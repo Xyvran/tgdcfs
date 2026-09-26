@@ -9,6 +9,7 @@ from tgdcfs.config import (
     StoreConfig,
 )
 from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
+from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileRef
 from tgdcfs.core.replication import ReplicationQueue, file_path
@@ -43,6 +44,7 @@ class Client:
         metadata_api: Optional[MetaDataApi] = None,
         mirror_group: Optional[MirrorGroup] = None,
         filesystem: Optional[FilesystemConfig] = None,
+        cache: Optional[LocalCache] = None,
     ):
         self.name = name
         self.store = store
@@ -53,6 +55,8 @@ class Client:
         self.metadata_api = metadata_api
         self.mirror_group = mirror_group
         self.filesystem = filesystem
+        # The local cache shared by every file system; ``None`` when off.
+        self.cache = cache
 
     @property
     def message_api(self) -> IStore:
@@ -67,6 +71,7 @@ class Client:
         store_factory: StoreFactory,
         encryption_cfg: Optional[EncryptionConfig] = None,
         replication: Optional[ReplicationQueue] = None,
+        cache: Optional[LocalCache] = None,
     ) -> "Client":
         store = await store_factory(config.stores[filesystem.primary])
         inline = filesystem.sync == "inline" or replication is None
@@ -99,6 +104,8 @@ class Client:
             mirror_group=mirror_group,
             inline_mirroring=inline,
             read_preference=read_preference,
+            cache=cache,
+            cache_scope=filesystem.name,
         )
 
         # Wrap the file-content repository in an encryption decorator if
@@ -183,6 +190,7 @@ class Client:
             metadata_api=metadata_api,
             mirror_group=mirror_group,
             filesystem=filesystem,
+            cache=cache,
         )
 
 

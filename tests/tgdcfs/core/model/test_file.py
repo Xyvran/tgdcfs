@@ -445,7 +445,7 @@ class TestTGFSFileDesc:
 
         result = file_desc.add_version_from_sent_file_message(msg)
 
-        mock_from_sent.assert_called_once_with(msg)
+        mock_from_sent.assert_called_once_with(msg, version_id=None)
         assert result == mock_version
 
     def test_update_version(self):

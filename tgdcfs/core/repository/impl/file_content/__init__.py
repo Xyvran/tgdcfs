@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Generator, List, Optional, Sequence
 
 from tgdcfs.backends.base import IStore
+from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSFileVersion
 from tgdcfs.core.repository.interface import IFileContentRepository
@@ -55,6 +56,8 @@ class StoreFileContentRepository(IFileContentRepository):
         mirror_group: Optional[MirrorGroup] = None,
         inline_mirroring: bool = True,
         read_preference: Optional[Sequence[str]] = None,
+        cache: Optional[LocalCache] = None,
+        cache_scope: str = "",
     ):
         self._store = store
         self._mirror_group = mirror_group
@@ -62,21 +65,61 @@ class StoreFileContentRepository(IFileContentRepository):
         # queue copies to the mirrors later (``sync: background``).
         self._inline_mirroring = inline_mirroring
         self._read_preference = list(read_preference or [])
+        # The local cache (design plan 4.10) and the file system name its
+        # entries are filed under. ``None`` when the cache is off.
+        self._cache = cache if cache is not None and cache.config.enabled else None
+        self._cache_scope = cache_scope
+
+    @property
+    def cache(self) -> Optional[LocalCache]:
+        return self._cache
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
-        res = await self._store.upload(file_msg)
+        # Stage the bytes on disk while they stream to the primary, so the
+        # mirrors read the version from here instead of from the primary.
+        writer = None
+        version_id = file_msg.version_id
+        if (
+            self._cache is not None
+            and self._cache.config.stage_uploads
+            and version_id
+            and self._mirror_group is not None
+        ):
+            writer = self._cache.open_staging(
+                self._cache_scope, version_id, file_msg.get_size()
+            )
+            if writer is not None:
+                self._cache.pin(version_id)
+                file_msg = StagedFileMessage.wrap(file_msg, writer)
+
+        try:
+            res = await self._store.upload(file_msg)
+        except BaseException:
+            if writer is not None:
+                await writer.abort()
+            raise
+        if writer is not None:
+            await writer.close()
 
         # Replicate the freshly uploaded parts into the mirror stores. The
         # mapping travels back to the caller inside the SentFileMessage
         # objects and ends up in TGFSFileVersion.mirrors / .replicas.
         if self._mirror_group and self._inline_mirroring and res:
             copies = await self._mirror_group.mirror_parts(
-                [m.message_id for m in res], [m.size for m in res]
+                [m.message_id for m in res],
+                [m.size for m in res],
+                cache=version_cache_for(
+                    self._cache, self._cache_scope, version_id, sum(m.size for m in res)
+                ),
             )
             for store_key, mirror_ids in copies.mirrors.items():
                 for sent, mirror_id in zip(res, mirror_ids):
                     sent.mirrors[store_key] = mirror_id
             res[0].replicas.update(copies.replicas)
+            # Inline mirroring is complete here; with a partial result the
+            # replication queue is not involved, so nothing would unpin.
+            if self._cache is not None and version_id:
+                self._cache.release(version_id)
         return res
 
     async def update(self, message_id: int, buffer: bytes, name: str) -> int:
