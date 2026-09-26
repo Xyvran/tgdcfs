@@ -210,6 +210,62 @@ class TestBudget:
         assert cache.entry("a") is None
         assert cache.entry("b") is not None and cache.entry("c") is not None
 
+    async def test_read_fills_never_push_the_cache_over_the_budget(self, tmp_path):
+        """Two reads reserve entries while nothing is on disk yet; filling
+        them must evict, or stop caching, rather than exceed max_size."""
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        a = cache.reserve("fs", "a", 4 * quarter)
+        b = cache.reserve("fs", "b", 4 * quarter)
+        assert a is not None and b is not None
+
+        for i in range(4):
+            await cache.write_blocks("a", i * quarter, b"a" * quarter)
+            assert cache.used_bytes() <= cache.config.max_size_bytes
+        for i in range(4):
+            await cache.write_blocks("b", i * quarter, b"b" * quarter)
+            assert cache.used_bytes() <= cache.config.max_size_bytes
+
+        # The older entry made room for the newer one.
+        assert cache.entry("a") is None
+        assert cache.complete("b")
+        assert await read_all(cache, "b") == b"b" * (4 * quarter)
+
+    async def test_a_read_fill_stops_caching_when_only_pinned_entries_remain(
+        self, tmp_path
+    ):
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        assert cache.reserve("fs", "a", 4 * quarter) is not None
+        assert cache.reserve("fs", "b", 4 * quarter) is not None
+        cache.pin("a")
+        for i in range(4):
+            await cache.write_blocks("a", i * quarter, b"a" * quarter)
+
+        await cache.write_blocks("b", 0, b"b" * quarter)
+
+        assert cache.used_bytes() == cache.config.max_size_bytes
+        assert cache.complete("a")
+        assert entry_of(cache, "b").present_bytes() == 0
+        assert not cache.has_range("b", 0, quarter - 1)
+
+    async def test_a_fill_in_flight_is_charged_before_it_lands(self, tmp_path):
+        """The budget is claimed when a write starts, not when it is on
+        disk, so a concurrent admission cannot use the same bytes."""
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        assert cache.reserve("fs", "a", 4 * quarter) is not None
+        started = cache.write_blocks("a", 0, b"a" * (4 * quarter))
+        import asyncio
+
+        task = asyncio.ensure_future(started)
+        await asyncio.sleep(0)  # the write is on its way to disk
+
+        assert cache.used_bytes() == 4 * quarter
+        assert cache.open_staging("fs", "b", quarter) is None
+        await task
+        assert cache.used_bytes() == 4 * quarter
+
     async def test_versions_above_the_file_limit_are_not_cached(self, tmp_path):
         cache = make_cache(tmp_path, max_file_size_mb=1)
         assert cache.open_staging("fs", "huge", 2 * 1024 * 1024) is None

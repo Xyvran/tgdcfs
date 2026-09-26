@@ -173,7 +173,9 @@ tgdcfs:
   # so repeated reads are served from disk. The cache is also what makes
   # ``write_ack: cache`` and parallel uploads to Telegram possible.
   #
-  # ``max_size_mb`` bounds the directory (0 = unlimited), ``max_files``
+  # ``max_size_mb`` is a hard ceiling for the directory (0 = unlimited):
+  # when no unpinned entry can be evicted, a version is simply not
+  # cached and the transfer goes on without the cache. ``max_files`` bounds
   # the number of cached versions (0 = unlimited) and a version above
   # ``max_file_size_mb`` is neither staged nor cached. Entries a mirror is
   # still waiting for are pinned and never evicted, so the budget has to

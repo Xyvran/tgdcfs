@@ -387,16 +387,22 @@ tgdcfs:
     keep_for_reads: true     # keep entries after replication and fill them from downloads
 ```
 
-**Sizing.** `max_size_mb` is the hard ceiling for the directory;
-`max_files` and `max_file_size_mb` bound the count and the largest
-single version. Eviction is least-recently-used over the entries no
-mirror is waiting for; an entry a mirror still needs is *pinned* and
-never evicted, so the budget has to hold the uploads that are still in
-flight to their mirrors on top of what you want to keep for reads. A
-version that does not fit is not cached, and an upload the cache cannot
-take is mirrored the old way. Pins survive a restart. In Docker, `dir`
-resolves inside the mounted data directory, next to `config.yaml`, so
-the volume has to have the room.
+**Sizing.** `max_size_mb` is a hard ceiling for the bytes in the
+directory; `max_files` and `max_file_size_mb` bound the count and the
+largest single version. A staged upload is charged its full size the
+moment it is admitted, a read-cache entry is charged the blocks it
+holds, and every block claims its bytes before it is written, so the
+sum never exceeds the budget. Eviction is least-recently-used over the
+entries no mirror is waiting for; an entry a mirror still needs is
+*pinned* and never evicted, so the budget has to hold the uploads that
+are still in flight to their mirrors on top of what you want to keep
+for reads. When the room cannot be made, a new version is not cached, a
+read fill stops caching and continues from the stores, and an upload
+the cache cannot take is mirrored the old way. Pins survive a restart.
+Entries are sparse files: `ls -l` shows a version's full size, `du`
+shows what is on disk, and the budget counts the latter. In Docker,
+`dir` resolves inside the mounted data directory, next to
+`config.yaml`, so the volume has to have the room.
 
 **Ciphertext.** With at-rest encryption on, the cache holds exactly
 what the stores hold: ciphertext. Nothing in the cache directory is

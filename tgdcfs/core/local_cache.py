@@ -28,13 +28,17 @@ Versions are immutable, so an entry can never be stale.
 Budget
 ------
 
-``max_size`` (bytes present, plus the full size of entries still being
-written), ``max_files`` (entries) and ``max_file_size`` (larger versions
-are never cached). Eviction is LRU by last access over *unpinned*
-entries; a pinned entry (its mirrors still need it) is never evicted.
-When the budget cannot be met a new entry is refused, and the caller
-carries on without the cache. Every disk error is handled the same way:
-the cache steps aside, the transfer goes on.
+``max_size`` is a hard ceiling: an entry being staged is charged its
+full size from the moment it is admitted, a read-cache entry is charged
+the blocks it holds plus the blocks a fill is writing right now, and
+every write claims its bytes before it touches the disk, so the sum
+never exceeds the budget. ``max_files`` bounds the entries and
+``max_file_size`` the largest version cached. Eviction is LRU by last
+access over *unpinned* entries; a pinned entry (its mirrors still need
+it) is never evicted. When the budget cannot be met a new entry is
+refused, or a fill stops caching, and the caller carries on without the
+cache. Every disk error is handled the same way: the cache steps aside,
+the transfer goes on.
 """
 
 from __future__ import annotations
@@ -85,6 +89,9 @@ class CacheEntry:
     # True while a StagingWriter appends to it: the whole size is charged
     # against the budget, not just the blocks written so far.
     writing: bool = False
+    # Bytes a read-cache fill has claimed from the budget but not yet
+    # marked present: the write is on its way to disk. Never persisted.
+    inflight: int = 0
 
     @property
     def blocks(self) -> int:
@@ -99,7 +106,7 @@ class CacheEntry:
         return sum(self.block_length(i) for i, p in enumerate(self.present) if p)
 
     def charged_bytes(self) -> int:
-        return self.size if self.writing else self.present_bytes()
+        return self.size if self.writing else self.present_bytes() + self.inflight
 
     def is_complete(self) -> bool:
         return self.size == 0 or all(self.present)
@@ -551,18 +558,29 @@ class LocalCache:
             return False
         return True
 
-    def _make_room(self, size: int) -> bool:
-        """Evict unpinned entries, oldest first, until ``size`` more bytes fit."""
+    def _make_room(
+        self, size: int, new_entry: bool = True, keep: Optional[CacheEntry] = None
+    ) -> bool:
+        """Evict unpinned entries, oldest first, until ``size`` more bytes fit.
+
+        ``new_entry`` also claims one of ``max_files``; ``keep`` is the
+        entry the bytes are for, which is never its own victim. Entries
+        being written or filled right now are not victims either.
+        """
         cfg = self.config
         while True:
             over_bytes = (
                 cfg.max_size_bytes and self.used_bytes() + size > cfg.max_size_bytes
             )
-            over_files = cfg.max_files and len(self._entries) + 1 > cfg.max_files
+            over_files = (
+                new_entry and cfg.max_files and len(self._entries) + 1 > cfg.max_files
+            )
             if not over_bytes and not over_files:
                 return True
             victims = [
-                e for e in self._entries.values() if e.pins == 0 and not e.writing
+                e
+                for e in self._entries.values()
+                if e.pins == 0 and not e.writing and not e.inflight and e is not keep
             ]
             if not victims:
                 return False
@@ -622,6 +640,8 @@ class LocalCache:
         return StagingWriter(self, entry)
 
     def _mark_present(self, entry: CacheEntry, blocks: Iterable[int]) -> None:
+        if self._entries.get(entry.version_id) is not entry:
+            return  # evicted while the bytes were on their way
         changed = [i for i in blocks if not entry.present[i]]
         if not changed:
             return
@@ -651,20 +671,36 @@ class LocalCache:
             return
         if begin % entry.block_size != 0 or begin + len(data) > entry.size:
             return
+        first = begin // entry.block_size
+        end_offset = begin + len(data)
+        last_full = end_offset // entry.block_size  # exclusive
+        if end_offset >= entry.size:
+            last_full = entry.blocks
+        blocks = range(first, last_full)
+        if not blocks:
+            return  # no whole block to keep; never write bytes the budget ignores
+        # Claim the budget before the bytes reach the disk: the write
+        # suspends, and an entry admitted meanwhile must not count on
+        # the same room. Blocks already present are already charged.
+        added = sum(entry.block_length(i) for i in blocks if not entry.present[i])
+        if added and not self._make_room(added, new_entry=False, keep=entry):
+            self._refuse(
+                f"the budget is taken by entries the mirrors still need; "
+                f"{version_id} is only partly cached"
+            )
+            return
+        entry.inflight += added
         try:
             await asyncio.to_thread(
                 self._pwrite, self.data_path(version_id), begin, data
             )
         except OSError as ex:
             logger.warning(f"Cache: writing blocks of {version_id} failed: {ex}")
+            entry.inflight -= added
             self.remove(version_id)
             return
-        first = begin // entry.block_size
-        end_offset = begin + len(data)
-        last_full = end_offset // entry.block_size  # exclusive
-        if end_offset >= entry.size:
-            last_full = entry.blocks
-        self._mark_present(entry, range(first, last_full))
+        entry.inflight -= added
+        self._mark_present(entry, blocks)
         entry.last_access = time.time()
 
     @staticmethod
