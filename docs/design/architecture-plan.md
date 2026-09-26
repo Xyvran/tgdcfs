@@ -638,11 +638,21 @@ configs; manager UI for queue and backfill progress.
 **Phase 5: local cache and multi-source reads (large).** Sections 4.10
 and 4.11, in this order so each step ships on its own:
 
+Every step that adds a config field adds it to the config generator
+(`tgdcfs-gh-pages/app/config-generator`) in the same step, with the
+loader's validation mirrored in the form and the field left out of the
+YAML when it equals the default (as `sync` is since Phase 4). A field
+the generator does not know is a field the next deployment gets wrong.
+
 1. `LocalCache` with index, budget, LRU eviction, pins and the startup
    sweep; the `cache` config block; write staging through the wrapped
    upload message; `VersionBytes` as the source of `_replicate` and
    `_reupload_one` with the download fallback; the replication worker
-   unpins on success. Delivers "mirroring without the read-back".
+   unpins on success. Generator: a "Local cache" section (enabled,
+   directory, budget by size, files and per-version size, block size,
+   stage uploads, keep for reads) with the hint that the cache holds
+   ciphertext and lives on the data volume. Delivers "mirroring without
+   the read-back".
 2. Read cache: `get()` serves present blocks from disk, fills missing
    whole blocks from the stores; the delete fan-out drops entries;
    `GET /api/cache` with size, entries, pinned bytes and hit ratio and
@@ -650,10 +660,13 @@ and 4.11, in this order so each step ships on its own:
 3. Multi-source scheduler behind `read_parallel`: piece queue, per-store
    slots, reorder window, per-piece failover and benching, the mapping
    through each store's layout, `read_sources`. The Telegram-internal
-   piece split becomes one store's way of filling its slots.
+   piece split becomes one store's way of filling its slots. Generator:
+   `read_parallel` and `read_sources` on the file system form, the
+   sources limited to the file system's own stores, and a hint that the
+   toggle only pays off with more than one readable store.
 4. Docs: README sections for the cache (disk sizing, the volume, what
-   is stored and that it is ciphertext) and for parallel reads; config
-   generator fields; demo config.
+   is stored and that it is ciphertext) and for parallel reads;
+   getting-started page; demo config.
 
 Tests per step against the fake channels: staging fills the cache and
 the mirror never calls `download_file`; a full cache leaves a write
