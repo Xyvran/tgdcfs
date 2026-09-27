@@ -1,6 +1,6 @@
 import datetime
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Self
+from typing import Any, Dict, Iterable, List, Optional, Self
 
 from tgdcfs.backends.base import normalize_store_key
 from tgdcfs.errors import (
@@ -64,6 +64,95 @@ class TGFSFileRef:
         self.location.delete_file_ref(self)
 
 
+class FileRefList(list[TGFSFileRef]):
+    """The file refs of a directory, with an index by name.
+
+    Every stat of a file looks its ref up by name, and a WebDAV listing
+    stats each member of the folder: with a plain list that is one scan
+    of the folder per member, which blocked the event loop for tens of
+    seconds on a folder of ten thousand files. The index makes the
+    lookup constant. Every way of changing the list goes through the
+    overridden methods, so the index never drifts from the list; refs
+    are indexed by identity because ``TGFSFileRef.__eq__`` compares the
+    whole tree behind ``location``.
+    """
+
+    def __init__(self, refs: Iterable[TGFSFileRef] = ()):
+        super().__init__(refs)
+        self._by_name: Dict[str, List[TGFSFileRef]] = {}
+        for ref in self:
+            self._index(ref)
+
+    def _index(self, ref: TGFSFileRef) -> None:
+        self._by_name.setdefault(ref.name, []).append(ref)
+
+    def _unindex(self, ref: TGFSFileRef) -> None:
+        refs = self._by_name.get(ref.name)
+        if refs is None:
+            return
+        refs[:] = [r for r in refs if r is not ref]
+        if not refs:
+            del self._by_name[ref.name]
+
+    def _reindex(self) -> None:
+        self._by_name = {}
+        for ref in self:
+            self._index(ref)
+
+    def named(self, name: str) -> List[TGFSFileRef]:
+        """The refs called ``name``, in list order."""
+        return list(self._by_name.get(name, ()))
+
+    # -- list mutators -----------------------------------------------------
+
+    def append(self, ref: TGFSFileRef) -> None:
+        super().append(ref)
+        self._index(ref)
+
+    def extend(self, refs: Iterable[TGFSFileRef]) -> None:
+        for ref in refs:
+            self.append(ref)
+
+    def insert(self, index: Any, ref: TGFSFileRef) -> None:
+        super().insert(index, ref)
+        self._index(ref)
+
+    def remove(self, ref: TGFSFileRef) -> None:
+        super().remove(ref)
+        self._unindex(ref)
+
+    def pop(self, index: Any = -1) -> TGFSFileRef:
+        ref = super().pop(index)
+        self._unindex(ref)
+        return ref
+
+    def clear(self) -> None:
+        super().clear()
+        self._by_name = {}
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        super().__setitem__(index, value)
+        self._reindex()
+
+    def __delitem__(self, index: Any) -> None:
+        super().__delitem__(index)
+        self._reindex()
+
+    def __iadd__(self, refs: Iterable[TGFSFileRef]) -> "FileRefList":  # type: ignore[override,misc]
+        self.extend(refs)
+        return self
+
+    def __imul__(self, n: Any) -> "FileRefList":  # type: ignore[override,misc]
+        super().__imul__(n)
+        self._reindex()
+        return self
+
+    def __reduce__(self) -> Any:
+        # Copies (``copy.deepcopy``, pickling) rebuild the index from the
+        # items instead of carrying a stale one over.
+        return (FileRefList, (list(self),))
+
+
 @dataclass
 class TGFSDirectory:
     name: str
@@ -75,6 +164,13 @@ class TGFSDirectory:
 
     def __post_init__(self):
         validate_name(self.name)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        # ``files`` is assigned by the dataclass initialiser and by
+        # ``from_dict``; whatever list arrives is kept as the indexed one.
+        if key == "files" and not isinstance(value, FileRefList):
+            value = FileRefList(value)
+        super().__setattr__(key, value)
 
     @property
     def created_at_timestamp(self) -> int:
@@ -164,7 +260,8 @@ class TGFSDirectory:
     def find_dirs(self, names: Iterable[str] = tuple()) -> List["TGFSDirectory"]:
         if not names:
             return self.children
-        return [child for child in self.children if child.name in frozenset(names)]
+        wanted = frozenset(names)
+        return [child for child in self.children if child.name in wanted]
 
     def find_dir(self, name: str) -> "TGFSDirectory":
         dirs = self.find_dirs([name])
@@ -175,7 +272,20 @@ class TGFSDirectory:
     def find_files(self, names: Iterable[str] = tuple()) -> List[TGFSFileRef]:
         if not names:
             return self.files
-        return [file for file in self.files if file.name in frozenset(names)]
+        wanted = tuple(names)
+        if len(wanted) == 1:
+            # The common case (stat of one file): served from the index.
+            return self._indexed_files().named(wanted[0])
+        wanted_set = frozenset(wanted)
+        return [file for file in self.files if file.name in wanted_set]
+
+    def _indexed_files(self) -> FileRefList:
+        files = self.files
+        if not isinstance(files, FileRefList):
+            # A subclass or a caller could bypass ``__setattr__``; be safe.
+            files = FileRefList(files)
+            self.files = files
+        return files
 
     def find_file(self, name: str) -> TGFSFileRef:
         files = self.find_files([name])
