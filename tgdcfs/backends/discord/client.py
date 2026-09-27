@@ -140,6 +140,14 @@ class DiscordBotAPI:
         )
         return SentMessage(message_id=message.id)
 
+    async def get_author_id(self, channel_id: int, message_id: int) -> int:
+        """The user id of whoever sent the message.
+
+        Discord lets a bot edit its own messages only; the store uses
+        this to hand an edit to the bot that sent the message.
+        """
+        return (await self._fetch(channel_id, message_id)).author.id
+
     async def edit_text(self, channel_id: int, message_id: int, text: str) -> int:
         message = await self._fetch(channel_id, message_id)
         # A text-only message; drop any attachment an overflow left behind.
@@ -305,6 +313,11 @@ class DiscordBotAPI:
     def user_name(self) -> str:
         user = self._bot.user
         return user.name if user else self.name
+
+    @property
+    def user_id(self) -> Optional[int]:
+        user = self._bot.user
+        return user.id if user else None
 
 
 # A login is retried on Discord-side failures (5xx from the API, a refused

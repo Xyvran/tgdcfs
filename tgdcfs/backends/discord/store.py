@@ -1,6 +1,6 @@
 """The Discord store: one channel, addressed through a pool of bots.
 
-Discord differs from Telegram in three ways that shape this class:
+Discord differs from Telegram in four ways that shape this class:
 
 * a message carries at most a few tens of megabytes, so ``upload``
   partitions files into many small parts and buffers one part at a time;
@@ -8,7 +8,11 @@ Discord differs from Telegram in three ways that shape this class:
   not fit is sent as a small JSON attachment ("overflow") and read back
   transparently;
 * there is no server-side copy, so ``copy_within`` re-uploads and
-  ``copy_from`` always reports that the caller has to re-upload.
+  ``copy_from`` always reports that the caller has to re-upload;
+* a bot may edit its own messages only (a channel admin right does not
+  extend to other bots' posts, unlike Telegram), so an edit has to be
+  made by the bot that sent the message: the store remembers who sent
+  what and looks the author up for messages from before its start.
 
 Adapted from the dcfs project (Apache 2.0, see NOTICE).
 """
@@ -18,7 +22,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from itertools import cycle
-from typing import AsyncIterator, Iterable, List, Optional, Sequence
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+)
+
+from lru import LRU  # type: ignore
 
 from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
 from tgdcfs.errors import MessageNotFound, TechnicalError
@@ -32,7 +47,7 @@ from tgdcfs.reqres import (
 )
 from tgdcfs.utils.message_cache import channel_cache
 
-from .client import DiscordBotAPI, is_transient
+from .client import DiscordBotAPI, SentMessage, is_transient
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +64,22 @@ OVERFLOW_CAPTION = "TGDCFS_OVERFLOW"
 
 # Reads a part in this many bytes at a time while buffering it.
 READ_CHUNK = 1024 * 1024
+
+# Discord's error code for an edit of a message another user sent.
+CANNOT_EDIT_FOREIGN_MESSAGE = 50005
+
+# How many message ids the store remembers the sending bot of. Descriptor
+# messages, the ones that get edited, are few; content parts are many and
+# are rarely edited, and a forgotten entry only costs one lookup.
+AUTHOR_CACHE_SIZE = 16384
+
+
+def is_foreign_message_error(ex: Exception) -> bool:
+    """Whether Discord refused an edit because another user sent the message."""
+    return (
+        getattr(ex, "status", None) == 403
+        and getattr(ex, "code", None) == CANNOT_EDIT_FOREIGN_MESSAGE
+    )
 
 
 class DiscordStore(IStore):
@@ -77,6 +108,8 @@ class DiscordStore(IStore):
         self._upload_slots = asyncio.Semaphore(max_concurrent_uploads)
         self._download_slots = asyncio.Semaphore(max_concurrent_downloads)
         self._max_concurrent_downloads = max_concurrent_downloads
+        # Message id -> the bot that sent it, for edits (see the module doc).
+        self._authors = LRU(AUTHOR_CACHE_SIZE)  # type: LRU[int, DiscordBotAPI]
 
     @property
     def backend(self) -> str:
@@ -120,18 +153,90 @@ class DiscordStore(IStore):
             f"{self._max_retries} attempts: {last}"
         ) from last
 
+    # -- who sent what -----------------------------------------------------
+
+    async def _send(
+        self, what: str, action: Callable[[DiscordBotAPI], Awaitable[SentMessage]]
+    ) -> SentMessage:
+        """Send with the next bot of the pool and remember it as the author.
+
+        Each attempt takes the next bot, so a retry after a rate limit
+        lands on another connection; the bot of the attempt that went
+        through is the one that may edit the message later.
+        """
+        used: List[DiscordBotAPI] = []
+
+        async def attempt() -> SentMessage:
+            bot = self.next_bot
+            used.append(bot)
+            return await action(bot)
+
+        sent = await self._retry(what, attempt)
+        self._authors[sent.message_id] = used[-1]
+        return sent
+
+    async def _author_bot(
+        self, message_id: int, refresh: bool = False
+    ) -> DiscordBotAPI:
+        """The bot that sent ``message_id``, the only one that may edit it.
+
+        Messages this process sent are remembered; any other message is
+        fetched once and its author matched against the pool. A message
+        whose author is not in the pool anymore (the token was removed
+        from the configuration) cannot be edited by anyone here, so it
+        is reported as not found: callers replace a missing message
+        with a fresh copy, which is the only way forward.
+        """
+        if not refresh and (known := self._authors.get(message_id)) is not None:
+            return known
+        author = await self._retry(
+            f"author of {message_id}",
+            lambda: self.next_bot.get_author_id(self.channel_id, message_id),
+        )
+        for bot in self._bots:
+            if bot.user_id == author:
+                self._authors[message_id] = bot
+                return bot
+        logger.warning(
+            f"Discord message {message_id} in store {self.key} was sent by user "
+            f"{author}, which is none of the configured bots; it cannot be edited "
+            f"and is replaced by a fresh message"
+        )
+        raise MessageNotFound(message_id=message_id)
+
+    async def _edit(
+        self,
+        what: str,
+        message_id: int,
+        action: Callable[[DiscordBotAPI], Awaitable[Any]],
+    ) -> Any:
+        """Run an edit of ``message_id`` with the bot that sent it.
+
+        Should Discord still refuse the edit as another user's message
+        (the remembered author was wrong), the author is looked up again
+        and the edit tried once more with that bot.
+        """
+        bot = await self._author_bot(message_id)
+        try:
+            return await self._retry(what, lambda: action(bot))
+        except Exception as ex:
+            if not is_foreign_message_error(ex):
+                raise
+        bot = await self._author_bot(message_id, refresh=True)
+        return await self._retry(what, lambda: action(bot))
+
     # -- text messages -----------------------------------------------------
 
     async def send_text(self, message: str) -> int:
         cache = channel_cache(self.channel_id).id
         if len(message) <= MAX_TEXT_CHARS:
-            sent = await self._retry(
-                "send_text", lambda: self.next_bot.send_text(self.channel_id, message)
+            sent = await self._send(
+                "send_text", lambda bot: bot.send_text(self.channel_id, message)
             )
         else:
-            sent = await self._retry(
+            sent = await self._send(
                 "send_text (overflow)",
-                lambda: self.next_bot.send_file(
+                lambda bot: bot.send_file(
                     self.channel_id,
                     message.encode("utf-8"),
                     OVERFLOW_FILENAME,
@@ -146,14 +251,16 @@ class DiscordStore(IStore):
     async def edit_message_text(self, message_id: int, message: str) -> int:
         cache = channel_cache(self.channel_id).id
         if len(message) <= MAX_TEXT_CHARS:
-            mid = await self._retry(
+            mid = await self._edit(
                 "edit_message_text",
-                lambda: self.next_bot.edit_text(self.channel_id, message_id, message),
+                message_id,
+                lambda bot: bot.edit_text(self.channel_id, message_id, message),
             )
         else:
-            mid = await self._retry(
+            mid = await self._edit(
                 "edit_message_text (overflow)",
-                lambda: self.next_bot.edit_file(
+                message_id,
+                lambda bot: bot.edit_file(
                     self.channel_id,
                     message_id,
                     message.encode("utf-8"),
@@ -217,9 +324,9 @@ class DiscordStore(IStore):
 
     async def _send_part(self, data: bytes, name: str) -> SentFileMessage:
         async with self._upload_slots:
-            sent = await self._retry(
+            sent = await self._send(
                 f"upload of {name}",
-                lambda: self.next_bot.send_file(self.channel_id, data, name),
+                lambda bot: bot.send_file(self.channel_id, data, name),
             )
         return SentFileMessage(message_id=sent.message_id, size=len(data))
 
@@ -286,9 +393,10 @@ class DiscordStore(IStore):
                 f"A {len(buffer)}-byte document does not fit one Discord message "
                 f"({self._max_part_bytes} bytes)"
             )
-        mid = await self._retry(
+        mid = await self._edit(
             f"replace_document {message_id}",
-            lambda: self.next_bot.edit_file(self.channel_id, message_id, buffer, name),
+            message_id,
+            lambda bot: bot.edit_file(self.channel_id, message_id, buffer, name),
         )
         cache = channel_cache(self.channel_id).id
         if (cached := cache.get(mid)) is not None and cached.document is not None:
