@@ -1,9 +1,11 @@
+import copy
 import datetime
+import time
 import pytest
 from unittest.mock import Mock
 
 from tgdcfs.core.model import TGFSFileRefSerialized
-from tgdcfs.core.model.directory import TGFSDirectory, TGFSFileRef
+from tgdcfs.core.model.directory import FileRefList, TGFSDirectory, TGFSFileRef
 from tgdcfs.errors import (
     FileOrDirectoryAlreadyExists,
     FileOrDirectoryDoesNotExist,
@@ -712,3 +714,109 @@ class TestDirectoryRelocation:
             moving.move_to(dest)
 
         assert moving.parent is src
+
+
+class TestFileIndex:
+    """``find_files`` by name is served from an index that follows every
+    change of the ``files`` list."""
+
+    @staticmethod
+    def _dir_with(*names: str) -> TGFSDirectory:
+        d = TGFSDirectory.root_dir()
+        for i, name in enumerate(names, start=1):
+            d.create_file_ref(name, i)
+        return d
+
+    def test_files_are_indexed(self):
+        d = self._dir_with("a", "b", "c")
+        assert isinstance(d.files, FileRefList)
+        assert d.find_file("b").message_id == 2
+        assert d.find_files(["c", "a"]) == [d.files[0], d.files[2]]
+        assert d.find_files(["nope"]) == []
+        with pytest.raises(FileOrDirectoryDoesNotExist):
+            d.find_file("nope")
+
+    def test_index_follows_the_list(self):
+        d = self._dir_with("a", "b")
+        extra = TGFSFileRef(message_id=9, name="z", location=d)
+
+        d.files.append(extra)
+        assert d.find_file("z") is extra
+
+        d.files.remove(extra)
+        assert d.find_files(["z"]) == []
+
+        d.files.insert(0, extra)
+        assert d.find_file("z") is extra
+        assert d.files.pop(0) is extra
+        assert d.find_files(["z"]) == []
+
+        d.files[0] = extra
+        assert d.find_file("z") is extra
+        assert d.find_files(["a"]) == []
+
+        del d.files[0]
+        assert d.find_files(["z"]) == []
+        assert d.find_file("b").message_id == 2
+
+        d.files += [extra]
+        assert d.find_file("z") is extra
+
+        d.files.clear()
+        assert d.find_files(["b"]) == []
+        assert d.find_files() == []
+
+    def test_assigning_a_plain_list_keeps_the_index(self):
+        d = self._dir_with("a")
+        ref = TGFSFileRef(message_id=5, name="n", location=d)
+        d.files = [ref]
+        assert isinstance(d.files, FileRefList)
+        assert d.find_file("n") is ref
+        assert d.find_files(["a"]) == []
+
+    def test_from_dict_is_indexed(self):
+        d = TGFSDirectory.from_dict(
+            {
+                "type": "D",
+                "name": "root",
+                "children": [],
+                "files": [
+                    {"type": "FR", "name": "x.txt", "messageId": 1},
+                    {"type": "FR", "name": "y.txt", "messageId": 2},
+                ],
+            }
+        )
+        assert d.find_file("y.txt").message_id == 2
+
+    def test_duplicate_names_keep_list_order(self):
+        d = TGFSDirectory.root_dir()
+        first = TGFSFileRef(message_id=1, name="dup", location=d)
+        second = TGFSFileRef(message_id=2, name="dup", location=d)
+        d.files.extend([first, second])
+        assert d.find_files(["dup"]) == [first, second]
+        d.files.remove(first)
+        assert d.find_files(["dup"]) == [second]
+
+    def test_deleting_a_ref_drops_it_from_the_index(self):
+        d = self._dir_with("a", "b")
+        d.find_file("a").delete()
+        assert d.find_files(["a"]) == []
+        assert [f.name for f in d.files] == ["b"]
+
+    def test_copies_rebuild_the_index(self):
+        d = self._dir_with("a", "b")
+        c = copy.deepcopy(d)
+        assert isinstance(c.files, FileRefList)
+        assert c.find_file("b").message_id == 2
+        assert c.find_file("b") is not d.find_file("b")
+
+    def test_lookup_does_not_scan_the_folder(self):
+        # Ten thousand stats of a ten-thousand-file folder: a scan per
+        # stat took tens of seconds and blocked the event loop.
+        d = TGFSDirectory.root_dir()
+        for i in range(10_000):
+            d.attach_file_ref(f"file-{i}.bin", i + 1)
+        started = time.monotonic()
+        for i in range(10_000):
+            assert d.find_file(f"file-{i}.bin").message_id == i + 1
+        assert time.monotonic() - started < 5.0
