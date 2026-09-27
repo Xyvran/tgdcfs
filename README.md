@@ -196,6 +196,13 @@ Discord store partitions files into attachments of
 exceed a bot's 2000 characters as a small JSON attachment, and streams
 downloads from the CDN with HTTP range requests.
 
+Several bot tokens share the work round-robin. A Discord bot may edit
+its own messages only, so an edit of a descriptor or a replaced
+attachment is always made by the bot that sent the message: the store
+remembers who sent what and looks the sender of an older message up
+once. A message whose sender was removed from `bot_tokens` cannot be
+edited by anyone and is replaced by a fresh one on its next change.
+
 ```yaml
 backends:
   discord:

@@ -116,6 +116,21 @@ class TestMessages:
         with pytest.raises(MessageNotFound):
             await api.edit_text(CHANNEL, 1, "x")
         assert await api.get_message(CHANNEL, 1) is None
+        with pytest.raises(MessageNotFound):
+            await api.get_author_id(CHANNEL, 1)
+
+    async def test_author_of_a_message(self, api, channel):
+        message = make_message(15)
+        message.author.id = 777
+        channel.fetch_message.return_value = message
+        assert await api.get_author_id(CHANNEL, 15) == 777
+        channel.fetch_message.assert_awaited_once_with(15)
+
+    def test_user_id(self, api):
+        api._bot.user.id = 42
+        assert api.user_id == 42
+        api._bot.user = None
+        assert api.user_id is None
 
     async def test_get_messages_maps_attachments(self, api, channel):
         channel.fetch_message.side_effect = [

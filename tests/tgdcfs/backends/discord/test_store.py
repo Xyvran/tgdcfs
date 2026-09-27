@@ -1,5 +1,6 @@
 """DiscordStore on a fake bot: overflow, partitioning, retries, deletion."""
 
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -25,18 +26,52 @@ from tgdcfs.utils.message_cache import channel_cache
 CHANNEL = 4242
 
 
-class FakeBot(DiscordBotAPI):
-    """Records what the store asks for and serves it from memory."""
+@dataclass
+class FakeChannel:
+    """What the bots of one test share: the messages and who sent them."""
 
-    def __init__(self):
-        self.name = "fake"
-        self.messages: Dict[int, dict] = {}
-        self.next_id = 1000
+    messages: Dict[int, dict] = field(default_factory=dict)
+    authors: Dict[int, int] = field(default_factory=dict)
+    next_id: int = 1000
+
+
+class FakeBot(DiscordBotAPI):
+    """Records what the store asks for and serves it from memory.
+
+    Bots given the same ``FakeChannel`` see each other's messages, like
+    real bots in one channel; each message remembers which bot sent it,
+    and only that bot may edit it, as on Discord.
+    """
+
+    def __init__(self, user_id: int = 1, channel: Optional[FakeChannel] = None):
+        self.name = f"fake{user_id}"
+        self._user_id = user_id
+        self.channel = channel if channel is not None else FakeChannel()
         self.calls: List[str] = []
         self.fail_next: Dict[str, List[Exception]] = {}
         self.pinned: List[int] = []
         self.deleted: List[List[int]] = []
         self.honour_range = True
+
+    @property
+    def user_id(self) -> Optional[int]:
+        return self._user_id
+
+    @property
+    def messages(self) -> Dict[int, dict]:
+        return self.channel.messages
+
+    @property
+    def authors(self) -> Dict[int, int]:
+        return self.channel.authors
+
+    @property
+    def next_id(self) -> int:
+        return self.channel.next_id
+
+    @next_id.setter
+    def next_id(self, value: int) -> None:
+        self.channel.next_id = value
 
     def _maybe_fail(self, method: str) -> None:
         self.calls.append(method)
@@ -44,10 +79,23 @@ class FakeBot(DiscordBotAPI):
             raise queue.pop(0)
 
     def _add(self, text: str = "", data: Optional[bytes] = None, name: str = "") -> int:
-        mid = self.next_id
-        self.next_id += 1
+        mid = self.channel.next_id
+        self.channel.next_id += 1
         self.messages[mid] = {"text": text, "data": data, "name": name}
+        self.authors[mid] = self._user_id
         return mid
+
+    def _check_author(self, message_id: int) -> None:
+        if message_id not in self.messages:
+            raise MessageNotFound(message_id=message_id)
+        if self.authors.get(message_id, self._user_id) != self._user_id:
+            raise ForeignMessage()
+
+    async def get_author_id(self, channel_id, message_id):
+        self._maybe_fail("get_author_id")
+        if message_id not in self.messages:
+            raise MessageNotFound(message_id=message_id)
+        return self.authors.get(message_id, self._user_id)
 
     def _resp(self, mid: int) -> MessageResp:
         m = self.messages[mid]
@@ -72,15 +120,13 @@ class FakeBot(DiscordBotAPI):
 
     async def edit_text(self, channel_id, message_id, text):
         self._maybe_fail("edit_text")
-        if message_id not in self.messages:
-            raise MessageNotFound(message_id=message_id)
+        self._check_author(message_id)
         self.messages[message_id] = {"text": text, "data": None, "name": ""}
         return message_id
 
     async def edit_file(self, channel_id, message_id, data, name, caption=None):
         self._maybe_fail("edit_file")
-        if message_id not in self.messages:
-            raise MessageNotFound(message_id=message_id)
+        self._check_author(message_id)
         self.messages[message_id] = {"text": caption or "", "data": data, "name": name}
         return message_id
 
@@ -133,6 +179,13 @@ class Forbidden(Exception):
     status = 403
 
 
+class ForeignMessage(Exception):
+    """Discord's answer to an edit of another user's message."""
+
+    status = 403
+    code = 50005
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
     channel_cache(CHANNEL).id._lru.clear()
@@ -170,11 +223,101 @@ class TestBasics:
             DiscordStore([], CHANNEL)
 
     def test_bots_rotate(self):
-        a, b = FakeBot(), FakeBot()
+        a, b = FakeBot(1), FakeBot(2)
         store = DiscordStore([a, b], CHANNEL)
         assert store.next_bot is a
         assert store.next_bot is b
         assert store.next_bot is a
+
+
+def pool(*user_ids: int) -> List[FakeBot]:
+    """Bots that share one channel, so each sees the others' messages."""
+    channel = FakeChannel()
+    return [FakeBot(uid, channel) for uid in user_ids]
+
+
+class TestEditsGoToTheAuthor:
+    """A bot may edit its own messages only; the pool rotates for sends."""
+
+    async def test_edit_uses_the_bot_that_sent_the_message(self):
+        a, b = pool(1, 2)
+        store = DiscordStore([a, b], CHANNEL, retry_interval=0.0, max_retries=3)
+
+        mid = await store.send_text("v1")  # sent by a, the rotation moves on
+        assert a.calls == ["send_text"]
+
+        assert await store.edit_message_text(mid, "v2") == mid
+        assert a.messages[mid]["text"] == "v2"
+        assert "edit_text" in a.calls
+        assert "edit_text" not in b.calls
+        # Known author: no lookup was needed.
+        assert "get_author_id" not in a.calls + b.calls
+
+    async def test_overflow_edit_and_replace_document_too(self):
+        a, b = pool(1, 2)
+        store = DiscordStore(
+            [a, b], CHANNEL, max_part_bytes=10, retry_interval=0.0, max_retries=3
+        )
+        mid = await store.send_text("short")
+        long = "z" * (MAX_TEXT_CHARS + 1)
+        assert await store.edit_message_text(mid, long) == mid
+        assert a.messages[mid]["data"] == long.encode()
+        assert "edit_file" not in b.calls
+
+        sent = await store.upload(FileMessageFromBuffer.new(b"0123456789", "f"))
+        part = sent[0].message_id
+        author, other = (a, b) if a.authors[part] == 1 else (b, a)
+        other.calls.clear()
+        assert await store.replace_document(part, b"abc", "f") == part
+        assert author.messages[part]["data"] == b"abc"
+        assert "edit_file" not in other.calls
+
+    async def test_author_of_an_older_message_is_looked_up(self):
+        a, b = pool(1, 2)
+        first = DiscordStore([a, b], CHANNEL, retry_interval=0.0, max_retries=3)
+        mid = await first.send_text("before the restart")
+
+        # A fresh store (a restart) knows nothing about who sent what.
+        store = DiscordStore([b, a], CHANNEL, retry_interval=0.0, max_retries=3)
+        assert await store.edit_message_text(mid, "after") == mid
+        assert a.messages[mid]["text"] == "after"
+        assert "get_author_id" in b.calls  # the lookup went to the next bot
+        assert "edit_text" not in b.calls
+        assert "edit_text" in a.calls
+
+        # Looked up once, remembered from then on.
+        a.calls.clear()
+        b.calls.clear()
+        await store.edit_message_text(mid, "again")
+        assert "get_author_id" not in a.calls + b.calls
+
+    async def test_message_of_a_removed_bot_is_reported_missing(self, caplog):
+        a, b = pool(1, 2)
+        mid = await DiscordStore([a, b], CHANNEL).send_text("by a")
+
+        store = DiscordStore([b], CHANNEL, retry_interval=0.0, max_retries=3)
+        with pytest.raises(MessageNotFound):
+            await store.edit_message_text(mid, "x")
+        assert "edit_text" not in b.calls
+        assert "none of the configured bots" in caplog.text
+
+    async def test_a_wrong_remembered_author_is_corrected(self):
+        a, b = pool(1, 2)
+        store = DiscordStore([a, b], CHANNEL, retry_interval=0.0, max_retries=3)
+        mid = await store.send_text("v1")
+        store._authors[mid] = b  # a stale entry
+
+        assert await store.edit_message_text(mid, "v2") == mid
+        assert a.messages[mid]["text"] == "v2"
+        assert b.calls.count("edit_text") == 1  # refused once, not retried
+        assert "get_author_id" in a.calls + b.calls
+
+    async def test_foreign_message_error_is_recognised(self):
+        from tgdcfs.backends.discord.store import is_foreign_message_error
+
+        assert is_foreign_message_error(ForeignMessage())
+        assert not is_foreign_message_error(Forbidden())
+        assert not is_foreign_message_error(RateLimited())
 
 
 class TestText:
