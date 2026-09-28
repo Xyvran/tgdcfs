@@ -448,6 +448,9 @@ export const importConfig = (text: string): ImportedConfig => {
     : undefined;
   let withUserAccountUpload = false;
   let withUserAccountDownload = false;
+  // No Telegram block means a Discord-only deployment: the backend is off
+  // in the form, as Discord is when its block is missing.
+  config.telegram.enabled = telegram !== undefined;
   if (telegram) {
     notes.unknownKeys(telegramPath, telegram, [
       "api_id",

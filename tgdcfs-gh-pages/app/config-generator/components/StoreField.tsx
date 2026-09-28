@@ -13,6 +13,7 @@ import { ConfigTextField } from "./ConfigTextField";
 
 interface StoreFieldProps {
   store: StoreConfig;
+  telegramEnabled: boolean;
   discordEnabled: boolean;
   onUpdate: (field: keyof StoreConfig, value: string) => void;
   onDelete?: () => void;
@@ -22,6 +23,7 @@ interface StoreFieldProps {
 
 export function StoreField({
   store,
+  telegramEnabled,
   discordEnabled,
   onUpdate,
   onDelete,
@@ -51,7 +53,9 @@ export function StoreField({
             label="Backend"
             onChange={(e) => onUpdate("backend", e.target.value as Backend)}
           >
-            <MenuItem value="telegram">Telegram</MenuItem>
+            <MenuItem value="telegram" disabled={!telegramEnabled}>
+              Telegram{telegramEnabled ? "" : " (enable the backend first)"}
+            </MenuItem>
             <MenuItem value="discord" disabled={!discordEnabled}>
               Discord{discordEnabled ? "" : " (enable the backend first)"}
             </MenuItem>

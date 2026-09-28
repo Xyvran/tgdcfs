@@ -57,6 +57,7 @@ import {
 
 // Type-safe path mapping for updateConfig
 type ConfigUpdatePaths = {
+  "telegram.enabled": boolean;
   "telegram.api_id": string;
   "telegram.api_hash": string;
   "telegram.lib": "pyrogram" | "telethon";
@@ -105,7 +106,9 @@ export default function ConfigGenerator() {
     ): void => {
       const newConfig = { ...config };
 
-      if (path === "telegram.api_id") {
+      if (path === "telegram.enabled") {
+        newConfig.telegram.enabled = value as boolean;
+      } else if (path === "telegram.api_id") {
         newConfig.telegram.api_id = value as string;
       } else if (path === "telegram.api_hash") {
         newConfig.telegram.api_hash = value as string;
@@ -217,7 +220,10 @@ export default function ConfigGenerator() {
       ...config.stores,
       {
         name: `store-${config.stores.length + 1}`,
-        backend: config.discord.enabled ? "discord" : "telegram",
+        backend:
+          config.telegram.enabled || !config.discord.enabled
+            ? "telegram"
+            : "discord",
         channel: "",
       },
     ]);
@@ -286,6 +292,9 @@ export default function ConfigGenerator() {
     }
     if (store.backend === "discord" && !/^\d+$/.test(channel)) {
       errors.push("Discord channel ids are numeric");
+    }
+    if (store.backend === "telegram" && !config.telegram.enabled) {
+      errors.push("Enable the Telegram backend below");
     }
     if (store.backend === "discord" && !config.discord.enabled) {
       errors.push("Enable the Discord backend below");
@@ -510,7 +519,7 @@ export default function ConfigGenerator() {
 
     const configForYaml = {
       backends: {
-        ...(telegramUsed
+        ...(config.telegram.enabled && telegramUsed
           ? {
               telegram: {
                 api_id: config.telegram.api_id,
@@ -741,6 +750,7 @@ export default function ConfigGenerator() {
                 <StoreField
                   key={index}
                   store={store}
+                  telegramEnabled={config.telegram.enabled}
                   discordEnabled={config.discord.enabled}
                   onUpdate={(field, value) => updateStore(index, field, value)}
                   onDelete={
@@ -807,139 +817,161 @@ export default function ConfigGenerator() {
               </Button>
             </FormSection>
 
-            <FormSection title="Telegram">
-              {!telegramUsed && (
+            <FormSection title="Telegram (Optional)">
+              <FormControlLabel
+                label="Enable the Telegram backend"
+                control={
+                  <Checkbox
+                    checked={config.telegram.enabled}
+                    onChange={(e) =>
+                      updateConfig("telegram.enabled", e.target.checked)
+                    }
+                  />
+                }
+              />
+              {!config.telegram.enabled && (
+                <Alert severity="info">
+                  Telegram is off: no Telegram store can be used and the
+                  block is left out of the config. A Discord-only deployment
+                  needs the Discord backend below.
+                </Alert>
+              )}
+              {config.telegram.enabled && !telegramUsed && (
                 <Alert severity="info">
                   No store uses Telegram; this block is left out of the
                   config.
                 </Alert>
               )}
-              <Box
-                sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}
-              >
-                <Typography variant="h6">API Credentials</Typography>
-                <Button
-                  variant="outlined"
-                  size="small"
-                  component="a"
-                  href="https://my.telegram.org/apps"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  sx={{ textTransform: "none" }}
-                >
-                  Get API Keys
-                </Button>
-              </Box>
-              <FieldRow justifyContent="space-between">
-                <ConfigTextField
-                  label="API ID"
-                  value={config.telegram.api_id}
-                  onChange={(e) =>
-                    updateConfig("telegram.api_id", e.target.value)
-                  }
-                  style={{ flex: 1 }}
-                  required={telegramUsed}
-                />
-                <ConfigTextField
-                  label="API Hash"
-                  value={config.telegram.api_hash}
-                  onChange={(e) =>
-                    updateConfig("telegram.api_hash", e.target.value)
-                  }
-                  style={{ flex: 1 }}
-                  required={telegramUsed}
-                />
-                <FormControl size="small" sx={{ minWidth: 200 }}>
-                  <InputLabel>Telegram Library</InputLabel>
-                  <Select
-                    value={config.telegram.lib}
-                    label="Telegram Library"
-                    onChange={(e) =>
-                      updateConfig(
-                        "telegram.lib",
-                        e.target.value as "pyrogram" | "telethon"
-                      )
-                    }
+              {config.telegram.enabled && (
+                <>
+                  <Box
+                    sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}
                   >
-                    <MenuItem value="pyrogram">Pyrogram</MenuItem>
-                    <MenuItem value="telethon">Telethon</MenuItem>
-                  </Select>
-                </FormControl>
-              </FieldRow>
+                    <Typography variant="h6">API Credentials</Typography>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      component="a"
+                      href="https://my.telegram.org/apps"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      sx={{ textTransform: "none" }}
+                    >
+                      Get API Keys
+                    </Button>
+                  </Box>
+                  <FieldRow justifyContent="space-between">
+                    <ConfigTextField
+                      label="API ID"
+                      value={config.telegram.api_id}
+                      onChange={(e) =>
+                        updateConfig("telegram.api_id", e.target.value)
+                      }
+                      style={{ flex: 1 }}
+                      required={telegramUsed}
+                    />
+                    <ConfigTextField
+                      label="API Hash"
+                      value={config.telegram.api_hash}
+                      onChange={(e) =>
+                        updateConfig("telegram.api_hash", e.target.value)
+                      }
+                      style={{ flex: 1 }}
+                      required={telegramUsed}
+                    />
+                    <FormControl size="small" sx={{ minWidth: 200 }}>
+                      <InputLabel>Telegram Library</InputLabel>
+                      <Select
+                        value={config.telegram.lib}
+                        label="Telegram Library"
+                        onChange={(e) =>
+                          updateConfig(
+                            "telegram.lib",
+                            e.target.value as "pyrogram" | "telethon"
+                          )
+                        }
+                      >
+                        <MenuItem value="pyrogram">Pyrogram</MenuItem>
+                        <MenuItem value="telethon">Telethon</MenuItem>
+                      </Select>
+                    </FormControl>
+                  </FieldRow>
 
-              <FormControlLabel
-                label="Use user account to upload files (No benefit unless you are a premium user)"
-                control={
-                  <Checkbox
-                    checked={withUserAccountUpload}
-                    onChange={(e) => {
-                      setWithUserAccountUpload(e.target.checked);
-                    }}
-                  />
-                }
-              />
-              <FormControlLabel
-                label="Use user account to download files (No known benefit)"
-                control={
-                  <Checkbox
-                    checked={withUserAccountDownload}
-                    onChange={(e) => {
-                      setWithUserAccountDownload(e.target.checked);
-                    }}
-                  />
-                }
-              />
-
-              <Box>
-                <Box
-                  sx={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 2,
-                    mt: 2,
-                    mb: 2,
-                  }}
-                >
-                  <Typography variant="h6">Bot Tokens</Typography>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    component="a"
-                    href="https://t.me/botfather"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    sx={{ textTransform: "none" }}
-                  >
-                    @BotFather
-                  </Button>
-                </Box>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                  Every bot must be admin in every Telegram store, mirrors
-                  included. A primary channel with &quot;Restrict saving
-                  content&quot; enabled cannot be forwarded from; the auto copy
-                  mode then re-uploads.
-                </Typography>
-                {config.telegram.bot.tokens.map((token, index) => (
-                  <BotTokenField
-                    key={index}
-                    index={index}
-                    value={token}
-                    onChange={(value) => updateBotToken(index, value)}
-                    onDelete={
-                      index > 0 ? () => removeBotToken(index) : undefined
+                  <FormControlLabel
+                    label="Use user account to upload files (No benefit unless you are a premium user)"
+                    control={
+                      <Checkbox
+                        checked={withUserAccountUpload}
+                        onChange={(e) => {
+                          setWithUserAccountUpload(e.target.checked);
+                        }}
+                      />
                     }
                   />
-                ))}
-                <Button
-                  startIcon={<Add />}
-                  onClick={addBotToken}
-                  variant="outlined"
-                  size="small"
-                  sx={{ mt: 1 }}
-                >
-                  Add Another Bot Token
-                </Button>
-              </Box>
+                  <FormControlLabel
+                    label="Use user account to download files (No known benefit)"
+                    control={
+                      <Checkbox
+                        checked={withUserAccountDownload}
+                        onChange={(e) => {
+                          setWithUserAccountDownload(e.target.checked);
+                        }}
+                      />
+                    }
+                  />
+
+                  <Box>
+                    <Box
+                      sx={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 2,
+                        mt: 2,
+                        mb: 2,
+                      }}
+                    >
+                      <Typography variant="h6">Bot Tokens</Typography>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        component="a"
+                        href="https://t.me/botfather"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        sx={{ textTransform: "none" }}
+                      >
+                        @BotFather
+                      </Button>
+                    </Box>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                      Every bot must be admin in every Telegram store, mirrors
+                      included. A primary channel with &quot;Restrict saving
+                      content&quot; enabled cannot be forwarded from; the auto copy
+                      mode then re-uploads.
+                    </Typography>
+                    {config.telegram.bot.tokens.map((token, index) => (
+                      <BotTokenField
+                        key={index}
+                        index={index}
+                        value={token}
+                        onChange={(value) => updateBotToken(index, value)}
+                        onDelete={
+                          index > 0 ? () => removeBotToken(index) : undefined
+                        }
+                      />
+                    ))}
+                    <Button
+                      startIcon={<Add />}
+                      onClick={addBotToken}
+                      variant="outlined"
+                      size="small"
+                      sx={{ mt: 1 }}
+                    >
+                      Add Another Bot Token
+                    </Button>
+                  </Box>
+                </>
+              )}
             </FormSection>
 
             <FormSection title="Discord (Optional)">
@@ -1612,7 +1644,32 @@ export default function ConfigGenerator() {
                         ))}
                       </Select>
                     </FormControl>
+                    <ConfigTextField
+                      label="Tee Buffer per Mirror (MB)"
+                      type="number"
+                      value={config.tgdcfs.transfer.tee_buffer_mb}
+                      onChange={(e) =>
+                        updateConfig("tgdcfs.transfer", {
+                          ...config.tgdcfs.transfer,
+                          tee_buffer_mb: parseInt(e.target.value) || 1,
+                        })
+                      }
+                      width={220}
+                    />
                   </FieldRow>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    The tee buffer only matters for file systems with Sync set
+                    to Tee: it is how much of the upload stream waits per
+                    mirror between the primary&apos;s reads and the
+                    mirror&apos;s upload. A full buffer pauses the primary
+                    until the mirror catches up, so a larger buffer smooths
+                    out a slow mirror at the cost of memory per upload in
+                    flight.
+                  </Typography>
                   <Typography
                     variant="body2"
                     color="text.secondary"

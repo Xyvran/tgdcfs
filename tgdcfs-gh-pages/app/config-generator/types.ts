@@ -107,10 +107,15 @@ export interface TransferConfig {
   chunk_cache_mb: number;
   chunk_cache_readahead: number;
   chunk_cache_block_kb: number;
+  // sync: tee buffers this much per mirror between the primary's reads
+  // of the upload stream and the mirror's upload.
+  tee_buffer_mb: number;
 }
 
 export interface ConfigData {
   telegram: {
+    // UI only: off leaves the whole backends.telegram block out.
+    enabled: boolean;
     api_id: string;
     api_hash: string;
     lib: "pyrogram" | "telethon";
@@ -168,6 +173,7 @@ export const newFilesystem = (
 // loaded config never shares nested state with the initial one.
 export const defaultConfig = (): ConfigData => ({
   telegram: {
+    enabled: true,
     api_id: "",
     api_hash: "",
     lib: "telethon",
@@ -225,6 +231,7 @@ export const defaultConfig = (): ConfigData => ({
       chunk_cache_mb: 0,
       chunk_cache_readahead: 2,
       chunk_cache_block_kb: 1024,
+      tee_buffer_mb: 64,
     },
     encryption: {
       enabled: false,

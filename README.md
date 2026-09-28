@@ -553,6 +553,9 @@ as before. Small reads stay on one store.
   file system, the write acknowledgement and parallel-read settings.
   The mini app's "Mirrors and replication" dialog shows the cache and
   offers "Drop unpinned entries".
+* The config generator offers "Tee" in the Sync dropdown, the tee buffer
+  under Transfer, and a switch for the Telegram backend like the one for
+  Discord, so a Discord-only config leaves the Telegram block out.
 
 ## At-rest encryption
 
