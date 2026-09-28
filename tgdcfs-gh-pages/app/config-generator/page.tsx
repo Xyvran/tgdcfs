@@ -331,8 +331,16 @@ export default function ConfigGenerator() {
       const held = [fs.primary, ...fs.mirrors];
       fs.read_sources = fs.read_sources.filter((m) => held.includes(m));
     }
-    if (field === "sync" && value === "background") {
+    if (field === "sync" && value !== "inline") {
       fs.strict = false;
+    }
+    if (field === "sync" && value === "tee") {
+      // Tee feeds the mirrors from the upload stream; write-back answers
+      // before any store has the bytes, so the two exclude each other.
+      fs.write_ack = "primary";
+    }
+    if (field === "write_ack" && value === "cache" && fs.sync === "tee") {
+      fs.sync = "background";
     }
     if (field === "strict" && value === true) {
       // Strict promises the mirror copy when the write is answered;

@@ -13,7 +13,7 @@ export interface StoreConfig {
 
 export type MetadataType = "pinned_message" | "github_repo";
 export type MirrorMode = "auto" | "forward" | "reupload";
-export type SyncMode = "inline" | "background";
+export type SyncMode = "inline" | "background" | "tee";
 // When a write is answered: once the primary store has it, or once the
 // local cache has it and a worker moves it into the stores (write-back).
 export type WriteAck = "primary" | "cache";

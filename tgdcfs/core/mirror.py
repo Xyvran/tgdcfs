@@ -42,8 +42,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional
 
 from tgdcfs.backends.base import IStore
+from tgdcfs.core.tee import TeeBranch, TeeFileMessage, TeeUpload
 from tgdcfs.errors import MessageNotFound, TechnicalError
-from tgdcfs.reqres import FileMessageFromStream, Replica
+from tgdcfs.reqres import FileMessageFromStream, Replica, UploadableFileMessage
 
 if TYPE_CHECKING:
     from tgdcfs.core.local_cache import VersionBytes, VersionCache
@@ -185,6 +186,78 @@ class MirrorGroup:
     @property
     def stores(self) -> List[MirrorStore]:
         return list(self._stores)
+
+    # -- tee: mirrors fed from the upload stream ----------------------------
+
+    def must_reupload(self, target: MirrorStore) -> bool:
+        """Whether ``target`` can only be filled by re-uploading the bytes:
+        ``mode: reupload``, another backend, or no server-side copy on
+        either side (Discord)."""
+        if self._mode == "reupload":
+            return True
+        if target.store.backend != self._primary.backend:
+            return True
+        return not (
+            self._primary.caps.supports_server_copy
+            and target.store.caps.supports_server_copy
+        )
+
+    def tee_targets(self) -> List[MirrorStore]:
+        """The mirrors a tee'd upload feeds from the stream: the ones that
+        would otherwise download the version from the primary again."""
+        return [ch for ch in self._stores if self.must_reupload(ch)]
+
+    def tee(
+        self, file_msg: UploadableFileMessage, buffer_bytes: int
+    ) -> Optional[TeeUpload]:
+        """Split ``file_msg`` for the primary and every re-uploading mirror.
+
+        Returns ``None`` when no mirror needs the stream or the size is
+        unknown or zero; the caller then uploads ``file_msg`` as it is.
+        Otherwise the primary uploads ``TeeUpload.message`` and, while it
+        does, one task per target uploads the same bytes as a replica.
+        """
+        size = file_msg.get_size()
+        targets = self.tee_targets()
+        if not targets or size <= 0:
+            return None
+        name = file_msg.file_name()
+        branches = [TeeBranch(ch.key, buffer_bytes) for ch in targets]
+        message = TeeFileMessage.wrap(file_msg, branches)
+
+        def upload_into(ch: MirrorStore):
+            async def run(branch: TeeBranch) -> Replica:
+                stream = branch.stream()
+                try:
+                    sent = await ch.store.upload(
+                        FileMessageFromStream.new(
+                            stream=stream, size=size, name=f"replica-{name}"
+                        )
+                    )
+                finally:
+                    await stream.aclose()
+                return Replica(
+                    message_ids=[m.message_id for m in sent],
+                    part_sizes=[m.size for m in sent],
+                )
+
+            return run
+
+        return TeeUpload(message, {ch.key: upload_into(ch) for ch in targets})
+
+    def collect_tee(
+        self, results: Dict[str, "Replica | Exception"]
+    ) -> Dict[str, Replica]:
+        """Sort the outcome of a tee: replicas are returned, a failure is
+        handled like any other mirror write error (logged, or raised
+        with ``strict``)."""
+        replicas: Dict[str, Replica] = {}
+        for key, outcome in results.items():
+            if isinstance(outcome, Exception):
+                self._handle_write_error(key, "tee'd content", outcome)
+            else:
+                replicas[key] = outcome
+        return replicas
 
     def needs_replica(self, target: MirrorStore, part_sizes: List[int]) -> bool:
         """Whether ``target`` gets a replica (own layout) rather than an

@@ -124,6 +124,23 @@ class TestFilesystemConfig:
         assert fs.sync == "background"
         assert fs.sync_is_default is False
 
+    def test_tee_sync_is_accepted(self):
+        fs = FilesystemConfig.from_dict("media", {"primary": "a", "sync": "tee"})
+        assert fs.sync == "tee"
+        assert fs.sync_is_default is False
+
+    def test_strict_refuses_tee(self):
+        with pytest.raises(ValueError, match="inline"):
+            FilesystemConfig.from_dict(
+                "media", {"primary": "a", "strict": True, "sync": "tee"}
+            )
+
+    def test_write_back_refuses_tee(self):
+        with pytest.raises(ValueError, match="write_ack: cache"):
+            FilesystemConfig.from_dict(
+                "media", {"primary": "a", "sync": "tee", "write_ack": "cache"}
+            )
+
 
 class TestDerivedSync:
     """Left out, ``sync`` follows the mirrors: background when one re-uploads."""
@@ -214,6 +231,21 @@ class TestWritesWaitForMirrorsWarning:
         assert "'sync: inline'" in message
         assert "'dc'" in message
         assert "sync: background" in message
+
+    def test_tee_over_discord_mirror_is_an_info_not_a_warning(self, caplog):
+        fs = self.fs(mirrors=["dc"], sync="tee")
+        with caplog.at_level(logging.INFO):
+            fs.warn_if_writes_wait_for_mirrors(
+                self.stores(main="telegram", dc="discord")
+            )
+        assert self.warnings(caplog) == []
+        infos = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.name == "tgdcfs.config"
+        ]
+        (message,) = infos
+        assert "'sync: tee'" in message and "'dc'" in message
 
     def test_strict_over_discord_mirror_names_strict(self, caplog):
         fs = self.fs(mirrors=["dc"], strict=True)
@@ -369,7 +401,20 @@ class TestCurrentLayout:
         assert config.discord.bot_tokens == ["t1", "t2"]
         assert config.discord.max_file_size_bytes == 20_000_000
         assert config.discord.upload_max_retries == 10
+        # One part in flight per bot, never fewer than three.
+        assert config.discord.max_concurrent_uploads == 3
         assert config.uses_backend == {"telegram": True, "discord": True}
+
+    def test_discord_upload_concurrency_follows_the_bots(self):
+        data = current_layout()
+        data["backends"]["discord"] = {"bot_tokens": ["t1", "t2", "t3", "t4", "t5"]}
+        config = Config.from_dict(data)
+        assert config.discord is not None
+        assert config.discord.max_concurrent_uploads == 5
+        data["backends"]["discord"]["max_concurrent_uploads"] = 2
+        config = Config.from_dict(data)
+        assert config.discord is not None
+        assert config.discord.max_concurrent_uploads == 2
 
     def test_discord_backend_single_token(self):
         data = current_layout()

@@ -1,6 +1,7 @@
 """DiscordStore on a fake bot: overflow, partitioning, retries, deletion."""
 
 from dataclasses import dataclass, field
+import asyncio
 from typing import AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -414,6 +415,40 @@ class TestUpload:
         assert b"".join(bot.messages[s.message_id]["data"] for s in sent) == (
             b"abcdefghijklmnopq"
         )
+
+    async def test_reads_no_further_ahead_than_the_upload_slots(self, bot):
+        """A source faster than Discord is held back, not buffered whole:
+        at most ``max_concurrent_uploads`` parts are read before one is
+        sent, so the tee'd upload stream and a cache file are consumed at
+        the pace of the bots."""
+        gate = asyncio.Event()
+        original = bot.send_file
+
+        async def slow_send(channel_id, data, name, caption=""):
+            await gate.wait()
+            return await original(channel_id, data, name, caption)
+
+        bot.send_file = slow_send  # type: ignore[method-assign]
+        store = DiscordStore(
+            [bot], CHANNEL, max_part_bytes=10, max_concurrent_uploads=2
+        )
+        reads: List[int] = []
+
+        async def source():
+            for i in range(6):
+                reads.append(i)
+                yield bytes([i]) * 10
+
+        file_msg = FileMessageFromStream.new(stream=source(), size=60, name="s")
+        upload = asyncio.ensure_future(store.upload(file_msg))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(reads) == 2  # two parts in memory, the rest not yet read
+
+        gate.set()
+        sent = await upload
+        assert [s.size for s in sent] == [10] * 6
+        assert len(reads) == 6
 
     async def test_transient_failures_are_retried(self, store, bot):
         bot.fail_next["send_file"] = [RateLimited(), RateLimited()]

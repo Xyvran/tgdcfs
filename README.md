@@ -161,7 +161,7 @@ filesystems:
     primary: tg-main
     mirrors: [tg-spare]
     mode: auto           # auto (default) | forward | reupload
-    sync: inline         # inline | background; default: background when a mirror re-uploads
+    sync: inline         # inline | background | tee; default: background when a mirror re-uploads
     strict: false        # true: an upload fails when mirroring fails
     metadata:
       type: pinned_message   # or github_repo, see below
@@ -211,7 +211,7 @@ backends:
     delete_messages_on_remove: false
     # upload_max_retries: 10
     # upload_retry_interval: 5
-    # max_concurrent_uploads: 3
+    # max_concurrent_uploads: 3     # parts in flight; default: one per bot, at least 3
     # max_concurrent_downloads: 3
 
 stores:
@@ -296,6 +296,24 @@ in each of them:
   explicit `sync: inline` or `strict: true` over such a mirror is
   accepted, and the server logs a warning at startup that names the
   mirrors every write will wait for.
+* **Tee: every store at once, no read-back.** With `sync: tee` a mirror
+  that has to re-upload is fed from the upload stream itself: every
+  byte the primary store takes from the client is also handed to a
+  bounded buffer per such mirror, whose upload runs at the same time.
+  Nothing is read back from the primary and nothing is written to the
+  cache; a Telegram primary with a Discord mirror uploads to both at
+  once, each with all of its bots (Discord sends one part per bot, see
+  `max_concurrent_uploads`; a Telegram stream goes part by part, one
+  bot per part). The mirror's copy is a replica in its own layout.
+  Mirrors that can be copied server-side (Telegram to Telegram) are
+  still forwarded inline after the upload. The price: the write lasts
+  as long as the slowest store takes, and a rate limit on either side
+  slows the client directly. `tgdcfs.transfer.tee_buffer_mb` (default
+  64) is the buffer per mirror; a full buffer makes the primary's next
+  read wait. A mirror that fails mid-stream is dropped from the tee, the
+  upload finishes without it, and the file goes to the replication
+  queue for that store; a failing primary fails the write as before.
+  `tee` cannot be combined with `strict: true` or `write_ack: cache`.
 * **Reads fail over automatically.** If a part (or the whole primary
   store) becomes unavailable, downloads are served from a mirror.
 * **File descriptors are mirrored too**, and in `pinned_message` metadata
@@ -745,6 +763,7 @@ tgdcfs:
     chunk_cache_block_kb: 1024
     upload_parts_in_flight: 1
     read_parallel_window: 8
+    tee_buffer_mb: 64
 ```
 
 **Downloads** are cut into pieces and several are fetched at once. Bytes
@@ -772,7 +791,8 @@ how many parts of one version the Telegram store uploads at once when
 the source is a cache file (write-back uploads and distribution to the
 mirrors; a streamed upload is always sequential). `read_parallel_window`
 is the reorder window of a multi-source read. Both are described under
-[Local cache](#local-cache).
+[Local cache](#local-cache). `tee_buffer_mb` is the buffer per mirror of
+a `sync: tee` upload, described under [Mirroring](#mirroring).
 
 **Rate limits.** More parallelism means more requests per second. Telegram
 answers a flood with a wait, which TGDCFS honours; if uploads start logging

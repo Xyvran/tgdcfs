@@ -67,9 +67,17 @@ class StoreFileContentRepository(IFileContentRepository):
         piece_size: int = 4 * 1024 * 1024,
         parallel_threshold: int = 10 * 1024 * 1024,
         read_window: int = 8,
+        tee_mirroring: bool = False,
+        tee_buffer: int = 64 * 1024 * 1024,
     ):
         self._store = store
         self._mirror_group = mirror_group
+        # ``sync: tee``: mirrors that would re-upload the bytes are fed
+        # from the upload stream while the primary uploads it, buffering
+        # ``tee_buffer`` bytes per mirror; the other mirrors are copied
+        # inline afterwards (server-side, one call per part).
+        self._tee_mirroring = tee_mirroring
+        self._tee_buffer = tee_buffer
         # Multi-source reads (design plan 4.11): a range above the
         # threshold is cut into pieces of ``piece_size`` that every store
         # holding the version fetches side by side; ``read_sources`` (store
@@ -110,9 +118,20 @@ class StoreFileContentRepository(IFileContentRepository):
                 self._cache.pin(version_id)
                 file_msg = StagedFileMessage.wrap(file_msg, writer)
 
+        # Split the stream for the mirrors that would otherwise download
+        # it from the primary again (``sync: tee``): their uploads run
+        # while the primary's does, fed by the reads it takes.
+        tee = None
+        if self._tee_mirroring and self._mirror_group is not None:
+            tee = self._mirror_group.tee(file_msg, self._tee_buffer)
+            if tee is not None:
+                file_msg = tee.message
+
         try:
             res = await self._store.upload(file_msg)
         except BaseException:
+            if tee is not None:
+                await tee.abort()
             if writer is not None:
                 await writer.abort()
             raise
@@ -122,10 +141,23 @@ class StoreFileContentRepository(IFileContentRepository):
         # Replicate the freshly uploaded parts into the mirror stores. The
         # mapping travels back to the caller inside the SentFileMessage
         # objects and ends up in TGFSFileVersion.mirrors / .replicas.
-        if self._mirror_group and self._inline_mirroring and res:
+        if self._mirror_group and res and (self._inline_mirroring or tee):
+            only_stores = None
+            if tee is not None:
+                # The tee'd mirrors finish on their own; the rest are the
+                # server-side copies, which are cheap enough to make inline.
+                res[0].replicas.update(
+                    self._mirror_group.collect_tee(await tee.collect())
+                )
+                only_stores = [
+                    key
+                    for key in self._mirror_group.store_keys
+                    if key not in tee.store_keys
+                ]
             copies = await self._mirror_group.mirror_parts(
                 [m.message_id for m in res],
                 [m.size for m in res],
+                only_stores=only_stores,
                 cache=version_cache_for(
                     self._cache, self._cache_scope, version_id, sum(m.size for m in res)
                 ),
@@ -134,7 +166,7 @@ class StoreFileContentRepository(IFileContentRepository):
                 for sent, mirror_id in zip(res, mirror_ids):
                     sent.mirrors[store_key] = mirror_id
             res[0].replicas.update(copies.replicas)
-            # Inline mirroring is complete here; with a partial result the
+            # Mirroring is complete here; with a partial result the
             # replication queue is not involved, so nothing would unpin.
             if self._cache is not None and version_id:
                 self._cache.release(version_id)

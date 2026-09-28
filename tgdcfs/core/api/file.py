@@ -49,6 +49,7 @@ class FileApi:
         mirror_group: Optional[MirrorGroup] = None,
         inline_mirroring: bool = True,
         on_written: Optional[Callable[[TGFSFileRef], Awaitable[None]]] = None,
+        written_gaps_only: bool = False,
     ):
         self._metadata_api = metadata_api
         self._file_desc_api = file_desc_api
@@ -59,10 +60,23 @@ class FileApi:
         # pushed; the replication queue hooks in here for
         # ``sync: background``.
         self._on_written = on_written
+        # ``sync: tee``: the write itself filled the mirrors that re-upload,
+        # so the queue is only told about a file some store still lacks a
+        # copy of (a mirror that failed mid-stream, a server-side copy
+        # that was refused, a copy of a file made without a stream).
+        self._written_gaps_only = written_gaps_only
 
-    async def _written(self, fr: TGFSFileRef) -> None:
-        if self._on_written is not None:
-            await self._on_written(fr)
+    async def _written(self, fr: TGFSFileRef, fd: Optional[TGFSFileDesc]) -> None:
+        if self._on_written is None:
+            return
+        if self._written_gaps_only and fd is not None and self._mirror_group:
+            if not any(
+                self._mirror_group.missing_stores(version)
+                for version in fd.get_versions()
+                if version.is_valid()
+            ):
+                return
+        await self._on_written(fr)
 
     async def collect_message_ids(self, fr: TGFSFileRef) -> List[int]:
         """Return every primary-store message id backing ``fr``.
@@ -275,7 +289,7 @@ class FileApi:
         copied_fr.mirrors = dict(resp.mirrors)
         copied_fr.store = resp.store
         await self._metadata_api.push()
-        await self._written(copied_fr)
+        await self._written(copied_fr, copied_fd)
         return copied_fr
 
     async def _discard_orphans(
@@ -321,7 +335,7 @@ class FileApi:
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
         await self._metadata_api.push()
-        await self._written(fr)
+        await self._written(fr, resp.fd)
         return resp.fd
 
     async def _sync_file_ref(self, fr: TGFSFileRef, resp: FDRepositoryResp) -> None:
@@ -351,7 +365,7 @@ class FileApi:
         else:
             resp = await self._file_desc_api.append_file_version(file_msg, fr)
         await self._sync_file_ref(fr, resp)
-        await self._written(fr)
+        await self._written(fr, resp.fd)
         return resp.fd
 
     async def set_last_modified(

@@ -593,6 +593,48 @@ changes for the mirrors except that they read from the staged copy
 unless they forward, so a Telegram primary with a Discord mirror fills
 both at once from the local file.
 
+### 4.13 Tee mirroring: every store from the upload stream
+
+Write-back (4.12) fills primary and mirrors at once, but only through a
+cache file on the data volume. A deployment without a disk to spare, or
+one that wants the client to hold the only copy until every store has
+it, needs the same parallelism without the file: `sync: tee`.
+
+**Mechanism.** `core/tee.py`. The message the primary uploader consumes
+is wrapped (`TeeFileMessage`, the pattern of `StagedFileMessage`): every
+`read()` also feeds one bounded buffer (`TeeBranch`) per mirror that
+would otherwise re-upload (`MirrorGroup.tee_targets`: `mode: reupload`,
+another backend, no server-side copy on either side). Each branch is
+consumed by a task that uploads it into its mirror through
+`FileMessageFromStream`, exactly as `_replicate` does from a download,
+and records a replica in the mirror's own layout. Mirrors that forward
+server-side are copied inline after the upload, as with `sync: inline`.
+The end of the stream is signalled by the byte count, not by `close()`:
+the Telegram uploader closes the message after every part.
+
+**Backpressure.** A branch holds `transfer.tee_buffer_mb`. A full branch
+makes the primary's next read wait, so the client's upload runs at the
+pace of the slowest store.
+The Discord store reads a part only once one of its
+`max_concurrent_uploads` slots is free (one per bot by default), so a
+fast source is held back instead of buffered whole; this also bounds
+the memory of an upload from a cache file.
+
+**Failure.** A mirror that fails mid-stream detaches its branch: the
+producer is never held up by a consumer that is gone, the primary upload
+finishes, the failure is handled like any mirror write error
+(non-strict: logged), and the file is queued for replication for that
+store only because a store lacks a copy (`FileApi` enqueues on gaps in
+tee mode, not on every write). A failing primary aborts every branch and
+fails the write as before; parts the mirrors already sent are orphans,
+as they are on the inline path today. `strict` and `write_ack: cache`
+are refused with `tee`.
+
+**What it does not do.** A Telegram store uploads a stream part by part,
+one bot per part, since a part's chunks must come from one session;
+several bots at once need a seekable source, which is the cache
+(`upload_parts_in_flight`). Every Discord bot is busy throughout.
+
 ## 5. Configuration
 
 Schema v2. Everything under `tgdcfs:` is the old `tgfs:` block, renamed.

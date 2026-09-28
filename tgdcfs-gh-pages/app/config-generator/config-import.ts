@@ -109,7 +109,7 @@ class Notes {
 
 const METADATA_TYPES: readonly MetadataType[] = ["pinned_message", "github_repo"];
 const MIRROR_MODES: readonly MirrorMode[] = ["auto", "forward", "reupload"];
-const SYNC_MODES: readonly SyncMode[] = ["inline", "background"];
+const SYNC_MODES: readonly SyncMode[] = ["inline", "background", "tee"];
 const WRITE_ACKS: readonly WriteAck[] = ["primary", "cache"];
 
 const readMetadata = (
@@ -190,11 +190,17 @@ const readStoresAndFilesystems = (
       data.sync === undefined
         ? derived
         : notes.choice(`${path}.sync`, data.sync, SYNC_MODES, derived);
-    if (fs.strict && fs.sync === "background") {
+    if (fs.strict && fs.sync !== "inline") {
       notes.add(
         `${path}: 'strict: true' requires 'sync: inline'; strict was turned off`
       );
       fs.strict = false;
+    }
+    if (fs.sync === "tee" && fs.write_ack === "cache") {
+      notes.add(
+        `${path}: 'sync: tee' cannot be combined with 'write_ack: cache'; write_ack was set to primary`
+      );
+      fs.write_ack = "primary";
     }
     if (fs.strict && fs.write_ack === "cache") {
       notes.add(

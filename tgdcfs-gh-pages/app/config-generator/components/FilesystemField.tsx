@@ -270,6 +270,7 @@ export function FilesystemField({
               >
                 <MenuItem value="inline">Inline (during the upload)</MenuItem>
                 <MenuItem value="background">Background queue</MenuItem>
+                <MenuItem value="tee">Tee (every store at once)</MenuItem>
               </Select>
             </FormControl>
           </Box>
@@ -282,11 +283,14 @@ export function FilesystemField({
             (no bandwidth) and re-uploads where that is impossible.
             &quot;Inline&quot; makes an upload wait for its copies;
             &quot;Background&quot; queues the file and a worker copies it
-            afterwards. Background is preselected as soon as a mirror
-            re-uploads, since a client would otherwise time out waiting
-            for a large upload to pass through the mirror a second time.
-            The server picks the same default when the config leaves Sync
-            out, so it is only written when your choice differs.
+            afterwards; &quot;Tee&quot; feeds a re-uploading mirror from
+            the upload itself, so primary and mirror fill at the same time
+            without a read-back or a cache, and the upload runs at the pace
+            of the slowest store. Background is preselected as soon as a
+            mirror re-uploads, since a client would otherwise time out
+            waiting for a large upload to pass through the mirror a second
+            time. The server picks the same default when the config leaves
+            Sync out, so it is only written when your choice differs.
             {reuploadMirror && filesystem.sync === "inline" && (
               <>
                 {" "}

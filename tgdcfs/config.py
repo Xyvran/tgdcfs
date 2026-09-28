@@ -353,9 +353,14 @@ class TransferConfig:
     # their turn; the memory bound of one such read is this times the
     # piece size.
     read_parallel_window: int = 8
+    # ``sync: tee``: bytes buffered per mirror between the primary's reads
+    # of the upload stream and the mirror's upload; a full buffer makes
+    # the primary wait.
+    tee_buffer_mb: int = 64
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_READ_PARALLEL_WINDOW = 8
+    DEFAULT_TEE_BUFFER_MB = 64
     DEFAULT_UPLOAD_WORKERS_SMALL = 3
     DEFAULT_UPLOAD_WORKERS_BIG = 8
     # 512 KiB is the largest part Telegram accepts and is valid for any file
@@ -377,6 +382,10 @@ class TransferConfig:
     @property
     def upload_part_size_bytes(self) -> int:
         return self.upload_part_size_kb * 1024
+
+    @property
+    def tee_buffer_bytes(self) -> int:
+        return self.tee_buffer_mb * 1024 * 1024
 
     @property
     def parallel_download_threshold_bytes(self) -> int:
@@ -449,6 +458,7 @@ class TransferConfig:
             read_parallel_window=positive(
                 "read_parallel_window", cls.DEFAULT_READ_PARALLEL_WINDOW
             ),
+            tee_buffer_mb=positive("tee_buffer_mb", cls.DEFAULT_TEE_BUFFER_MB),
         )
 
 
@@ -797,7 +807,11 @@ class DiscordConfig:
             ),
             upload_max_retries=positive("upload_max_retries", 10),
             upload_retry_interval=float(data.get("upload_retry_interval", 5.0)),
-            max_concurrent_uploads=positive("max_concurrent_uploads", 3),
+            # Every bot busy by default: one part in flight per bot, and at
+            # least three so a single bot still overlaps its requests.
+            max_concurrent_uploads=positive(
+                "max_concurrent_uploads", max(3, len(tokens))
+            ),
             max_concurrent_downloads=positive("max_concurrent_downloads", 3),
         )
 
@@ -838,7 +852,12 @@ class StoreConfig:
 
 
 MirrorMode = Literal["auto", "forward", "reupload"]
-SyncMode = Literal["inline", "background"]
+# ``inline``: the write waits for every mirror copy. ``background``: the
+# write records the primary copy and a queue fills the mirrors later.
+# ``tee``: mirrors that re-upload are fed from the upload stream while
+# the primary uploads it (no read-back, no cache), the others are copied
+# inline; the write lasts as long as the slowest store takes.
+SyncMode = Literal["inline", "background", "tee"]
 # When a write is acknowledged: once the primary store has it (today's
 # behaviour) or once the local cache has it (write-back, section 4.12).
 WriteAck = Literal["primary", "cache"]
@@ -852,7 +871,10 @@ class FilesystemConfig:
     when the pair of stores allows it and re-uploads otherwise,
     ``forward`` insists on the server-side copy, ``reupload`` never asks
     for one. ``sync`` says whether mirroring happens inside the write
-    (``inline``) or from a persistent background queue (``background``).
+    (``inline``), from a persistent background queue (``background``) or
+    from the upload stream itself (``tee``: a mirror that re-uploads
+    receives the bytes while the primary does, nothing is read back or
+    cached, and the write lasts as long as the slowest store takes).
     When ``sync`` is not given it is derived from the stores once they
     are known (``derive_sync``): ``background`` as soon as a mirror has
     to re-upload, since a write would otherwise wait for every byte to
@@ -903,13 +925,13 @@ class FilesystemConfig:
             )
         sync_is_default = "sync" not in data
         sync = str(data.get("sync", "inline"))
-        if sync not in ("inline", "background"):
+        if sync not in ("inline", "background", "tee"):
             raise ValueError(
                 f"filesystems.{name}: unknown sync '{sync}', "
-                f"available options: inline, background"
+                f"available options: inline, background, tee"
             )
         strict = bool(data.get("strict", False))
-        if strict and sync == "background":
+        if strict and sync != "inline":
             raise ValueError(
                 f"filesystems.{name}: 'strict: true' requires 'sync: inline'"
             )
@@ -918,6 +940,12 @@ class FilesystemConfig:
             raise ValueError(
                 f"filesystems.{name}: unknown write_ack '{write_ack}', "
                 f"available options: primary, cache"
+            )
+        if write_ack == "cache" and sync == "tee":
+            raise ValueError(
+                f"filesystems.{name}: 'sync: tee' feeds the mirrors from the upload "
+                f"stream, which 'write_ack: cache' answers before any store has; "
+                f"use 'sync: background' with write-back"
             )
         if strict and write_ack == "cache":
             raise ValueError(
@@ -987,9 +1015,16 @@ class FilesystemConfig:
         file system to ``background``; this warns when an explicit
         ``sync: inline`` or ``strict: true`` overrides that.
         """
-        if self.sync != "inline":
-            return
         if not (mirrors := self.reuploading_mirrors(stores)):
+            return
+        if self.sync == "tee":
+            logger.info(
+                f"filesystems.{self.name}: 'sync: tee' feeds "
+                f"{', '.join(repr(m) for m in mirrors)} from the upload stream; "
+                f"every write runs at the pace of the slowest store."
+            )
+            return
+        if self.sync != "inline":
             return
         cause = "'strict: true'" if self.strict else "'sync: inline'"
         remedy = (

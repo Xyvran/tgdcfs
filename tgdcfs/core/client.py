@@ -99,10 +99,16 @@ class Client:
                 strict=filesystem.strict,
             )
 
+        # ``sync: tee``: the mirrors that re-upload are fed from the upload
+        # stream itself, the others copied inline; the queue only gets the
+        # files a store still lacks a copy of.
+        tee = filesystem.sync == "tee" and mirror_group is not None
         fc_repo: IFileContentRepository = StoreFileContentRepository(
             store,
             mirror_group=mirror_group,
             inline_mirroring=inline,
+            tee_mirroring=tee,
+            tee_buffer=config.tgdcfs.transfer.tee_buffer_bytes,
             read_preference=read_preference,
             cache=cache,
             cache_scope=filesystem.name,
@@ -193,6 +199,7 @@ class Client:
             mirror_group=mirror_group,
             inline_mirroring=inline,
             on_written=on_written,
+            written_gaps_only=tee,
         )
         dir_api = DirectoryApi(metadata_api, file_api, store)
 

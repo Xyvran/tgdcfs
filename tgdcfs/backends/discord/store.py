@@ -323,23 +323,40 @@ class DiscordStore(IStore):
         return bytes(data)
 
     async def _send_part(self, data: bytes, name: str) -> SentFileMessage:
-        async with self._upload_slots:
-            sent = await self._send(
-                f"upload of {name}",
-                lambda bot: bot.send_file(self.channel_id, data, name),
-            )
+        sent = await self._send(
+            f"upload of {name}",
+            lambda bot: bot.send_file(self.channel_id, data, name),
+        )
         return SentFileMessage(message_id=sent.message_id, size=len(data))
+
+    async def _send_part_with_slot(
+        self, data: bytes, name: str, unstarted: List[int]
+    ) -> SentFileMessage:
+        """Send one part with the upload slot ``upload`` acquired for it and
+        release the slot afterwards. ``unstarted`` counts the tasks that
+        hold a slot but have not run yet: one cancelled before its first
+        step never reaches its ``finally``, so ``upload`` releases for it."""
+        unstarted[0] -= 1
+        try:
+            return await self._send_part(data, name)
+        finally:
+            self._upload_slots.release()
 
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         """Send ``file_msg`` as parts of at most ``max_part_bytes``.
 
         Parts are read sequentially (the message is a stream) and sent
-        with bounded concurrency; the result is in file order.
+        with bounded concurrency; the result is in file order. A part is
+        read only once a slot is free for it, so at most
+        ``max_concurrent_uploads`` parts are in memory and a source that
+        produces faster than Discord takes (a cache file, a tee'd upload
+        stream) is held back instead of buffered whole.
         """
         await file_msg.open()
         file_name = file_msg.file_name()
         size = file_msg.get_size()
         tasks: List[asyncio.Task[SentFileMessage]] = []
+        unstarted = [0]
         try:
             index = 0
             remaining = size
@@ -347,13 +364,22 @@ class DiscordStore(IStore):
                 limit = self._max_part_bytes
                 if size >= 0:
                     limit = min(limit, remaining)
-                data = await self._read_part(file_msg, limit) if limit > 0 else b""
+                await self._upload_slots.acquire()
+                try:
+                    data = await self._read_part(file_msg, limit) if limit > 0 else b""
+                except BaseException:
+                    self._upload_slots.release()
+                    raise
                 if not data and index > 0:
+                    self._upload_slots.release()
                     break
                 index += 1
+                unstarted[0] += 1
                 tasks.append(
                     asyncio.create_task(
-                        self._send_part(data, f"[part{index}]{file_name}")
+                        self._send_part_with_slot(
+                            data, f"[part{index}]{file_name}", unstarted
+                        )
                     )
                 )
                 remaining -= len(data)
@@ -363,6 +389,9 @@ class DiscordStore(IStore):
         except BaseException:
             for task in tasks:
                 task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for _ in range(unstarted[0]):
+                self._upload_slots.release()
             raise
         finally:
             await file_msg.close()
