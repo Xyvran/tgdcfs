@@ -91,6 +91,16 @@ SWEEP_INTERVAL = 15 * 60.0
 STALE_PIN_SECONDS = 24 * 3600.0
 
 
+def format_bytes(size: int) -> str:
+    """``size`` in the largest binary unit that keeps it at or above 1."""
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024 or unit == "GiB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
 class VersionBytes(Protocol):
     """A complete, seekable copy of a version's bytes."""
 
@@ -625,34 +635,87 @@ class LocalCache:
 
     def _make_room(
         self, size: int, new_entry: bool = True, keep: Optional[CacheEntry] = None
-    ) -> bool:
+    ) -> Optional[str]:
         """Evict unpinned entries, oldest first, until ``size`` more bytes fit
         the budget and leave ``min_free`` on the disk.
 
         ``new_entry`` also claims one of ``max_files``; ``keep`` is the
         entry the bytes are for, which is never its own victim. Entries
         being written or filled right now are not victims either.
+
+        Returns ``None`` once the bytes fit, otherwise why they cannot:
+        which limit is hit and what holds the room that is left, so the
+        log tells a cache full of pinned entries from a disk filled by
+        something else.
         """
         cfg = self.config
         while True:
-            over_bytes = (
+            over_bytes = bool(
                 cfg.max_size_bytes and self.used_bytes() + size > cfg.max_size_bytes
             )
-            over_files = (
+            over_files = bool(
                 new_entry and cfg.max_files and len(self._entries) + 1 > cfg.max_files
             )
             over_disk = False
+            free: Optional[int] = None
             if cfg.min_free_bytes:
                 free = self._disk_free()
                 over_disk = free is not None and free - size < cfg.min_free_bytes
             if not over_bytes and not over_files and not over_disk:
-                return True
+                return None
             victim = self._lru_victim(keep)
             if victim is None:
-                return False
+                return self._shortfall(size, over_bytes, over_files, free, keep)
             self._evict(
                 victim, "for the disk headroom" if over_disk else "to make room"
             )
+
+    def _shortfall(
+        self,
+        size: int,
+        over_bytes: bool,
+        over_files: bool,
+        free: Optional[int],
+        keep: Optional[CacheEntry] = None,
+    ) -> str:
+        """Why ``size`` more bytes do not fit once nothing is left to evict."""
+        cfg = self.config
+        limits = []
+        if over_bytes:
+            limits.append(
+                f"the budget is met ({format_bytes(self.used_bytes())} of "
+                f"{format_bytes(cfg.max_size_bytes)} used, "
+                f"{format_bytes(size)} more needed)"
+            )
+        if over_files:
+            limits.append(f"max_files is met ({len(self._entries)} entries)")
+        if free is not None and free - size < cfg.min_free_bytes:
+            limits.append(
+                f"the disk headroom is met ({format_bytes(free)} free, "
+                f"min_free {format_bytes(cfg.min_free_bytes)}, "
+                f"{format_bytes(size)} more needed)"
+            )
+        pinned = [e for e in self._entries.values() if e.pins > 0]
+        # ``keep`` is the entry being filled, so it counts as written to.
+        busy = [
+            e
+            for e in self._entries.values()
+            if e.pins == 0 and (not e.evictable or e is keep)
+        ]
+        if not pinned and not busy:
+            holders = (
+                "the cache holds nothing it could evict, so the disk is "
+                "filled outside the cache"
+            )
+        else:
+            holders = (
+                f"nothing is left to evict: {len(pinned)} entries "
+                f"({format_bytes(sum(e.charged_bytes() for e in pinned))}) are "
+                f"pinned until the mirrors have them, {len(busy)} entries "
+                f"({format_bytes(sum(e.charged_bytes() for e in busy))}) are "
+                f"being written"
+            )
+        return f"{' and '.join(limits)}; {holders}"
 
     def _refuse(self, reason: str) -> None:
         self._throttled_warning(f"Cache: not caching a version: {reason}")
@@ -684,11 +747,8 @@ class LocalCache:
         if not self._fits(size):
             self._refuse(f"{size} bytes exceed max_file_size")
             return None
-        if not self._make_room(size):
-            self._refuse(
-                "the budget, or the headroom on the disk, cannot be met without "
-                "evicting entries the mirrors still need"
-            )
+        if (why := self._make_room(size)) is not None:
+            self._throttled_warning(f"Cache: not caching {version_id}: {why}")
             return None
         entry = CacheEntry(
             version_id=version_id,
@@ -764,11 +824,9 @@ class LocalCache:
         # suspends, and an entry admitted meanwhile must not count on
         # the same room. Blocks already present are already charged.
         added = sum(entry.block_length(i) for i in blocks if not entry.present[i])
-        if added and not self._make_room(added, new_entry=False, keep=entry):
-            self._refuse(
-                f"the budget, or the headroom on the disk, is taken by entries the "
-                f"mirrors still need; {version_id} is only partly cached"
-            )
+        why = self._make_room(added, new_entry=False, keep=entry) if added else None
+        if why is not None:
+            self._throttled_warning(f"Cache: {version_id} is only partly cached: {why}")
             return
         entry.inflight += added
         try:
@@ -814,11 +872,9 @@ class LocalCache:
             return None
         if version_id in self._entries:
             self.remove(version_id)
-        if not self._make_room(0):
-            self._refuse(
-                "max_files, the budget or the headroom on the disk is taken by "
-                f"entries the mirrors still need; {version_id} is read without "
-                "the cache"
+        if (why := self._make_room(0)) is not None:
+            self._throttled_warning(
+                f"Cache: {version_id} is read without the cache: {why}"
             )
             return None
         entry = CacheEntry(

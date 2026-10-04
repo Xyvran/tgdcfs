@@ -7,6 +7,7 @@ from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from .folder import Folder
 from .member import Member
@@ -99,6 +100,13 @@ def create_app(
         return path == other or path.startswith(f"{other}/")
 
     app = FastAPI()
+
+    @app.exception_handler(ClientDisconnect)
+    async def client_disconnected(request: Request, exc: ClientDisconnect):
+        # The client hung up while its body was still being read. Nobody is
+        # left to answer, so this is not a server error worth a traceback.
+        logger.debug(f"Client disconnected during {request.method} {request.url.path}")
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
 
     @app.options(path="/{path:path}")
     async def options():

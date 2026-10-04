@@ -23,6 +23,7 @@ from tgdcfs.core.local_cache import (
     CacheSweeper,
     LocalCache,
     StagedFileMessage,
+    format_bytes,
 )
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion
@@ -305,6 +306,60 @@ class TestBudget:
         cache = make_cache(tmp_path, min_free_mb=1)
         monkeypatch.setattr(cache, "_disk_free", lambda: None)
         assert cache.open_staging("fs", "a", 100) is not None
+
+    async def test_a_refusal_names_the_pinned_entries(self, tmp_path, caplog):
+        cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
+        await stage(cache, "pinned", b"a" * (768 * 1024))
+        cache.pin("pinned")
+
+        with caplog.at_level("WARNING", logger="tgdcfs.core.local_cache"):
+            assert cache.open_staging("fs", "next", 512 * 1024) is None
+
+        assert (
+            "Cache: not caching next: the budget is met (768.0 KiB of 1.0 MiB "
+            "used, 512.0 KiB more needed); nothing is left to evict: 1 entries "
+            "(768.0 KiB) are pinned until the mirrors have them, 0 entries "
+            "(0 B) are being written"
+        ) in caplog.text
+
+    async def test_a_refusal_tells_a_disk_filled_outside_the_cache(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        cache = make_cache(tmp_path, min_free_mb=1)
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024 + 10)
+
+        with caplog.at_level("WARNING", logger="tgdcfs.core.local_cache"):
+            assert cache.open_staging("fs", "a", 100) is None
+
+        assert (
+            "Cache: not caching a: the disk headroom is met (1.0 MiB free, "
+            "min_free 1.0 MiB, 100 B more needed); the cache holds nothing it "
+            "could evict, so the disk is filled outside the cache"
+        ) in caplog.text
+
+    async def test_a_partial_fill_counts_its_own_entry_as_written(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        cache = make_cache(tmp_path, min_free_mb=1, block_kb=256)
+        quarter = 256 * 1024
+        assert cache.reserve("fs", "a", 2 * quarter) is not None
+        monkeypatch.setattr(cache, "_disk_free", lambda: 1024 * 1024)
+
+        with caplog.at_level("WARNING", logger="tgdcfs.core.local_cache"):
+            await cache.write_blocks("a", 0, b"a" * quarter)
+
+        assert "Cache: a is only partly cached: the disk headroom is met" in (
+            caplog.text
+        )
+        assert "0 entries (0 B) are pinned" in caplog.text
+        assert "1 entries (0 B) are being written" in caplog.text
+
+    async def test_format_bytes(self):
+        assert format_bytes(0) == "0 B"
+        assert format_bytes(1023) == "1023 B"
+        assert format_bytes(1536) == "1.5 KiB"
+        assert format_bytes(20 * 1024**3) == "20.0 GiB"
+        assert format_bytes(3000 * 1024**3) == "3000.0 GiB"
 
     async def test_a_disk_write_failure_is_warned_once_a_minute(self, tmp_path, caplog):
         cache = make_cache(tmp_path, block_kb=256)

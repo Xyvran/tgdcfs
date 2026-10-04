@@ -1,4 +1,9 @@
-from asgidav.app import split_path, extract_path_from_destination
+import logging
+from http import HTTPStatus
+
+import pytest
+
+from asgidav.app import create_app, extract_path_from_destination, split_path
 
 
 class TestAppHelpers:
@@ -41,3 +46,41 @@ class TestAppHelpers:
         path = "/webdav/path%20with%20spaces/file.txt"
         result = extract_path_from_destination(path)
         assert result == "/webdav/path with spaces/file.txt"
+
+
+class TestClientDisconnect:
+    @pytest.mark.asyncio
+    async def test_hang_up_during_body_is_not_a_server_error(self, caplog):
+        async def get_member(path):
+            return None
+
+        app = create_app(get_member)
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "PROPFIND",
+            "scheme": "http",
+            "path": "/folder/",
+            "raw_path": b"/folder/",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"depth", b"1"), (b"content-length", b"100")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 80),
+        }
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        with caplog.at_level(logging.DEBUG, logger="asgidav.app"):
+            await app(scope, receive, send)
+
+        assert sent[0]["status"] == HTTPStatus.BAD_REQUEST
+        assert "Client disconnected during PROPFIND /folder/" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
