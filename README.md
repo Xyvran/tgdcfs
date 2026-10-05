@@ -852,6 +852,31 @@ Before committing and pushing, run the following command to install git hooks:
 pre-commit install
 ```
 
+### Releases
+
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`, in
+the same commit as the change. Versions follow [SemVer](https://semver.org/);
+every release is a tag `vX.Y.Z` with a
+[GitHub release](https://github.com/Xyvran/tgdcfs/releases), and the Docker
+images carry `X.Y.Z` and `X.Y` next to the commit tag:
+
+```bash
+docker pull xyvran/tgdcfs:0.6.1   # one release
+docker pull xyvran/tgdcfs:0.6     # newest patch release of 0.6
+```
+
+To cut a release on `master`:
+
+1. Rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD`, add an empty
+   `[Unreleased]` above it and update the compare links at the bottom.
+2. Set `version` in `pyproject.toml` to `X.Y.Z` and commit both.
+3. Push the commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The "Release" workflow checks the version, publishes the release with that
+version's changelog section as its notes, and tags the images once
+`docker-build-push` has published the commit. Running it by hand republishes
+the notes of every tag, e.g. after correcting an entry.
+
 ### Preview builds
 
 Pushing any branch other than `master` runs the full test suite and, in

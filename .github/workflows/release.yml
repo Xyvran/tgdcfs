@@ -1,0 +1,165 @@
+name: Release
+
+# A pushed tag vX.Y.Z becomes a GitHub release whose notes are that version's
+# section of CHANGELOG.md, and the Docker images of the tagged commit get the
+# tags X.Y.Z and X.Y. Nothing is rebuilt: the images are the ones
+# docker-publish.yml built from master, so tag a commit that is on master.
+#
+# Run it by hand to (re)publish every existing tag, e.g. after a changelog
+# correction or for tags pushed before this workflow existed. Releases that
+# exist already get their notes updated.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (vX.Y.Z); empty publishes every release tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tags:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.list.outputs.tags }}
+      latest: ${{ steps.list.outputs.latest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # A new release must bump pyproject.toml in the tagged commit. Tags made
+      # before the changelog existed are only published by hand and skip this.
+      - name: Check the version in pyproject.toml
+        if: github.event_name == 'push'
+        run: python scripts/changelog.py check-version "${GITHUB_REF_NAME}"
+
+      - name: List the tags to publish
+        id: list
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+            tags="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG}" ]; then
+            tags="${INPUT_TAG}"
+          else
+            tags="$(git tag --list 'v*.*.*' --sort=v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | xargs)"
+          fi
+          latest="$(git tag --list 'v*.*.*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
+          echo "Publishing: ${tags}; latest release: ${latest}"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+
+  github-release:
+    needs: tags
+    runs-on: ubuntu-latest
+    steps:
+      # The notes always come from the default branch, so a release tagged
+      # after the fact, or a corrected entry, is published with today's text.
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Create or update the releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGS: ${{ needs.tags.outputs.tags }}
+          LATEST: ${{ needs.tags.outputs.latest }}
+        run: |
+          for tag in ${TAGS}; do
+            git rev-parse --verify --quiet "refs/tags/${tag}" > /dev/null \
+              || { echo "::error::tag ${tag} does not exist"; exit 1; }
+            python scripts/changelog.py notes "${tag}" > notes.md
+            if [ "${tag}" = "${LATEST}" ]; then latest=true; else latest=false; fi
+            if gh release view "${tag}" > /dev/null 2>&1; then
+              gh release edit "${tag}" --title "${tag}" --notes-file notes.md --latest="${latest}"
+              echo "Updated release ${tag}"
+            else
+              gh release create "${tag}" --verify-tag --title "${tag}" --notes-file notes.md --latest="${latest}"
+              echo "Created release ${tag}"
+            fi
+          done
+
+  docker-tags:
+    needs: tags
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repository: [xyvran/tgdcfs, xyvran/tgdcfs-fe]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # On a fresh tag the image of its commit may still be building (it is
+      # pushed only after the tests on master pass), so wait for it. A tag
+      # published by hand does not wait: old commits that never got an image
+      # of their own are skipped with a warning.
+      - name: Add the version tags to the commit's image
+        env:
+          TAGS: ${{ needs.tags.outputs.tags }}
+          REPOSITORY: ${{ matrix.repository }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then attempts=60; else attempts=1; fi
+          for tag in ${TAGS}; do
+            sha="$(git rev-list -n 1 "${tag}")"
+            version="${tag#v}"
+            minor="${version%.*}"
+            source="${REPOSITORY}:${sha}"
+            found=false
+            for attempt in $(seq "${attempts}"); do
+              if docker buildx imagetools inspect "${source}" > /dev/null 2>&1; then
+                found=true
+                break
+              fi
+              if [ "${attempt}" -lt "${attempts}" ]; then sleep 60; fi
+            done
+            if [ "${found}" != true ]; then
+              if [ "${GITHUB_EVENT_NAME}" = push ]; then
+                echo "::error::${source} did not appear on Docker Hub"
+                exit 1
+              fi
+              echo "::warning::${source} does not exist, ${tag} gets no Docker tags"
+              continue
+            fi
+            # X.Y follows the newest patch release of that line only, so
+            # republishing an older patch does not move it backwards.
+            newest="$(git tag --list "v${minor}.*" --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
+            targets=(--tag "${REPOSITORY}:${version}")
+            if [ "${newest}" = "${tag}" ]; then targets+=(--tag "${REPOSITORY}:${minor}"); fi
+            docker buildx imagetools create "${targets[@]}" "${source}"
+            echo "Tagged ${source} as ${targets[*]}"
+          done
