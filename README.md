@@ -870,9 +870,9 @@ To cut a release on `master`:
 1. Rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD`, add an empty
    `[Unreleased]` above it and update the compare links at the bottom.
 2. Set `version` in `pyproject.toml` to `X.Y.Z` and commit both.
-3. Push the commit, then either `git tag vX.Y.Z && git push origin vX.Y.Z`,
-   or start the "Release" workflow by hand with the tag `vX.Y.Z`, which
-   creates the tag on the head of `master`.
+3. Push the commit to `master`. The "Release" workflow sees the new version,
+   tags the commit `vX.Y.Z` and releases it. Pushing the tag yourself, or
+   starting the workflow by hand with the tag, works as well.
 
 The "Release" workflow checks the version, publishes the release with that
 version's changelog section as its notes, and tags the images once

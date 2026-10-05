@@ -6,6 +6,8 @@ name: Release
 # docker-build-push built from master, so tag a commit that is on master.
 #
 # Ways to run it:
+# * push a commit to the default branch that changes the version in
+#   pyproject.toml: the commit is tagged vX.Y.Z and released;
 # * push a tag vX.Y.Z;
 # * start it by hand with a tag that does not exist yet: the tag is created
 #   on `ref` (default: the head of the default branch) and released;
@@ -18,6 +20,7 @@ name: Release
 
 on:
   push:
+    branches: [master]
     tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
@@ -38,10 +41,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
   tags:
     runs-on: ubuntu-latest
@@ -60,11 +59,29 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Create the tag
-        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+      # A push to the default branch releases only when it bumps the version.
+      - name: Detect a version bump
+        id: bump
+        if: github.event_name == 'push' && github.ref_type == 'branch'
         env:
-          TAG: ${{ inputs.tag }}
-          REF: ${{ inputs.ref || github.event.repository.default_branch }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          now="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          before="$(git show "${BEFORE}:pyproject.toml" 2>/dev/null \
+            | python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])' 2>/dev/null || true)"
+          if [ "${now}" = "${before}" ] || git rev-parse --verify --quiet "refs/tags/v${now}" > /dev/null; then
+            echo "No new version (${before} -> ${now})"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version bump ${before} -> ${now}"
+            echo "tag=v${now}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create the tag
+        if: (github.event_name == 'workflow_dispatch' && inputs.tag != '') || steps.bump.outputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag || steps.bump.outputs.tag }}
+          REF: ${{ inputs.ref || github.sha }}
         run: |
           [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "::error::${TAG} is not a release tag of the form vX.Y.Z"; exit 1; }
@@ -84,9 +101,9 @@ jobs:
 
       # A new release must carry its version in pyproject.toml.
       - name: Check the version in pyproject.toml
-        if: (github.event_name == 'push' || inputs.tag != '') && !inputs.historical
+        if: (github.ref_type == 'tag' || inputs.tag != '' || steps.bump.outputs.tag != '') && !inputs.historical
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || steps.bump.outputs.tag || github.ref_name }}
         run: |
           git checkout -q "${TAG}" -- pyproject.toml
           python scripts/changelog.py check-version "${TAG}"
@@ -96,11 +113,15 @@ jobs:
         id: list
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          BUMP_TAG: ${{ steps.bump.outputs.tag }}
           HISTORICAL: ${{ inputs.historical }}
         run: |
           release_tags() { git tag --list 'v*.*.*' "$@" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; }
           wait=false
-          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+          if [ "${GITHUB_EVENT_NAME}" = push ] && [ "${GITHUB_REF_TYPE}" = branch ]; then
+            tags="${BUMP_TAG}"
+            wait=true
+          elif [ "${GITHUB_EVENT_NAME}" = push ]; then
             tags="${GITHUB_REF_NAME}"
             wait=true
           elif [ -n "${INPUT_TAG}" ]; then
@@ -119,6 +140,7 @@ jobs:
 
   github-release:
     needs: tags
+    if: needs.tags.outputs.tags != ''
     runs-on: ubuntu-latest
     steps:
       # The notes always come from the default branch, so a release tagged
@@ -156,6 +178,7 @@ jobs:
 
   docker-tags:
     needs: tags
+    if: needs.tags.outputs.tags != ''
     runs-on: ubuntu-latest
     strategy:
       matrix:
