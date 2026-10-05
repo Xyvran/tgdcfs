@@ -1,13 +1,20 @@
 name: Release
 
-# A pushed tag vX.Y.Z becomes a GitHub release whose notes are that version's
+# A release tag vX.Y.Z becomes a GitHub release whose notes are that version's
 # section of CHANGELOG.md, and the Docker images of the tagged commit get the
 # tags X.Y.Z and X.Y. Nothing is rebuilt: the images are the ones
-# docker-publish.yml built from master, so tag a commit that is on master.
+# docker-build-push built from master, so tag a commit that is on master.
 #
-# Run it by hand to (re)publish every existing tag, e.g. after a changelog
-# correction or for tags pushed before this workflow existed. Releases that
-# exist already get their notes updated.
+# Ways to run it:
+# * push a tag vX.Y.Z;
+# * start it by hand with a tag that does not exist yet: the tag is created
+#   on `ref` (default: the head of the default branch) and released;
+# * start it by hand with an existing tag, or with no tag to republish every
+#   release, e.g. after correcting a changelog entry. Existing releases get
+#   their notes updated.
+# `historical` is for tags set on commits from before the changelog: their
+# pyproject.toml has no matching version, and their image is not waited for
+# (a commit that never got an image of its own is skipped with a warning).
 
 on:
   push:
@@ -15,9 +22,18 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (vX.Y.Z); empty publishes every release tag"
+        description: "Release tag vX.Y.Z; empty republishes every release tag"
         required: false
         default: ""
+      ref:
+        description: "Commit to tag when the tag does not exist yet (default: head of the default branch)"
+        required: false
+        default: ""
+      historical:
+        description: "Tag predates the changelog: skip the version check and do not wait for the image"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -32,6 +48,7 @@ jobs:
     outputs:
       tags: ${{ steps.list.outputs.tags }}
       latest: ${{ steps.list.outputs.latest }}
+      wait: ${{ steps.list.outputs.wait }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -43,28 +60,62 @@ jobs:
         with:
           python-version: "3.13"
 
-      # A new release must bump pyproject.toml in the tagged commit. Tags made
-      # before the changelog existed are only published by hand and skip this.
+      - name: Create the tag
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.ref || github.event.repository.default_branch }}
+        run: |
+          [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::${TAG} is not a release tag of the form vX.Y.Z"; exit 1; }
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" > /dev/null; then
+            echo "${TAG} exists already"
+            exit 0
+          fi
+          commit="$(git rev-parse --verify "origin/${REF}^{commit}" 2>/dev/null || git rev-parse --verify "${REF}^{commit}")"
+          git merge-base --is-ancestor "${commit}" "origin/${{ github.event.repository.default_branch }}" \
+            || { echo "::error::${commit} is not on the default branch"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          GIT_COMMITTER_DATE="$(git log -1 --format=%cI "${commit}")" \
+            git tag -a "${TAG}" "${commit}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "Created ${TAG} on ${commit}"
+
+      # A new release must carry its version in pyproject.toml.
       - name: Check the version in pyproject.toml
-        if: github.event_name == 'push'
-        run: python scripts/changelog.py check-version "${GITHUB_REF_NAME}"
+        if: (github.event_name == 'push' || inputs.tag != '') && !inputs.historical
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          git checkout -q "${TAG}" -- pyproject.toml
+          python scripts/changelog.py check-version "${TAG}"
+          git checkout -q HEAD -- pyproject.toml
 
       - name: List the tags to publish
         id: list
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          HISTORICAL: ${{ inputs.historical }}
         run: |
+          release_tags() { git tag --list 'v*.*.*' "$@" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$'; }
+          wait=false
           if [ "${GITHUB_EVENT_NAME}" = push ]; then
             tags="${GITHUB_REF_NAME}"
+            wait=true
           elif [ -n "${INPUT_TAG}" ]; then
             tags="${INPUT_TAG}"
+            if [ "${HISTORICAL}" != true ]; then wait=true; fi
           else
-            tags="$(git tag --list 'v*.*.*' --sort=v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | xargs)"
+            tags="$(release_tags --sort=v:refname | xargs)"
           fi
-          latest="$(git tag --list 'v*.*.*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
-          echo "Publishing: ${tags}; latest release: ${latest}"
-          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          latest="$(release_tags --sort=-v:refname | head -n 1)"
+          echo "Publishing: ${tags}; latest release: ${latest}; wait for images: ${wait}"
+          {
+            echo "tags=${tags}"
+            echo "latest=${latest}"
+            echo "wait=${wait}"
+          } >> "$GITHUB_OUTPUT"
 
   github-release:
     needs: tags
@@ -124,16 +175,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # On a fresh tag the image of its commit may still be building (it is
-      # pushed only after the tests on master pass), so wait for it. A tag
-      # published by hand does not wait: old commits that never got an image
-      # of their own are skipped with a warning.
+      # For a new release the image of its commit may still be building (it is
+      # pushed only after the tests on master pass), so wait for it up to an
+      # hour. Otherwise a commit without an image is skipped with a warning.
       - name: Add the version tags to the commit's image
         env:
           TAGS: ${{ needs.tags.outputs.tags }}
+          WAIT: ${{ needs.tags.outputs.wait }}
           REPOSITORY: ${{ matrix.repository }}
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = push ]; then attempts=60; else attempts=1; fi
+          if [ "${WAIT}" = true ]; then attempts=60; else attempts=1; fi
           for tag in ${TAGS}; do
             sha="$(git rev-list -n 1 "${tag}")"
             version="${tag#v}"
@@ -148,7 +199,7 @@ jobs:
               if [ "${attempt}" -lt "${attempts}" ]; then sleep 60; fi
             done
             if [ "${found}" != true ]; then
-              if [ "${GITHUB_EVENT_NAME}" = push ]; then
+              if [ "${WAIT}" = true ]; then
                 echo "::error::${source} did not appear on Docker Hub"
                 exit 1
               fi

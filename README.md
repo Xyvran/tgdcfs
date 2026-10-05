@@ -870,12 +870,14 @@ To cut a release on `master`:
 1. Rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD`, add an empty
    `[Unreleased]` above it and update the compare links at the bottom.
 2. Set `version` in `pyproject.toml` to `X.Y.Z` and commit both.
-3. Push the commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Push the commit, then either `git tag vX.Y.Z && git push origin vX.Y.Z`,
+   or start the "Release" workflow by hand with the tag `vX.Y.Z`, which
+   creates the tag on the head of `master`.
 
 The "Release" workflow checks the version, publishes the release with that
 version's changelog section as its notes, and tags the images once
-`docker-build-push` has published the commit. Running it by hand republishes
-the notes of every tag, e.g. after correcting an entry.
+`docker-build-push` has published the commit. Started by hand without a tag,
+it republishes the notes of every release, e.g. after correcting an entry.
 
 ### Preview builds
 
