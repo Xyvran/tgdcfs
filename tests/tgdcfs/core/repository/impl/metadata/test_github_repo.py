@@ -1415,7 +1415,31 @@ class TestStatsFiles:
         repo.create_git_commit.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_moved_branch_is_retried(self, repository, repo):
+    async def test_a_load_notes_which_refs_have_a_stored_stat(self, repository, repo):
+        root = self.load(
+            repository,
+            repo,
+            [("a.txt.10", "s1"), ("b.txt.11", "s2"), (".tgdcfsstats.json", "x")],
+        )
+        repo.get_git_blob.return_value = self.blob(
+            {"10": {"size": 5, "createdAt": 1, "modifiedAt": 2}}
+        )
+        a, b = root.files
+        a.stat_epoch = 1  # changed since the start: not restored, but stored
+
+        assert repository.stats_loaded(root) is False
+        await repository.load_stats(root)
+
+        assert repository.stats_loaded(root) is True
+        assert a.stat is None and a.stat_stored is True
+        assert b.stat is None and b.stat_stored is False
+
+    @pytest.mark.asyncio
+    async def test_a_moved_branch_is_retried(self, repository, repo, monkeypatch):
+        monkeypatch.setattr(
+            "tgdcfs.core.repository.impl.metadata.github_repo.STATS_COMMIT_BACKOFF",
+            0.0,
+        )
         root = self.load(repository, repo, [("a.txt.10", "s1")])
         root.files[0].stat = self.stat(5)
         ref, _ = self.commit_mocks(repo)

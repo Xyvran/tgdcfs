@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import logging
+import time
 from typing import Iterable, Optional
 
 from github import Github, GithubException, InputGitTreeElement
@@ -27,8 +28,12 @@ from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
 logger = logging.getLogger(__name__)
 
 
-# How often a stats commit is retried when the branch moved under it.
-STATS_COMMIT_ATTEMPTS = 3
+# How often a stats commit is tried when the branch moved under it, and
+# the pause before the n-th retry (STATS_COMMIT_BACKOFF * n seconds). The
+# commits of this process are serialized by ``GithubConfig.write``, so
+# the branch only moves when another instance writes to it.
+STATS_COMMIT_ATTEMPTS = 5
+STATS_COMMIT_BACKOFF = 1.0
 
 
 def _blob_sha(content: str) -> str:
@@ -109,12 +114,22 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
             return False
         for fr in directory.find_files():
+            entry = entries.get(str(fr.message_id))
+            if entry is not None:
+                fr.stat_stored = True
             # A ref that changed since the start has a stored entry from
             # before the change; it stays empty and is read again.
             if fr.stat is None and fr.stat_epoch == 0:
-                fr.stat = FileStat.from_dict(entries.get(str(fr.message_id)))
+                fr.stat = FileStat.from_dict(entry)
         directory.stats_loaded = True
         return True
+
+    def stats_loaded(self, directory: TGFSDirectory) -> bool:
+        return (
+            not isinstance(directory, GithubDirectory)
+            or directory.stats_sha is None
+            or directory.stats_loaded
+        )
 
     def stats_stored(self, directory: TGFSDirectory) -> bool:
         return isinstance(directory, GithubDirectory) and (
@@ -152,7 +167,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             # Paths and contents are fixed here, on the event loop; the
             # thread only talks to GitHub.
             writes = [(d.stats_path, content) for d, content in changes]
-            await asyncio.to_thread(self._commit_stats, writes)
+            await self._ghc.write(self._commit_stats, writes)
             for directory, content in changes:
                 directory.stats_sha = None if content is None else _blob_sha(content)
                 directory.stats_loaded = True
@@ -175,7 +190,8 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
     def _commit_stats(self, writes: list[tuple[str, Optional[str]]]) -> None:
         """One commit on top of the branch head; retried when another
-        commit landed in between (the ref update is not forced)."""
+        commit landed in between (the ref update is not forced). Runs on a
+        worker thread, under the write lock."""
         repo = self._ghc.repo
         elements = [
             (
@@ -188,6 +204,8 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             for path, content in writes
         ]
         for attempt in range(STATS_COMMIT_ATTEMPTS):
+            if attempt:
+                time.sleep(STATS_COMMIT_BACKOFF * attempt)
             ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
             base_commit = repo.get_git_commit(ref.object.sha)
             tree = repo.create_git_tree(elements, base_tree=base_commit.tree)

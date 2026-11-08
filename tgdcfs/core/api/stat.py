@@ -39,8 +39,9 @@ class FileStatApi:
     (``listing.stat_in_metadata``) the stats are kept on the file refs and
     written to the metadata. A listing then reads no descriptor at all; a
     stat that is not stored yet is read from the descriptor once and
-    written back in the background. A write to a file drops its stat, the
-    next listing reads it again.
+    written back in the background. A write to a file drops its stat and
+    puts the one of the new content in its place (:meth:`remember`), so
+    a folder that is being filled lists without reading anything back.
     """
 
     def __init__(
@@ -141,12 +142,30 @@ class FileStatApi:
         the tree.
         """
         fr.stat_epoch += 1
-        if fr.stat is None and not self._stored(fr.location):
-            return
+        had = fr.stat is not None
         fr.stat = None
-        self.changed(fr.location, pushed)
+        metadata_api = self._metadata_api
+        if metadata_api is None:
+            return
+        directory = fr.location
+        # Whether the metadata may still hold the dropped stat. Only then
+        # is the write urgent: until it happens a restart would show the
+        # old size. A stat that was never written (one a write remembered
+        # a moment ago, during a bulk upload) is just left out of the
+        # next regular write, instead of forcing a commit every few
+        # seconds.
+        outdated = (
+            fr.stat_stored
+            or (had and metadata_api.push_writes_stats)
+            or (self._stored(directory) and not metadata_api.stats_loaded(directory))
+        )
+        if not had and not outdated:
+            return
+        self.changed(directory, pushed, urgent=outdated)
 
-    def changed(self, directory: TGFSDirectory, pushed: bool = False) -> None:
+    def changed(
+        self, directory: TGFSDirectory, pushed: bool = False, urgent: bool = True
+    ) -> None:
         """The set of files in ``directory`` changed (a file was added,
         removed or moved), so its stored stats need rewriting."""
         metadata_api = self._metadata_api
@@ -155,7 +174,51 @@ class FileStatApi:
         if pushed and metadata_api.push_writes_stats:
             return
         if self._persist or self._stored(directory):
-            self._mark(directory, urgent=True)
+            self._mark(directory, urgent=urgent)
+
+    async def remember(
+        self, fr: TGFSFileRef, fd: TGFSFileDesc, pushed: bool = False
+    ) -> None:
+        """Keep the stat of ``fr`` that a write just produced.
+
+        The writer has the new descriptor in hand, so the next listing
+        need not read it back: a folder that is being filled used to make
+        every listing read the descriptor (and, encrypted, the content
+        header) of each file added since the last one, thousands of reads
+        that outlasted the client's patience. ``pushed`` as for
+        :meth:`invalidate`.
+        """
+        if not self._persist:
+            return
+        epoch = fr.stat_epoch
+        try:
+            stat = await self.stat_of(fd)
+        except Exception as ex:
+            # The next listing reads it, as it would have without this.
+            logger.debug(f"No stat for {fr.name} after the write: {ex}")
+            return
+        self.adopt(fr, stat, pushed, epoch)
+
+    def adopt(
+        self,
+        fr: TGFSFileRef,
+        stat: Optional[FileStat],
+        pushed: bool = False,
+        epoch: Optional[int] = None,
+    ) -> None:
+        """Give ``fr`` the known ``stat`` (a copy has the original's), unless
+        the file changed since ``epoch`` or left the tree meanwhile."""
+        if not self._persist or stat is None:
+            return
+        if epoch is not None and fr.stat_epoch != epoch:
+            return
+        if not _in_tree(fr):
+            return
+        fr.stat = stat
+        metadata_api = self._metadata_api
+        if pushed and metadata_api is not None and metadata_api.push_writes_stats:
+            return
+        self._mark(fr.location)
 
     def _stored(self, directory: TGFSDirectory) -> bool:
         return self._metadata_api is not None and self._metadata_api.stats_stored(
@@ -219,6 +282,12 @@ class FileStatApi:
         batch, self._dirty = self._dirty, {}
         self._dirty_since = None
         self._urgent = False
+        # From here on the metadata may hold these stats; a ref whose stat
+        # changes during the write needs the next one soon.
+        for directory in batch.values() if self._persist else ():
+            for fr in directory.find_files():
+                if fr.stat is not None:
+                    fr.stat_stored = True
         try:
             await self._metadata_api.save_stats(batch.values(), keep=self._persist)
             return True

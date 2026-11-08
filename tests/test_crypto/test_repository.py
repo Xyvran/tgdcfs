@@ -617,3 +617,41 @@ async def test_a_plaintext_read_passes_its_own_refusal_on() -> None:
 
     assert out == plaintext
     assert inner.admits == [False, False]
+
+
+# --- the header of a version just written ----------------------------------
+
+
+async def _save_as_version(repo, data: bytes, version_id: str):
+    file_msg = FileMessageFromBuffer.new(buffer=data, name="test.bin")
+    file_msg.version_id = version_id
+    sent = await repo.save(file_msg)
+    return _FakeFileVersion(
+        id=version_id,
+        size=sum(m.size for m in sent),
+        message_ids=[m.message_id for m in sent],
+        part_sizes=[m.size for m in sent],
+    )
+
+
+async def test_the_size_of_a_version_just_written_needs_no_probe() -> None:
+    """A listing right after an upload asks for the plaintext size of every
+    new file; that must not fetch each header back from the store."""
+    repo = _make_repo(chunk_size=4096)
+    fv = await _save_as_version(repo, os.urandom(10_000), "v1")
+
+    assert await repo.content_length(fv) == 10_000
+    assert repo._inner.admits == []  # no read reached the store
+
+
+async def test_a_rewritten_version_gets_its_new_header() -> None:
+    """``update_file_version`` writes new bytes under the same version id;
+    the header cached for the old bytes must not decrypt the new ones."""
+    repo = _make_repo(chunk_size=4096)
+    await _save_as_version(repo, os.urandom(5_000), "v1")
+    plaintext = os.urandom(7_000)
+
+    fv = await _save_as_version(repo, plaintext, "v1")
+
+    assert await repo.content_length(fv) == 7_000
+    assert await _collect(await repo.get(fv, 0, -1, "test.bin")) == plaintext

@@ -85,6 +85,19 @@ class _HeaderCache:
     def put(self, version_id: str, entry: Optional[tuple[FileHeader, bytes]]) -> None:
         if version_id in self._store:
             return
+        self._add(version_id, entry)
+
+    def replace(
+        self, version_id: str, entry: Optional[tuple[FileHeader, bytes]]
+    ) -> None:
+        """Like :meth:`put`, but a cached entry is overwritten: the version
+        was just (re)written with a new header."""
+        if version_id in self._store:
+            self._store[version_id] = entry
+            return
+        self._add(version_id, entry)
+
+    def _add(self, version_id: str, entry: Optional[tuple[FileHeader, bytes]]) -> None:
         if len(self._store) >= self._capacity:
             evict = self._order.pop(0)
             self._store.pop(evict, None)
@@ -136,7 +149,9 @@ class EncryptingFileContentRepository(IFileContentRepository):
             encrypted.get_size(),
             (file_msg.get_size() + self._chunk_size - 1) // self._chunk_size,
         )
-        return await self._inner.save(encrypted)
+        sent = await self._inner.save(encrypted)
+        self._remember_header(file_msg.version_id, header, file_key)
+        return sent
 
     async def stage(
         self, file_msg: UploadableFileMessage, version_id: str
@@ -148,7 +163,19 @@ class EncryptingFileContentRepository(IFileContentRepository):
         file_key = derive_file_key(self._master_key, header.file_salt)
         encrypted = EncryptingFileMessage.wrap(file_msg, file_key, header)
         encrypted.version_id = version_id
-        return await self._inner.stage(encrypted, version_id)
+        staged = await self._inner.stage(encrypted, version_id)
+        if staged is not None:
+            self._remember_header(version_id, header, file_key)
+        return staged
+
+    def _remember_header(
+        self, version_id: Optional[str], header: FileHeader, file_key: bytes
+    ) -> None:
+        """Keep the header of a version just written, so its plaintext size
+        (asked right after the upload, for the listing) and the first read
+        of it do not fetch the header back from the store."""
+        if version_id:
+            self._cache.replace(version_id, (header, file_key))
 
     async def forget(self, version_ids: Iterable[str]) -> None:
         await self._inner.forget(version_ids)

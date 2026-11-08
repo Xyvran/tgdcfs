@@ -40,6 +40,13 @@ class TGFSFileRef:
     # stat read from the descriptor before the change is not stored.
     stat_epoch: int = field(default=0, compare=False, repr=False)
 
+    # Whether the metadata may hold a stat for this ref: one was loaded
+    # from there, or a write of the folder's stats included one. A stat
+    # dropped while this is set has to be overwritten soon, or a restart
+    # would bring back the outdated one; a stat that was never stored
+    # can wait for the next regular write.
+    stat_stored: bool = field(default=False, compare=False, repr=False)
+
     def to_dict(self) -> TGFSFileRefSerialized:
         res = TGFSFileRefSerialized(
             type="FR",
@@ -74,6 +81,9 @@ class TGFSFileRef:
 
     def delete(self) -> None:
         self.location.delete_file_ref(self)
+
+    async def delete_async(self) -> None:
+        await self.location.delete_file_ref_async(self)
 
 
 class FileRefList(list[TGFSFileRef]):
@@ -239,7 +249,8 @@ class TGFSDirectory:
                         if file.get("store")
                         else None
                     ),
-                    stat=FileStat.from_dict(file.get("stat")),
+                    stat=(stat := FileStat.from_dict(file.get("stat"))),
+                    stat_stored=stat is not None,
                 )
                 for file in data["files"]
                 if file["name"] and file["messageId"]
@@ -361,6 +372,50 @@ class TGFSDirectory:
             to.delete_file_ref(moved)
             raise
         return moved
+
+    # -- async forms ---------------------------------------------------------
+    #
+    # The changes above, for callers on the event loop. Here they only
+    # change the tree; a backend that writes each change through to a
+    # remote service (``GithubDirectory``) overrides them to do that off
+    # the loop, so one slow write does not stall every other request.
+
+    async def create_dir_async(self, name: str) -> "TGFSDirectory":
+        return self.create_dir(name)
+
+    async def create_file_ref_async(self, name: str, fd_message_id: int) -> TGFSFileRef:
+        return self.create_file_ref(name, fd_message_id)
+
+    async def delete_file_ref_async(self, fr: TGFSFileRef) -> None:
+        self.delete_file_ref(fr)
+
+    async def relocate_file_ref_async(
+        self, fr: TGFSFileRef, to: "TGFSDirectory", new_name: Optional[str] = None
+    ) -> TGFSFileRef:
+        """:meth:`relocate_file_ref` for callers on the event loop."""
+        name = new_name or fr.name
+        if to is self and name == fr.name:
+            return fr
+
+        moved = await to.create_file_ref_async(name, fr.message_id)
+        moved.mirrors = dict(fr.mirrors)
+        moved.store = fr.store
+        moved.stat = fr.stat
+        moved.stat_epoch = fr.stat_epoch
+        try:
+            await self.delete_file_ref_async(fr)
+        except Exception:
+            await to.delete_file_ref_async(moved)
+            raise
+        return moved
+
+    async def move_to_async(
+        self, new_parent: "TGFSDirectory", new_name: Optional[str] = None
+    ) -> None:
+        self.move_to(new_parent, new_name)
+
+    async def delete_async(self) -> None:
+        self.delete()
 
     def is_ancestor_of(self, other: "TGFSDirectory") -> bool:
         """True when ``other`` is ``self`` or lives somewhere below it."""

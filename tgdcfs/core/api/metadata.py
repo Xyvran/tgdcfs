@@ -57,6 +57,9 @@ class MetaDataApi:
     def stats_stored(self, directory: TGFSDirectory) -> bool:
         return self.__metadata_repo.stats_stored(directory)
 
+    def stats_loaded(self, directory: TGFSDirectory) -> bool:
+        return self.__metadata_repo.stats_loaded(directory)
+
     async def save_stats(
         self, directories: Iterable[TGFSDirectory], keep: bool
     ) -> None:

@@ -24,7 +24,7 @@ class DirectoryApi:
         return self.__metadata_api.get_root_directory()
 
     async def create(self, name: str, under: TGFSDirectory) -> TGFSDirectory:
-        new_dir = under.create_dir(name)
+        new_dir = await under.create_dir_async(name)
         await self.__metadata_api.push()
         return new_dir
 
@@ -54,7 +54,7 @@ class DirectoryApi:
         The subtree keeps referring to the same Telegram messages, so nothing
         is uploaded and, crucially, nothing is deleted from the channel.
         """
-        directory.move_to(to_parent, name)
+        await directory.move_to_async(to_parent, name)
         await self.__metadata_api.push()
         return directory
 
@@ -62,7 +62,7 @@ class DirectoryApi:
         message_ids, mirror_ids = await self.__file_api.collect_deletable_message_ids(
             self.__subtree_file_refs(directory)
         )
-        directory.delete()
+        await directory.delete_async()
         await self.__metadata_api.push()
         await self.__message_api.delete_messages(message_ids)
         await self.__file_api.delete_mirrored(mirror_ids)

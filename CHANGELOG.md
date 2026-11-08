@@ -32,7 +32,9 @@ the fact on the commits that shipped them.
   size and dates in the metadata, so a listing reads no descriptor at all
   and a folder of 10,000 files opens without 20,000 store reads. Missing
   values are read on the first listing and written back in the
-  background, also when the client gives up on the listing halfway. With
+  background, also when the client gives up on the listing halfway. An
+  upload, overwrite or copy stores the new values right away, so a folder
+  that is being filled lists without any reads. With
   `pinned_message` they are a `stat` field in `metadata.json`, with
   `github_repo` one `.tgdcfsstats.json` per folder. Only turn it on when
   every instance that writes to the file system supports it.
@@ -90,6 +92,17 @@ the fact on the commits that shipped them.
 - The `xyvran/tgdcfs-fe` image is published again. Its static build ran
   under arm64 emulation and hit the six-hour job limit; it now runs once on
   the build host, and only the nginx stage is built per platform.
+- With `github_repo` metadata, a write no longer stalls the whole server
+  while GitHub answers. Each new file, folder, move or delete is a commit,
+  which took several seconds during bulk uploads; meanwhile no other
+  request was served, and clients timed out on uploads and listings. The
+  commits now run in the background, one at a time.
+- With `github_repo` metadata and `stat_in_metadata: true`, the folder
+  stats are written again during bulk uploads. Their commit raced the
+  commits of the new files for the branch head and kept failing with
+  "Update is not a fast forward".
+- With encryption, the size of a file just written is known without
+  reading its header back from the store.
 
 ### Security
 

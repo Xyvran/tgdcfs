@@ -851,8 +851,11 @@ from its descriptor on the first listing, and the values are written back
 in the background: after 5 seconds without new values, at least once a
 minute during a long listing, and on shutdown. A client that gives up on a
 huge folder does not lose that work: the descriptor reads it started run to
-the end, and the next attempt finds their results. A write to a file drops
-its stored values, and the next listing reads them again.
+the end, and the next attempt finds their results. An upload, overwrite or
+copy stores the new values right away, so a folder that is being filled
+(a bulk upload of thousands of files) lists without reading anything back.
+Values that replace stored ones are written within seconds; values of new
+files go with the next regular write, at most a minute later.
 
 Keep in mind:
 

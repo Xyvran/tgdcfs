@@ -138,6 +138,11 @@ class IMetaDataRepository(metaclass=ABCMeta):
         """
         return True
 
+    def stats_loaded(self, directory: TGFSDirectory) -> bool:
+        """Whether the stored stats of ``directory`` are on its refs
+        (``TGFSFileRef.stat_stored`` tells which refs have one)."""
+        return True
+
     def stats_stored(self, directory: TGFSDirectory) -> bool:
         """Whether the store may hold stats for files in ``directory``."""
         if self._tree_has_stats is None:
