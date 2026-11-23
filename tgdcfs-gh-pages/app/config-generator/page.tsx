@@ -23,6 +23,7 @@ import yaml from "js-yaml";
 import { useCallback, useEffect, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { DOCKERHUB_IMAGE, GHCR_IMAGE, PAGES_URL } from "../lib/coordinates";
 import { BotTokenField } from "./components/BotTokenField";
 import { ConfigTextField } from "./components/ConfigTextField";
 import { DockerRunPanel } from "./components/DockerRunPanel";
@@ -1192,7 +1193,7 @@ export default function ConfigGenerator() {
                   http://{config.tgdcfs.server.host}:{config.tgdcfs.server.port}
                 </code>{" "}
                 {"("}Used in the{" "}
-                <a href="https://xyvran.github.io/tgdcfs/telegram-mini-app/">
+                <a href={`${PAGES_URL}/telegram-mini-app/`}>
                   <u>Telegram Mini App</u>
                 </a>
                 {")"}.
@@ -1879,7 +1880,8 @@ export default function ConfigGenerator() {
             <Divider sx={{ my: 3 }} />
 
             <DockerRunPanel
-              image="xyvran/tgdcfs"
+              image={DOCKERHUB_IMAGE}
+              ghcrImage={GHCR_IMAGE}
               containerName="tgdcfs"
               dataDir="/home/tgdcfs/.tgdcfs"
               hostDirName=".tgdcfs"

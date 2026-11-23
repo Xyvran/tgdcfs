@@ -14,6 +14,13 @@ RUN npm ci
 # Copy source code
 COPY tgdcfs-gh-pages/ .
 
+# The repository and Docker Hub namespace the image is built for. The config
+# generator and the guides show the Docker images of that repository; the
+# publishing workflows pass both, a plain local build falls back to the
+# upstream's coordinates (see tgdcfs-gh-pages/next.config.ts).
+ARG GITHUB_REPOSITORY
+ARG DOCKERHUB_NAMESPACE
+
 # Build the application
 RUN npm run build
 

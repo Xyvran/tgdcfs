@@ -17,6 +17,7 @@ import {
 } from "@mui/material";
 import Link from "next/link";
 import { useState, useEffect } from "react";
+import { DOCKERHUB_IMAGE } from "../lib/coordinates";
 
 export default function GettingStarted() {
   const [activeStep, setActiveStep] = useState(0);
@@ -437,7 +438,7 @@ export default function GettingStarted() {
                     {dockerConfig.sftpEnabled
                       ? ` -p ${dockerConfig.sftpPort}:${dockerConfig.sftpPort}`
                       : ""}{" "}
-                    xyvran/tgdcfs
+                    {DOCKERHUB_IMAGE}
                   </code>
                 </div>
 

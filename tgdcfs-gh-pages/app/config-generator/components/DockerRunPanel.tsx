@@ -13,10 +13,14 @@ import { ConfigTextField } from "./ConfigTextField";
 
 type PathStyle = "unix" | "windows";
 type Variant = "run" | "compose";
+type Registry = "dockerhub" | "ghcr";
+type Engine = "docker" | "podman";
 
 interface DockerRunPanelProps {
-  // Image without a tag, e.g. "xyvran/tgdcfs".
+  // Docker Hub image without a tag, e.g. "vulcanosoftware/tgdcfs".
   image: string;
+  // GHCR image without a tag, e.g. "ghcr.io/vulcanosoftware/tgdcfs/tgdcfs".
+  ghcrImage: string;
   // Container name and the directory the image reads its config from.
   containerName: string;
   dataDir: string;
@@ -44,12 +48,13 @@ const saveTextFile = (name: string, text: string) => {
   URL.revokeObjectURL(url);
 };
 
-// The docker run command, or the docker-compose.yml, for the config the
-// form describes: one published port each, the data directory mounted
-// where the image expects it and the passphrase variable passed through
-// when encryption reads one.
+// The docker or podman run command, or the docker-compose.yml, for the
+// config the form describes: one published port each, the data directory
+// mounted where the image expects it and the passphrase variable passed
+// through when encryption reads one.
 export function DockerRunPanel({
   image,
+  ghcrImage,
   containerName,
   dataDir,
   hostDirName,
@@ -57,10 +62,14 @@ export function DockerRunPanel({
   envVars,
 }: DockerRunPanelProps) {
   const [variant, setVariant] = useState<Variant>("run");
+  const [registry, setRegistry] = useState<Registry>("dockerhub");
+  const [engine, setEngine] = useState<Engine>("docker");
   const [pathStyle, setPathStyle] = useState<PathStyle>("unix");
   const [hostPath, setHostPath] = useState(defaultHostPath("unix", hostDirName));
   const [detached, setDetached] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  const engineName = engine === "podman" ? "Podman" : "Docker";
 
   // Pick the path style of the visitor's machine once, on the client.
   useEffect(() => {
@@ -77,16 +86,17 @@ export function DockerRunPanel({
   };
 
   const uniquePorts = Array.from(new Set(ports.filter((p) => p > 0)));
+  const selectedImage = registry === "ghcr" ? ghcrImage : image;
 
   const runCommand = [
-    "docker run",
+    `${engine} run`,
     detached ? "-d --restart unless-stopped" : "-it",
     "--pull=always",
     `--name ${containerName}`,
     ...uniquePorts.map((p) => `-p ${p}:${p}`),
     ...envVars.map((name) => `-e ${name}`),
     `-v "${hostPath}:${dataDir}"`,
-    `${image}:latest`,
+    `${selectedImage}:latest`,
   ].join(" ");
 
   // Compose reads the passphrase from a .env file next to it, so the
@@ -94,7 +104,7 @@ export function DockerRunPanel({
   const composeFile = [
     "services:",
     `  ${containerName}:`,
-    `    image: ${image}:latest`,
+    `    image: ${selectedImage}:latest`,
     `    container_name: ${containerName}`,
     "    pull_policy: always",
     "    restart: unless-stopped",
@@ -112,6 +122,9 @@ export function DockerRunPanel({
     "",
   ].join("\n");
 
+  const composeUpCommand =
+    engine === "podman" ? "podman-compose up -d" : "docker compose up -d";
+
   const text = variant === "run" ? runCommand : composeFile;
 
   const copy = () => {
@@ -124,7 +137,7 @@ export function DockerRunPanel({
   return (
     <Box>
       <Typography variant="h6" gutterBottom>
-        Docker
+        Docker / Podman
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         Put the downloaded config.yaml into the directory below; the
@@ -137,8 +150,36 @@ export function DockerRunPanel({
           onChange={(_, value: Variant | null) => value && setVariant(value)}
           size="small"
         >
-          <ToggleButton value="run">docker run</ToggleButton>
-          <ToggleButton value="compose">docker compose</ToggleButton>
+          <ToggleButton value="run">{engine} run</ToggleButton>
+          <ToggleButton value="compose">{engine} compose</ToggleButton>
+        </ToggleButtonGroup>
+      </Box>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+        <Typography variant="body2" color="text.secondary">
+          Engine:
+        </Typography>
+        <ToggleButtonGroup
+          value={engine}
+          exclusive
+          onChange={(_, value: Engine | null) => value && setEngine(value)}
+          size="small"
+        >
+          <ToggleButton value="docker">Docker</ToggleButton>
+          <ToggleButton value="podman">Podman</ToggleButton>
+        </ToggleButtonGroup>
+      </Box>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+        <Typography variant="body2" color="text.secondary">
+          Registry:
+        </Typography>
+        <ToggleButtonGroup
+          value={registry}
+          exclusive
+          onChange={(_, value: Registry | null) => value && setRegistry(value)}
+          size="small"
+        >
+          <ToggleButton value="dockerhub">Docker Hub</ToggleButton>
+          <ToggleButton value="ghcr">GHCR</ToggleButton>
         </ToggleButtonGroup>
       </Box>
       <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
@@ -164,7 +205,7 @@ export function DockerRunPanel({
       />
       {variant === "run" && (
         <FormControlLabel
-          label="Run in the background and restart with Docker"
+          label={`Run in the background and restart with ${engineName}`}
           control={
             <Checkbox
               checked={detached}
@@ -220,7 +261,7 @@ export function DockerRunPanel({
       </Box>
       {variant === "compose" && (
         <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-          Start it with <code>docker compose up -d</code> from the directory
+          Start it with <code>{composeUpCommand}</code> from the directory
           that holds the file.
         </Typography>
       )}
@@ -235,8 +276,8 @@ export function DockerRunPanel({
                   <code>{name}</code>
                 </span>
               ))}{" "}
-              in the shell first; Docker passes the value through without it
-              appearing in the command.
+              in the shell first; {engineName} passes the value through
+              without it appearing in the command.
             </>
           ) : (
             <>

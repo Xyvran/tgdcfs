@@ -47,6 +47,24 @@ the fact on the commits that shipped them.
   gets one line with its result and duration, and a store call that is
   still running after 60 seconds is named in a warning every minute.
   The scan used to run for half an hour without a single log line.
+- The Docker images are also published to GHCR
+  (`ghcr.io/<owner>/<repo>/tgdcfs` and `ghcr.io/<owner>/<repo>/tgdcfs-fe`)
+  next to Docker Hub, with the same `latest`, commit, `preview` and release
+  tags. GHCR publishing uses the workflow's own `GITHUB_TOKEN`, so a fork
+  without Docker Hub secrets still ships its images; Docker Hub publishing
+  is skipped with a warning there instead of failing the workflow. The
+  Docker Hub namespace is the repository owner unless the repository
+  variable `DOCKERHUB_NAMESPACE` says otherwise.
+- Config generator: the Docker command panel has a registry switch (Docker
+  Hub or GHCR) and an engine switch, so the shown commands and
+  `docker-compose.yml` can pull from either registry and use `podman` and
+  `podman-compose` instead of Docker. Docker Hub and Docker stay the
+  defaults.
+- The Docker image names and the Pages URL in the config generator and the
+  getting-started guide are derived from `GITHUB_REPOSITORY` and
+  `DOCKERHUB_NAMESPACE` at build time (`next.config.ts`; the Pages workflow
+  and the `tgdcfs-fe` image build pass them in) instead of being hard-coded.
+  A plain local build falls back to the upstream's names.
 
 ### Changed
 

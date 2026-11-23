@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: docker-preview-${{ github.ref }}
@@ -22,36 +23,78 @@ jobs:
     runs-on: ubuntu-latest
     # Belt and braces: the release branch is served by docker-build-push.
     if: github.ref != 'refs/heads/master'
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, never
+      # the upstream one. Override with the repository variable
+      # DOCKERHUB_NAMESPACE when the Docker Hub namespace differs from the
+      # GitHub username.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: xyvran/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: xyvran/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Ubuntu 26.04 runners stack the docker-default AppArmor profile
+      # (docker-default//&unconfined), which denies signals between processes
+      # inside a container. `next build` kills its build workers, so the
+      # frontend image fails with "Error: kill EACCES" (moby/moby#54099).
+      # Runners are single-use VMs, so relaxing the sysctl here is safe.
+      - name: Allow signals inside build containers
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+
+      # Docker Hub namespaces are lowercase, but github.repository_owner keeps
+      # the case of the GitHub account name (VulcanoSoftware). Docker reads a
+      # first path component with capitals as a registry host name and tries
+      # to push to https://VulcanoSoftware/, so lowercase it for later steps.
+      - name: Lowercase the Docker Hub namespace
+        run: echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE,,}" >> "$GITHUB_ENV"
+
+      - name: Lowercase the GHCR repository
+        run: echo "GHCR_REPOSITORY=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Prepare build
         id: prep
         env:
-          REPOSITORY: ${{ matrix.repository }}
+          # A step's env values are literal text, not shell-expanded, so
+          # the namespace has to come from the env context here.
+          REPOSITORY: ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}
+          GHCR_REPOSITORY: ${{ env.GHCR_REPOSITORY }}/${{ matrix.name }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           # Tags come from the commit, never from the branch name, so they are
           # stable regardless of how a branch is called or renamed.
           short="${GITHUB_SHA::12}"
-          image="${REPOSITORY}:preview-${short}"
+          image="${GHCR_REPOSITORY}:preview-${short}"
+          dockerhub_tags="${REPOSITORY}:preview,${REPOSITORY}:preview-${short}"
+          ghcr_tags="${GHCR_REPOSITORY}:preview,${image}"
+          # Publishing to Docker Hub needs its credentials. A repository
+          # without those secrets (a fork that never set them) still builds,
+          # smoke-tests and publishes to GHCR, which the workflow's own
+          # GITHUB_TOKEN covers. The secrets are the whole check: this runs
+          # on `push`, where only the repository that owns them can read
+          # them, and a hard-coded owner name here kept every fork from
+          # publishing to its own Docker Hub.
+          can_push=$([ -n "${DOCKERHUB_TOKEN}" ] && [ -n "${DOCKERHUB_USERNAME}" ] && echo true || echo false)
+          if [ "${can_push}" = true ]; then
+            push_tags="${dockerhub_tags},${ghcr_tags}"
+          else
+            push_tags="${ghcr_tags}"
+          fi
           {
             echo "image=${image}"
-            echo "tags=${REPOSITORY}:preview,${image}"
-            # Forks have no access to the registry secrets; there the job still
-            # builds and smoke-tests, it just does not publish.
-            echo "can_push=$([ -n "${DOCKERHUB_TOKEN}" ] && echo true || echo false)"
+            echo "push_tags=${push_tags}"
+            echo "dockerhub_tags=${dockerhub_tags}"
+            echo "ghcr_tags=${ghcr_tags}"
+            echo "can_push=${can_push}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
@@ -64,10 +107,17 @@ jobs:
           file: ./${{ matrix.dockerfile }}
           platforms: linux/amd64
           # Load into the local daemon first so the image can be exercised
-          # before anything reaches the registry.
+          # before anything reaches the registry. Tagging it with the GHCR
+          # name here is local only: the smoke tests below then find it
+          # without a pull, which a private GHCR package would deny.
           load: true
           push: false
-          tags: ${{ steps.prep.outputs.tags }}
+          tags: ${{ steps.prep.outputs.image }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
 
@@ -128,21 +178,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push ${{ matrix.name }}
-        if: steps.prep.outputs.can_push == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.prep.outputs.tags }}
+          tags: ${{ steps.prep.outputs.push_tags }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}
           # Everything is already in the cache from the build above, so this
           # only uploads layers.
           cache-from: type=gha
 
       - name: Summarise
-        if: steps.prep.outputs.can_push == 'true'
         run: |
           {
             echo "### ${{ matrix.name }} preview image"
@@ -151,6 +211,8 @@ jobs:
             echo "docker pull ${{ steps.prep.outputs.image }}"
             echo '```'
             echo
-            echo "Also tagged \`${{ matrix.repository }}:preview\`, which moves with every"
-            echo "feature-branch build. Use the commit-pinned tag above when that matters."
+            if [ "${{ steps.prep.outputs.can_push }}" = true ]; then
+              echo "Also tagged \`${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:preview\`, which moves with every"
+              echo "feature-branch build. Use the commit-pinned tag above when that matters."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
