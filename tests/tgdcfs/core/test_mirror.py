@@ -16,6 +16,7 @@ from tgdcfs.core.repository.impl.file_content import StoreFileContentRepository
 from tgdcfs.core.repository.interface import FDRepositoryResp
 from tgdcfs.errors import MessageNotFound, TechnicalError
 from tgdcfs.reqres import Document, MessageResp, Replica, SentFileMessage
+from tgdcfs.utils.throttle import in_background
 
 
 class TestRedundancyConfig:
@@ -627,6 +628,35 @@ class TestBackfill:
         assert fr.mirrors == {"tg:999": 15}
         assert len(fd_repo.saved) == 1
         metadata_api.push.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backfill_runs_as_background_work(self, mocker):
+        """Its requests are paced by the background throttle."""
+        group, _, mirror_api = make_group(mocker)
+        seen = []
+
+        async def copy_from(*_args, **_kwargs):
+            seen.append(in_background())
+            return [11]
+
+        mirror_api.copy_from.side_effect = copy_from
+
+        root = TGFSDirectory.root_dir()
+        root.create_file_ref("a.txt", 5)
+        fd = TGFSFileDesc(name="a.txt")
+        fd.add_version(make_sent_version())
+        client = SimpleNamespace(
+            name="test",
+            mirror_group=group,
+            fd_repo=FakeFDRepo(fd),
+            metadata_api=mocker.AsyncMock(),
+            dir_api=SimpleNamespace(root=root),
+        )
+
+        await backfill_mirrors(client)  # type: ignore[arg-type]
+
+        assert seen == [True]
+        assert not in_background()
 
     @pytest.mark.asyncio
     async def test_backfill_skips_fully_mirrored(self, mocker):

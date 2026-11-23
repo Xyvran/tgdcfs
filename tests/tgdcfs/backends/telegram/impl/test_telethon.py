@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock
 
@@ -673,6 +674,77 @@ class TestTelethonAPI:
         with pytest.raises(FileReferenceExpiredError):
             async for _ in resp.chunks:
                 pass
+
+    @pytest.mark.asyncio
+    async def test_download_file_restarts_a_stalled_stream(
+        self, telethon_api, mock_chat, mock_document_message, mocker
+    ):
+        """A request that never returns is abandoned and the download
+        starts over at the byte it had reached."""
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.stall_limits",
+            return_value=(0.05, 3),
+        )
+        telethon_api._client.get_messages.return_value = TotalList(
+            [mock_document_message]
+        )
+
+        offsets = []
+
+        def mock_iter_download(*_args, **kwargs):
+            offsets.append(kwargs["offset"])
+
+            async def gen():
+                if len(offsets) == 1:
+                    yield b"abc"
+                    await asyncio.Event().wait()
+                yield b"abcdef"
+
+            return gen()
+
+        telethon_api._client.iter_download = mock_iter_download
+
+        resp = await telethon_api.download_file(
+            DownloadFileReq(chat=mock_chat, message_id=54321, begin=0, end=5)
+        )
+        chunks = [chunk async for chunk in resp.chunks]
+
+        assert chunks == [b"abc", b"def"]
+        assert offsets == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_download_file_fails_after_repeated_stalls(
+        self, telethon_api, mock_chat, mock_document_message, mocker
+    ):
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.stall_limits",
+            return_value=(0.01, 2),
+        )
+        telethon_api._client.get_messages.return_value = TotalList(
+            [mock_document_message]
+        )
+
+        attempts = []
+
+        def mock_iter_download(*_args, **_kwargs):
+            attempts.append(1)
+
+            async def gen():
+                await asyncio.Event().wait()
+                yield b""  # pragma: no cover - never reached
+
+            return gen()
+
+        telethon_api._client.iter_download = mock_iter_download
+
+        resp = await telethon_api.download_file(
+            DownloadFileReq(chat=mock_chat, message_id=54321, begin=0, end=5)
+        )
+
+        with pytest.raises(TechnicalError, match="stalled 3 times, last at byte 0"):
+            async for _ in resp.chunks:
+                pass
+        assert len(attempts) == 3
 
     @pytest.mark.asyncio
     async def test_download_file_message_without_document(

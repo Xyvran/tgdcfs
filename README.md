@@ -295,7 +295,9 @@ in each of them:
   into the descriptor. The queue lives in `replication_queue.json` in
   the data directory, so nothing is lost on a restart; failed items back
   off and retry. `GET /api/replication/queue` shows what is pending,
-  `POST /api/replication/retry` retries failed items now. When `sync`
+  `POST /api/replication/retry` retries failed items now, and
+  `GET /api/replication/throttle` shows how fast each bot may work for
+  the background (see [Transfer performance](#transfer-performance)). When `sync`
   is not set, a file system with a mirror that has to re-upload (a
   Discord store on either side, another backend, `mode: reupload`)
   runs in the background and Telegram-to-Telegram forwarding inline;
@@ -780,6 +782,15 @@ tgdcfs:
     upload_parts_in_flight: 1
     read_parallel_window: 8
     tee_buffer_mb: 64
+    background:
+      start_rate: 2.0                 # requests/s per bot
+      min_rate: 0.2
+      max_rate: 6.0
+      increase_step: 0.5
+      increase_interval_seconds: 60
+      foreground_cooldown_seconds: 30
+      stall_timeout_seconds: 120
+      stall_restarts: 3
 ```
 
 **Downloads** are cut into pieces and several are fetched at once. Bytes
@@ -814,6 +825,31 @@ a `sync: tee` upload, described under [Mirroring](#mirroring).
 answers a flood with a wait, which TGDCFS honours; if uploads start logging
 flood waits, lower `upload_workers_big` and `connection_pool_size` before
 raising anything else.
+
+**Background transfers** -- the backfill and the `sync: background`
+replication queue -- are paced so they cannot run the bots into flood
+waits. Every bot has its own budget, because each has its own limits:
+every Telegram bot, the user account and every Discord bot, in either
+direction of a mirror. A budget starts at `start_rate` requests per
+second. A flood wait (Telegram) or a 429 (Discord) on that bot halves it,
+never below `min_rate`, and blocks the bot for as long as the server
+asked. Each `increase_interval_seconds` without one raises it by
+`increase_step`, up to `max_rate`. Background requests go to the bot that
+is free soonest, so a bot in cooldown is left alone while the others
+work.
+
+Foreground transfers (WebDAV, SFTP, the API) are never paced. While one
+runs, and for `foreground_cooldown_seconds` after the last one ended,
+every bot serves the background at `min_rate` only; afterwards the budgets
+ramp up again from `start_rate`. Flood waits caused by foreground requests
+still count against the bot's background budget.
+`GET /api/replication/throttle` shows the current rate, block and flood
+wait count of every bot.
+
+A Telegram download that receives nothing for `stall_timeout_seconds` is
+restarted at the byte it had reached, at most `stall_restarts` times
+before it fails. A request can hang without ever failing, and a backfill
+would otherwise wait on it forever. This applies to every download.
 
 `scripts/measure_transfer.py` shows what the piece-level parallelism is
 worth against a simulated link, without needing a channel.

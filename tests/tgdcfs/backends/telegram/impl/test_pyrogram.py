@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -69,6 +70,63 @@ class TestPyrogramDownload:
         )
 
         with pytest.raises(TechnicalError, match="ended after 8 of 100 bytes"):
+            async for _ in resp.chunks:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_restarts_a_stalled_stream(self, api, document_message, mocker):
+        """The restart asks for the chunk holding the byte reached and drops
+        what was already served of it."""
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.pyrogram.stall_limits",
+            return_value=(0.05, 3),
+        )
+        api._client.get_messages.return_value = document_message
+        calls: list[dict] = []
+
+        def get_file(**kwargs):
+            calls.append(kwargs)
+
+            async def gen():
+                if len(calls) == 1:
+                    yield b"abc"
+                    await asyncio.Event().wait()
+                yield b"abcdef"
+
+            return gen()
+
+        api._client.get_file = get_file
+
+        resp = await api.download_file(
+            DownloadFileReq(chat=1, message_id=54321, begin=0, end=5)
+        )
+        chunks = [chunk async for chunk in resp.chunks]
+
+        assert chunks == [b"abc", b"def"]
+        assert [c["offset"] for c in calls] == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_fails_after_repeated_stalls(self, api, document_message, mocker):
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.pyrogram.stall_limits",
+            return_value=(0.01, 1),
+        )
+        api._client.get_messages.return_value = document_message
+
+        def get_file(**_kwargs):
+            async def gen():
+                await asyncio.Event().wait()
+                yield b""  # pragma: no cover - never reached
+
+            return gen()
+
+        api._client.get_file = get_file
+
+        resp = await api.download_file(
+            DownloadFileReq(chat=1, message_id=54321, begin=0, end=5)
+        )
+
+        with pytest.raises(TechnicalError, match="stalled 2 times"):
             async for _ in resp.chunks:
                 pass
 

@@ -43,6 +43,7 @@ from tgdcfs.reqres import (
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
 from tgdcfs.utils.others import exclude_none
+from tgdcfs.utils.stall import StreamStalled, next_chunk, stall_limits
 
 logger = logging.getLogger(__name__)
 
@@ -303,20 +304,26 @@ class TelethonAPI(ITDLibClient):
             offset = req.begin
             refreshed = False
 
+            stall_timeout, max_restarts = stall_limits()
+            stalls = 0
+
             while rest > 0:
                 aligned = offset - offset % DOWNLOAD_REQUEST_SIZE
                 skip = offset - aligned
+                stream = self._transfer_client.iter_download(
+                    file=InputDocumentFileLocation(
+                        id=doc.id,
+                        access_hash=doc.access_hash,
+                        file_reference=doc.file_reference,
+                        thumb_size="",
+                    ),
+                    offset=aligned,
+                    request_size=DOWNLOAD_REQUEST_SIZE,
+                )
                 try:
-                    async for chunk in self._transfer_client.iter_download(
-                        file=InputDocumentFileLocation(
-                            id=doc.id,
-                            access_hash=doc.access_hash,
-                            file_reference=doc.file_reference,
-                            thumb_size="",
-                        ),
-                        offset=aligned,
-                        request_size=DOWNLOAD_REQUEST_SIZE,
-                    ):
+                    while rest > 0:
+                        if (chunk := await next_chunk(stream, stall_timeout)) is None:
+                            break
                         if skip:
                             if len(chunk) <= skip:
                                 skip -= len(chunk)
@@ -328,8 +335,6 @@ class TelethonAPI(ITDLibClient):
                         yield chunk
                         rest -= len(chunk)
                         offset += len(chunk)
-                        if rest <= 0:
-                            break
                 except FileReferenceExpiredError:
                     # Re-resolve once and resume where the stream stopped.
                     if refreshed:
@@ -337,6 +342,21 @@ class TelethonAPI(ITDLibClient):
                     refreshed = True
                     doc = await self._document_for(
                         req.chat, req.message_id, refresh=True
+                    )
+                    continue
+                except StreamStalled:
+                    # A request that never returns; start over at the same
+                    # offset, on the next connection where there is one.
+                    stalls += 1
+                    if stalls > max_restarts:
+                        raise TechnicalError(
+                            f"Download of message {req.message_id} stalled "
+                            f"{stalls} times, last at byte {offset}"
+                        )
+                    logger.warning(
+                        f"Download of message {req.message_id} received nothing "
+                        f"for {stall_timeout:.0f}s at byte {offset}, restarting "
+                        f"({stalls}/{max_restarts})"
                     )
                     continue
                 break

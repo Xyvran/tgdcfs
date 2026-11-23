@@ -165,6 +165,20 @@ tgdcfs:
   #   chunk_cache_block_kb: 1024
   #   upload_parts_in_flight: 1   # parts of one version sent at once from a cache file
   #   read_parallel_window: 8     # reorder window of a multi-source read, in pieces
+  #   # Pacing of the backfill and the background replication queue, per
+  #   # bot (Telegram bots, the account, Discord bots). Halved on a flood
+  #   # wait or 429, raised after quiet intervals, held at min_rate while
+  #   # foreground transfers run. Downloads that receive nothing for
+  #   # stall_timeout_seconds restart at the same byte.
+  #   background:
+  #     start_rate: 2.0             # requests/s per bot
+  #     min_rate: 0.2
+  #     max_rate: 6.0
+  #     increase_step: 0.5
+  #     increase_interval_seconds: 60
+  #     foreground_cooldown_seconds: 30
+  #     stall_timeout_seconds: 120
+  #     stall_restarts: 3
 
   # ---------------------------------------------------------------------------
   # Optional local cache, off by default. See the README, "Local cache".

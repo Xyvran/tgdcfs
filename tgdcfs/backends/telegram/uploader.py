@@ -16,6 +16,7 @@ from tgdcfs.reqres import (
     UploadedFile,
 )
 from tgdcfs.utils.others import flood_wait_seconds, is_big_file
+from tgdcfs.utils.throttle import throttle
 
 from .interface import ITDLibClient
 
@@ -88,23 +89,24 @@ class FileUploader:
     async def _upload_chunk(self, chunk: FileChunk) -> None:
         for attempt in range(1, MAX_PART_ATTEMPTS + 1):
             try:
-                if self._is_big:
-                    rsp = await self.client.save_big_file_part(
-                        SaveBigFilePartReq(
-                            file_id=self._file_id,
-                            bytes=chunk.content,
-                            file_part=chunk.file_part,
-                            file_total_parts=self._total_parts,
+                async with throttle.request(self.client.throttle_key):
+                    if self._is_big:
+                        rsp = await self.client.save_big_file_part(
+                            SaveBigFilePartReq(
+                                file_id=self._file_id,
+                                bytes=chunk.content,
+                                file_part=chunk.file_part,
+                                file_total_parts=self._total_parts,
+                            )
                         )
-                    )
-                else:
-                    rsp = await self.client.save_file_part(
-                        SaveFilePartReq(
-                            file_id=self._file_id,
-                            bytes=chunk.content,
-                            file_part=chunk.file_part,
+                    else:
+                        rsp = await self.client.save_file_part(
+                            SaveFilePartReq(
+                                file_id=self._file_id,
+                                bytes=chunk.content,
+                                file_part=chunk.file_part,
+                            )
                         )
-                    )
 
                 if not rsp.success:
                     raise TechnicalError(f"Unexpected response: {rsp}")

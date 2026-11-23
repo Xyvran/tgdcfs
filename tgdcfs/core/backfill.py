@@ -30,6 +30,7 @@ from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import Replica, SentFileMessage
 from tgdcfs.tasks import task_store
 from tgdcfs.tasks.models import TaskStatus, TaskType
+from tgdcfs.utils.throttle import background_work
 
 if TYPE_CHECKING:
     from tgdcfs.core.client import Client
@@ -222,6 +223,7 @@ async def _distribute_pending(
     return True
 
 
+@background_work
 async def backfill_file(
     client: "Client", fr: TGFSFileRef, verify: bool, report: BackfillReport
 ) -> None:
@@ -343,6 +345,7 @@ def _sync_ref(fr: TGFSFileRef, resp: "FDRepositoryResp") -> None:
         fr.store = resp.store
 
 
+@background_work
 async def backfill_mirrors(
     client: "Client",
     verify: bool = False,

@@ -307,7 +307,8 @@ class TestTelegramStore:
         assert call_args.message_id == 12345
         assert call_args.begin == 0
         assert call_args.end == 99
-        assert result == mock_response
+        # The stream is wrapped to count as a foreground transfer.
+        assert result.size == mock_response.size
 
     @staticmethod
     def _transfer_settings(mocker, **overrides) -> TransferConfig:
@@ -484,7 +485,7 @@ class TestTelegramStore:
 
         # Assert - should not use parallel download regardless of size
         mock_tdlib.next_bot.download_file.assert_called_once()
-        assert result == mock_response
+        assert result.size == mock_response.size
 
     @pytest.mark.asyncio
     async def test_download_file_to_the_end_without_the_block_cache(
@@ -513,7 +514,8 @@ class TestTelegramStore:
         mock_response = Mock(spec=DownloadFileResp, chunks=AsyncMock(), size=6000)
         mock_tdlib.next_bot.download_file.return_value = mock_response
 
-        assert await message_api.download_file(77, 0, -1) == mock_response
+        result = await message_api.download_file(77, 0, -1)
+        assert result.size == mock_response.size
         req = mock_tdlib.next_bot.download_file.call_args[0][0]
         assert (req.begin, req.end) == (0, 5999)
 

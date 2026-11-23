@@ -39,6 +39,7 @@ from tgdcfs.reqres import (
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
 from tgdcfs.utils.others import exclude_none
+from tgdcfs.utils.stall import StreamStalled, next_chunk, stall_limits
 
 logger = logging.getLogger(__name__)
 
@@ -293,26 +294,52 @@ class PyrogramAPI(ITDLibClient):
                     f"Invalid range: end must be greater than or equal to begin, got begin={req.begin} end={req.end}"
                 )
 
-            # The bytes between the chunk boundary and the wanted offset
-            # arrive first and are dropped.
-            skip = req.begin % GET_FILE_CHUNK_SIZE
-            if res := self._client.get_file(
-                file_id=file_id.FileId.decode(message.document.file_id),
-                offset=req.begin // GET_FILE_CHUNK_SIZE,
-            ):
-                async for chunk in res:
-                    if skip:
-                        if len(chunk) <= skip:
-                            skip -= len(chunk)
-                            continue
-                        chunk = chunk[skip:]
-                        skip = 0
-                    if len(chunk) > rest:
-                        chunk = chunk[:rest]
-                    yield chunk
-                    rest -= len(chunk)
-                    if rest <= 0:
-                        break
+            stall_timeout, max_restarts = stall_limits()
+            stalls = 0
+            offset = req.begin
+
+            while rest > 0:
+                # The bytes between the chunk boundary and the wanted offset
+                # arrive first and are dropped.
+                skip = offset % GET_FILE_CHUNK_SIZE
+                if not (
+                    res := self._client.get_file(
+                        file_id=file_id.FileId.decode(message.document.file_id),
+                        offset=offset // GET_FILE_CHUNK_SIZE,
+                    )
+                ):
+                    break
+                try:
+                    while rest > 0:
+                        if (chunk := await next_chunk(res, stall_timeout)) is None:
+                            break
+                        if skip:
+                            if len(chunk) <= skip:
+                                skip -= len(chunk)
+                                continue
+                            chunk = chunk[skip:]
+                            skip = 0
+                        if len(chunk) > rest:
+                            chunk = chunk[:rest]
+                        yield chunk
+                        rest -= len(chunk)
+                        offset += len(chunk)
+                except StreamStalled:
+                    # A request that never returns; start over at the same
+                    # offset.
+                    stalls += 1
+                    if stalls > max_restarts:
+                        raise TechnicalError(
+                            f"Download of message {req.message_id} stalled "
+                            f"{stalls} times, last at byte {offset}"
+                        )
+                    logger.warning(
+                        f"Download of message {req.message_id} received nothing "
+                        f"for {stall_timeout:.0f}s at byte {offset}, restarting "
+                        f"({stalls}/{max_restarts})"
+                    )
+                    continue
+                break
 
             if rest > 0:
                 # A stream that stops early would otherwise be passed on as

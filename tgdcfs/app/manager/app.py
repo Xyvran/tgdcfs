@@ -16,6 +16,7 @@ from tgdcfs.core.ops import Ops
 from tgdcfs.core.replication import ReplicationQueue
 from tgdcfs.reqres import MessageRespWithDocument
 from tgdcfs.tasks import task_store
+from tgdcfs.utils.throttle import throttle
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,12 @@ def create_manager_app(
         if replication is None:
             return {}
         return replication.to_dict()
+
+    @app.get("/replication/throttle")
+    async def get_replication_throttle():
+        """Background request budget per bot, and whether foreground
+        transfers are holding the background back."""
+        return throttle.snapshot()
 
     @app.post("/replication/retry")
     async def retry_replication(

@@ -1,6 +1,7 @@
 import pytest
 
 from tgdcfs.config import (
+    BackgroundTransferConfig,
     CacheConfig,
     Config,
     GithubRepoConfig,
@@ -343,6 +344,35 @@ class TestTransferConfig:
 
     def test_a_disabled_cache_is_allowed(self):
         assert TransferConfig.from_dict({"chunk_cache_mb": 0}).chunk_cache_mb == 0
+
+
+class TestBackgroundTransferConfig:
+    def test_defaults_when_absent(self):
+        background = TransferConfig.from_dict({}).background
+        assert background == BackgroundTransferConfig()
+        assert background.start_rate == 2.0
+        assert background.stall_restarts == 3
+
+    def test_overrides(self):
+        background = TransferConfig.from_dict(
+            {"background": {"start_rate": 1, "max_rate": 3, "stall_restarts": 0}}
+        ).background
+        assert background.start_rate == 1.0
+        assert background.max_rate == 3.0
+        assert background.stall_restarts == 0
+
+    @pytest.mark.parametrize("key", ["start_rate", "min_rate", "stall_timeout_seconds"])
+    def test_rejects_non_positive_values(self, key):
+        with pytest.raises(ValueError, match=key):
+            BackgroundTransferConfig.from_dict({key: 0})
+
+    def test_rejects_negative_restarts(self):
+        with pytest.raises(ValueError, match="stall_restarts"):
+            BackgroundTransferConfig.from_dict({"stall_restarts": -1})
+
+    def test_rejects_a_start_rate_outside_the_bounds(self):
+        with pytest.raises(ValueError, match="min_rate <= start_rate <= max_rate"):
+            BackgroundTransferConfig.from_dict({"start_rate": 10})
 
 
 class TestGithubRepoConfig:

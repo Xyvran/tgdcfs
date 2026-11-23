@@ -48,6 +48,19 @@ the fact on the commits that shipped them.
   still running after 60 seconds is named in a warning every minute.
   The scan used to run for half an hour without a single log line.
 
+- Background transfers no longer run the bots into flood waits. The
+  backfill and the `sync: background` replication queue are paced per bot
+  -- every Telegram bot, the user account and every Discord bot, in both
+  directions of a mirror -- with a rate that halves on a flood wait or a
+  Discord 429 and grows again after quiet intervals. Background requests
+  go to the bot that is free soonest, and while a foreground transfer
+  runs the background drops to its minimum rate. New config block
+  `tgdcfs.transfer.background`; `GET /api/replication/throttle` shows the
+  state of every bot.
+- A Telegram download that receives nothing for two minutes is restarted
+  at the byte it had reached, at most three times before it fails
+  (`stall_timeout_seconds`, `stall_restarts`). A single hanging request
+  used to stall a backfill indefinitely.
 ### Changed
 
 - WebDAV listings report a file's creation date as the date of its oldest

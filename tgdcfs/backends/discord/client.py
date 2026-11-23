@@ -310,6 +310,11 @@ class DiscordBotAPI:
     # -- identity ----------------------------------------------------------
 
     @property
+    def throttle_key(self) -> str:
+        """Names this bot's request budget in the background throttle."""
+        return f"discord:{self.user_id or self.name}"
+
+    @property
     def user_name(self) -> str:
         user = self._bot.user
         return user.name if user else self.name

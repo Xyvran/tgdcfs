@@ -46,6 +46,7 @@ from tgdcfs.reqres import (
     UploadableFileMessage,
 )
 from tgdcfs.utils.message_cache import channel_cache
+from tgdcfs.utils.throttle import in_background, throttle
 
 from .client import DiscordBotAPI, SentMessage, is_transient
 
@@ -130,6 +131,20 @@ class DiscordStore(IStore):
     def next_bot(self) -> DiscordBotAPI:
         return next(self._bots_cycle)
 
+    def _pick_bot(self) -> DiscordBotAPI:
+        """Round robin for the foreground, the bot free soonest for
+        background work."""
+        return throttle.pick(self._bots, lambda bot: bot.throttle_key) or self.next_bot
+
+    async def _with_bot(
+        self, action: Callable[[DiscordBotAPI], Awaitable[Any]], bot=None
+    ) -> Any:
+        """Run one request on ``bot`` (or a picked one), paced when it is
+        background work and with its 429s fed to the throttle."""
+        bot = bot or self._pick_bot()
+        async with throttle.request(bot.throttle_key):
+            return await action(bot)
+
     # -- retries -----------------------------------------------------------
 
     async def _retry(self, what: str, action):
@@ -167,9 +182,9 @@ class DiscordStore(IStore):
         used: List[DiscordBotAPI] = []
 
         async def attempt() -> SentMessage:
-            bot = self.next_bot
+            bot = self._pick_bot()
             used.append(bot)
-            return await action(bot)
+            return await self._with_bot(action, bot)
 
         sent = await self._retry(what, attempt)
         self._authors[sent.message_id] = used[-1]
@@ -191,7 +206,9 @@ class DiscordStore(IStore):
             return known
         author = await self._retry(
             f"author of {message_id}",
-            lambda: self.next_bot.get_author_id(self.channel_id, message_id),
+            lambda: self._with_bot(
+                lambda bot: bot.get_author_id(self.channel_id, message_id)
+            ),
         )
         for bot in self._bots:
             if bot.user_id == author:
@@ -218,12 +235,12 @@ class DiscordStore(IStore):
         """
         bot = await self._author_bot(message_id)
         try:
-            return await self._retry(what, lambda: action(bot))
+            return await self._retry(what, lambda: self._with_bot(action, bot))
         except Exception as ex:
             if not is_foreign_message_error(ex):
                 raise
         bot = await self._author_bot(message_id, refresh=True)
-        return await self._retry(what, lambda: action(bot))
+        return await self._retry(what, lambda: self._with_bot(action, bot))
 
     # -- text messages -----------------------------------------------------
 
@@ -275,8 +292,8 @@ class DiscordStore(IStore):
         """Replace the overflow marker with the descriptor text it stands for."""
         if message.text != OVERFLOW_CAPTION or message.document is None:
             return message
-        chunks, _ = await self.next_bot.download(
-            self.channel_id, message.message_id, 0, -1
+        chunks, _ = await self._with_bot(
+            lambda bot: bot.download(self.channel_id, message.message_id, 0, -1)
         )
         data = bytearray()
         async for chunk in chunks:
@@ -296,7 +313,9 @@ class DiscordStore(IStore):
         if missing:
             fetched = await self._retry(
                 "get_messages",
-                lambda: self.next_bot.get_messages(self.channel_id, missing),
+                lambda: self._with_bot(
+                    lambda bot: bot.get_messages(self.channel_id, missing)
+                ),
             )
             for mid, message in zip(missing, fetched):
                 if message is not None:
@@ -343,6 +362,10 @@ class DiscordStore(IStore):
             self._upload_slots.release()
 
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        with throttle.foreground():
+            return await self._upload(file_msg)
+
+    async def _upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         """Send ``file_msg`` as parts of at most ``max_part_bytes``.
 
         Parts are read sequentially (the message is a stream) and sent
@@ -406,7 +429,9 @@ class DiscordStore(IStore):
         async with self._download_slots:
             chunks, size = await self._retry(
                 f"download of message {message_id}",
-                lambda: self.next_bot.download(self.channel_id, message_id, begin, end),
+                lambda: self._with_bot(
+                    lambda bot: bot.download(self.channel_id, message_id, begin, end)
+                ),
             )
 
         async def guarded() -> AsyncIterator[bytes]:
@@ -414,7 +439,11 @@ class DiscordStore(IStore):
                 async for chunk in chunks:
                     yield chunk
 
-        return DownloadFileResp(chunks=guarded(), size=size)
+        # The bytes come from the CDN, which the bot limits do not cover;
+        # only the request that opened the download is paced.
+        if in_background():
+            return DownloadFileResp(chunks=guarded(), size=size)
+        return DownloadFileResp(chunks=throttle.foreground_stream(guarded()), size=size)
 
     async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int:
         if len(buffer) > self._max_part_bytes:
@@ -483,7 +512,9 @@ class DiscordStore(IStore):
         try:
             await self._retry(
                 "delete_messages",
-                lambda: self.next_bot.delete_messages(self.channel_id, unique),
+                lambda: self._with_bot(
+                    lambda bot: bot.delete_messages(self.channel_id, unique)
+                ),
             )
         except Exception as ex:
             logger.warning(
@@ -496,7 +527,9 @@ class DiscordStore(IStore):
     async def pin_message(self, message_id: int) -> None:
         await self._retry(
             f"pin_message {message_id}",
-            lambda: self.next_bot.pin_message(self.channel_id, message_id),
+            lambda: self._with_bot(
+                lambda bot: bot.pin_message(self.channel_id, message_id)
+            ),
         )
 
     async def get_pinned_message(self) -> MessageRespWithDocument:
@@ -504,7 +537,9 @@ class DiscordStore(IStore):
 
         pins = await self._retry(
             "get_pinned_messages",
-            lambda: self.next_bot.get_pinned_messages(self.channel_id),
+            lambda: self._with_bot(
+                lambda bot: bot.get_pinned_messages(self.channel_id)
+            ),
         )
         for message in pins:
             if message.document is not None and message.text != OVERFLOW_CAPTION:

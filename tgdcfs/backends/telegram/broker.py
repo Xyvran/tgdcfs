@@ -6,6 +6,7 @@ from typing import List, Optional, Set
 
 from tgdcfs.reqres import GetMessagesReq, GetMessagesResp, MessageResp
 from tgdcfs.utils.message_cache import channel_cache
+from tgdcfs.utils.throttle import in_background, throttle
 
 from .interface import TDLibApi
 
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 class Request:
     ids: list[int]
     future: asyncio.Future[GetMessagesResp]
+    # Whether the request comes from background work; a batch made of
+    # such requests only is paced by the background throttle.
+    background: bool = False
 
 
 class MessageBroker:
@@ -41,7 +45,7 @@ class MessageBroker:
         future = loop.create_future()
 
         async with self.__lock:
-            self.__requests.append(Request(ids, future))
+            self.__requests.append(Request(ids, future, in_background()))
             if self.__task is None:
                 self.__task = loop.create_task(self.__collect())
         return await future
@@ -92,22 +96,36 @@ class MessageBroker:
                     request.future.set_exception(ex)
             raise
 
+    def __bot_for(self, background: bool):
+        if background:
+            return (
+                throttle.pick(self.tdlib.bots, lambda bot: bot.throttle_key, force=True)
+                or self.tdlib.next_bot
+            )
+        return self.tdlib.next_bot
+
     async def process_requests(self, requests: List[Request]) -> None:
         if not requests:
             return
 
         ids: Set[int] = reduce(lambda full, req: full.union(req.ids), requests, set())
 
+        # The collector runs in the context of whichever request started
+        # it, so the batch decides for itself whether it is background.
+        background = all(r.background for r in requests)
+
         e: Optional[Exception] = None
-        bot = self.tdlib.next_bot
+        bot = self.__bot_for(background)
         for _ in range(self.__bots_count):
             try:
-
-                messages = await bot.get_messages(
-                    GetMessagesReq(
-                        chat=self.private_file_channel, message_ids=tuple(ids)
+                async with throttle.request(
+                    bot.throttle_key, pace=background, force=True
+                ):
+                    messages = await bot.get_messages(
+                        GetMessagesReq(
+                            chat=self.private_file_channel, message_ids=tuple(ids)
+                        )
                     )
-                )
 
                 messages_map = {
                     msg.message_id: msg for msg in messages if msg is not None
@@ -125,7 +143,7 @@ class MessageBroker:
                 logger.error(
                     f"{me.name} failed to get messages: {ex}, retrying with next bot..."
                 )
-                bot = self.tdlib.next_bot
+                bot = self.__bot_for(background)
         if not e:
             return
 

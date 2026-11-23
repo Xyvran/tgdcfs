@@ -28,8 +28,13 @@ from tgdcfs.reqres import (
 
 
 class ITDLibClient(metaclass=ABCMeta):
+    # Names this client's request budget in the background throttle;
+    # ``TDLibApi`` gives each client a readable name of its own.
+    throttle_key: str = "telegram"
+
     def __init__(self):
         self._me: Optional[GetMeResp] = None
+        self.throttle_key = f"telegram:{id(self):x}"
 
     @abstractmethod
     async def get_messages(self, req: GetMessagesReq) -> GetMessagesResp:
@@ -115,6 +120,10 @@ class TDLibApi:
 
     def __post_init__(self):
         self.__bots_cycle = cycle(self.bots)
+        for index, bot in enumerate(self.bots, start=1):
+            bot.throttle_key = f"telegram:bot{index}"
+        if self.account is not None:
+            self.account.throttle_key = "telegram:account"
 
     @property
     def bot(self) -> ITDLibClient:

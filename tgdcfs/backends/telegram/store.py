@@ -57,9 +57,10 @@ from tgdcfs.utils.chunk_cache import (
 from tgdcfs.utils.message_cache import MessageCache
 from tgdcfs.utils.others import exclude_none
 from tgdcfs.utils.prefetching_chain import prefetching_chain
+from tgdcfs.utils.throttle import in_background, throttle
 
 from .broker import MessageBroker
-from .interface import TDLibApi
+from .interface import ITDLibClient, TDLibApi
 from .uploader import FileUploader
 
 logger = logging.getLogger(__name__)
@@ -383,7 +384,7 @@ class TelegramStore(MessageBroker, IStore):
         if use_account_api and (account_api := self.tdlib.account):
             api = account_api
         else:
-            api = self.tdlib.next_bot
+            api = self._pick_bot()
 
         uploader = FileUploader(api, file_msg)
         logger.info(
@@ -424,6 +425,10 @@ class TelegramStore(MessageBroker, IStore):
         return list(self._partition(size, part_size))
 
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        with throttle.foreground():
+            return await self._upload(file_msg)
+
+    async def _upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         """Upload ``file_msg`` in parts of at most one Telegram document.
 
         Files above the bot limit go through the premium account when the
@@ -599,13 +604,14 @@ class TelegramStore(MessageBroker, IStore):
         """
 
         async def piece() -> AsyncIterator[bytes]:
-            resp = await self.tdlib.next_bot.download_file(
+            resp = await self._bot_download(
+                self._pick_bot(),
                 DownloadFileReq(
                     chat=self.private_file_channel,
                     message_id=message_id,
                     begin=begin,
                     end=end,
-                )
+                ),
             )
             async for chunk in resp.chunks:
                 yield chunk
@@ -807,9 +813,34 @@ class TelegramStore(MessageBroker, IStore):
     async def download_file(
         self, message_id: int, begin: int, end: int
     ) -> DownloadFileResp:
-        if (cached := await self._download_cached(message_id, begin, end)) is not None:
-            return cached
-        return await self._download_uncached(message_id, begin, end)
+        if (cached := await self._download_cached(message_id, begin, end)) is None:
+            resp = await self._download_uncached(message_id, begin, end)
+        else:
+            resp = cached
+        if in_background():
+            return resp
+        return DownloadFileResp(
+            chunks=throttle.foreground_stream(resp.chunks), size=resp.size
+        )
+
+    def _pick_bot(self) -> ITDLibClient:
+        """The bot for the next transfer request: round robin for the
+        foreground, the bot free soonest for background work."""
+        return (
+            throttle.pick(self.tdlib.bots, lambda bot: bot.throttle_key)
+            or self.tdlib.next_bot
+        )
+
+    @staticmethod
+    async def _bot_download(
+        bot: ITDLibClient, req: DownloadFileReq
+    ) -> DownloadFileResp:
+        """Download through one bot. Every chunk is one request, so the
+        stream is paced chunk by chunk when it is background work."""
+        key = bot.throttle_key
+        async with throttle.request(key, pace=False):
+            resp = await bot.download_file(req)
+        return DownloadFileResp(chunks=throttle.paced(key, resp.chunks), size=resp.size)
 
     async def _download_uncached(
         self, message_id: int, begin: int, end: int
@@ -828,13 +859,14 @@ class TelegramStore(MessageBroker, IStore):
             and account_config.used_to_download
             and (account := self.tdlib.account)
         ):
-            return await account.download_file(
+            return await self._bot_download(
+                account,
                 DownloadFileReq(
                     chat=self.private_file_channel,
                     message_id=message_id,
                     begin=begin,
                     end=end,
-                )
+                ),
             )
 
         if (
@@ -843,11 +875,12 @@ class TelegramStore(MessageBroker, IStore):
         ):
             return await self.download_file_parallel(message_id, begin, end)
 
-        return await self.tdlib.next_bot.download_file(
+        return await self._bot_download(
+            self._pick_bot(),
             DownloadFileReq(
                 chat=self.private_file_channel,
                 message_id=message_id,
                 begin=begin,
                 end=end,
-            )
+            ),
         )

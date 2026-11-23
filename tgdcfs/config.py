@@ -308,6 +308,76 @@ class SFTPConfig:
 
 
 @dataclass
+class BackgroundTransferConfig:
+    """Pacing of background transfers: backfill and the replication queue.
+
+    Every bot (each Telegram bot, the user account, each Discord bot) gets
+    its own request budget. It starts at ``start_rate`` requests per
+    second, is halved on every flood wait or Discord 429 that bot receives
+    (never below ``min_rate``), and grows by ``increase_step`` after each
+    ``increase_interval_seconds`` without one, up to ``max_rate``.
+
+    While a foreground transfer (WebDAV, SFTP, the API) is running, and
+    for ``foreground_cooldown_seconds`` after the last one ended, every
+    bot serves the background at ``min_rate`` only; afterwards the budget
+    ramps up again from ``start_rate``. Foreground requests are never
+    paced.
+
+    A Telegram download that receives nothing for
+    ``stall_timeout_seconds`` is restarted at the same offset, at most
+    ``stall_restarts`` times before it fails. This applies to every
+    download, foreground included.
+    """
+
+    start_rate: float = 2.0
+    min_rate: float = 0.2
+    max_rate: float = 6.0
+    increase_step: float = 0.5
+    increase_interval_seconds: float = 60.0
+    foreground_cooldown_seconds: float = 30.0
+    stall_timeout_seconds: float = 120.0
+    stall_restarts: int = 3
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "BackgroundTransferConfig":
+        data = data or {}
+        defaults = cls()
+
+        def positive(key: str) -> float:
+            value = float(data.get(key, getattr(defaults, key)))
+            if value <= 0:
+                raise ValueError(
+                    f"transfer.background.{key} must be positive, got {value}"
+                )
+            return value
+
+        def non_negative(key: str) -> float:
+            value = float(data.get(key, getattr(defaults, key)))
+            if value < 0:
+                raise ValueError(
+                    f"transfer.background.{key} must not be negative, got {value}"
+                )
+            return value
+
+        config = cls(
+            start_rate=positive("start_rate"),
+            min_rate=positive("min_rate"),
+            max_rate=positive("max_rate"),
+            increase_step=non_negative("increase_step"),
+            increase_interval_seconds=positive("increase_interval_seconds"),
+            foreground_cooldown_seconds=non_negative("foreground_cooldown_seconds"),
+            stall_timeout_seconds=positive("stall_timeout_seconds"),
+            stall_restarts=int(non_negative("stall_restarts")),
+        )
+        if not config.min_rate <= config.start_rate <= config.max_rate:
+            raise ValueError(
+                "transfer.background needs min_rate <= start_rate <= max_rate, got "
+                f"{config.min_rate}, {config.start_rate}, {config.max_rate}"
+            )
+        return config
+
+
+@dataclass
 class TransferConfig:
     """Tuning knobs for moving file bytes to and from Telegram.
 
@@ -357,6 +427,9 @@ class TransferConfig:
     # of the upload stream and the mirror's upload; a full buffer makes
     # the primary wait.
     tee_buffer_mb: int = 64
+    background: BackgroundTransferConfig = field(
+        default_factory=BackgroundTransferConfig
+    )
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_READ_PARALLEL_WINDOW = 8
@@ -459,6 +532,7 @@ class TransferConfig:
                 "read_parallel_window", cls.DEFAULT_READ_PARALLEL_WINDOW
             ),
             tee_buffer_mb=positive("tee_buffer_mb", cls.DEFAULT_TEE_BUFFER_MB),
+            background=BackgroundTransferConfig.from_dict(data.get("background")),
         )
 
 

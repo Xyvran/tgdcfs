@@ -112,6 +112,31 @@ class TestManagerApp:
         assert [i.path for i in queue.ready("Test-Channel")] == ["/a.bin"]
         assert client.post("/replication/retry?filesystem=nope").status_code == 404
 
+    def test_throttle_endpoint(self, mock_clients, mock_config, mocker):
+        from tgdcfs.config import BackgroundTransferConfig
+        from tgdcfs.utils.throttle import Throttle
+
+        throttle = Throttle(config=BackgroundTransferConfig, clock=lambda: 100.0)
+        throttle.flood("telegram:bot0", 12)
+        mocker.patch("tgdcfs.app.manager.app.throttle", throttle)
+        client = TestClient(create_manager_app(mock_clients, mock_config))
+
+        response = client.get("/replication/throttle")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "foreground_transfers": 0,
+            "foreground_busy": False,
+            "bots": {
+                "telegram:bot0": {
+                    "rate": 1.0,
+                    "effective_rate": 1.0,
+                    "blocked_for_seconds": 12.0,
+                    "flood_waits": 1,
+                }
+            },
+        }
+
     def test_replication_endpoints_without_a_queue(self, mock_clients, mock_config):
         client = TestClient(create_manager_app(mock_clients, mock_config))
         assert client.get("/replication/queue").json() == {}
