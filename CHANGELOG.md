@@ -47,6 +47,30 @@ the fact on the commits that shipped them.
   gets one line with its result and duration, and a store call that is
   still running after 60 seconds is named in a warning every minute.
   The scan used to run for half an hour without a single log line.
+- SFTP uploads stream into Telegram and Discord as the data arrives instead
+  of being buffered whole first. SFTP does not announce the file size up
+  front, so the Telegram store now uses the streamed-upload protocol
+  (`upload.saveBigFilePart` with `file_total_parts = -1` per part, the real
+  total only on the last part), and large files are sent as parts of at
+  most 2 GB by the bot without needing a premium account. Writes that run
+  ahead of the upload are staged in a spooled buffer: in memory up to
+  `upload_buffer_size_mb`, on disk in `upload_buffer_dir` beyond that, so
+  strongly interleaved clients (sshfs, rclone with many requests in flight)
+  work whatever order their writes arrive in. The upload only moves through
+  a staged region once it is contiguous, and a gap no write ever covers is
+  zero-filled on close. A write that lands behind bytes already streamed
+  fails the upload rather than store a corrupted file, and a jump further
+  ahead than the new `sftp.max_ahead_gap_mb` (default 1024 MiB) is rejected.
+  The disk staging is enforced against the actual free space of
+  `upload_buffer_dir`, re-checked on every staged write: an upload that
+  would outgrow the disk fails with a clear error ("not enough space in
+  upload_buffer_dir: need X, have Y") and is discarded instead of being
+  committed truncated, and the startup warning reports the effective cap.
+- With `sync: tee`, streamed uploads of unknown size (SFTP) feed the
+  re-uploading mirrors from the stream too. The tee refused a stream
+  without a size, so with a Discord mirror nothing arrived there until a
+  later background pass; the branches now end at the stream's own EOF
+  instead of at a byte count.
 
 ### Changed
 
@@ -116,6 +140,16 @@ the fact on the commits that shipped them.
   "Update is not a fast forward".
 - With encryption, the size of a file just written is known without
   reading its header back from the store.
+- An SFTP upload no longer fails with "Connection timed out after 20
+  seconds of inactivity" when GitHub is slow or briefly unavailable. The
+  file reference that reserves the name at open was written to the GitHub
+  metadata repo before the open returned: a run of 500 errors kept the open
+  -- and with it the whole transfer -- waiting for over 20 s, and FileZilla
+  gave up. The reservation is still made right away, but the blob write now
+  runs in the background and retries for about ten minutes before the
+  reference is given up on. A delete or rename that gets in first is not
+  undone by a late retry, and a retry whose earlier attempt had already
+  landed counts as done.
 
 ### Security
 

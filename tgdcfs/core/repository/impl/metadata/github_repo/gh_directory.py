@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TypeVar
 
+import requests
 from github import Github, InputGitTreeElement
 from github.Repository import Repository
 
@@ -19,6 +20,33 @@ from .stats_file import STATS_FILE_NAME
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# A deferred file reference write (an SFTP open does not wait for it) can
+# take much more punishment: ten rounds over roughly ten minutes before the
+# reference is given up on.
+DEFERRED_PUT_ATTEMPTS = 10
+DEFERRED_PUT_RETRY_DELAY = 5
+
+
+def _is_transient(ex: Exception) -> bool:
+    status = getattr(ex, "status", None)
+    if status is not None:
+        return status >= 500
+    return isinstance(ex, (requests.exceptions.RequestException, OSError))
+
+
+def _is_sha_missing(ex: Exception) -> bool:
+    """GitHub's answer to creating a file that exists already.
+
+    A write whose response was lost (the connection dropped after GitHub
+    committed) is tried again, and the second attempt is refused with 422
+    "sha wasn't supplied": the blob is there, so that is a success.
+    """
+    if getattr(ex, "status", None) != 422:
+        return False
+    data = getattr(ex, "data", None)
+    message = data.get("message", "") if isinstance(data, dict) else ""
+    return '"sha" wasn\'t supplied' in str(message)
 
 
 @dataclass
@@ -108,6 +136,9 @@ class GithubDirectory(TGFSDirectory):
         # there is none; whether its content has been put on the file refs.
         self.stats_sha: Optional[str] = None
         self.stats_loaded = False
+        # Background blob writes started by ``create_file_ref_deferred``;
+        # only kept here so they are not garbage collected mid-flight.
+        self._deferred_refs: set[asyncio.Task] = set()
 
     # --- dates ---------------------------------------------------------------
     #
@@ -428,6 +459,72 @@ class GithubDirectory(TGFSDirectory):
             f"Created file reference {name} in {self._ghc.repo_name} at {file_path}"
         )
         return file_ref
+
+    async def create_file_ref_deferred(
+        self, name: str, file_message_id: int
+    ) -> TGFSFileRef:
+        """Create the reference now, write the blob in the background.
+
+        The in-memory part runs right away so the name shows up in a
+        listing and a following upload finds it; only the GitHub blob
+        write is deferred, so a GitHub outage cannot hold an SFTP open --
+        and with it the client's transfer -- hostage. A write that keeps
+        failing is treated like a failing ``create_file_ref_async``: the
+        reference leaves the tree and the error is logged.
+        """
+        file_ref = super().create_file_ref(name, file_message_id)
+        file_path = self._file_ref_path(name, file_message_id)
+        message = f"Create file reference for {self._message_name(name)}"
+        task = asyncio.create_task(
+            self._put_file_ref_patiently(file_ref, file_path, message),
+            name=f"github-file-ref-{name}",
+        )
+        self._deferred_refs.add(task)
+        task.add_done_callback(self._deferred_refs.discard)
+        return file_ref
+
+    def _create_placeholder_if_present(
+        self, file_ref: TGFSFileRef, path: str, message: str
+    ) -> None:
+        """Runs on the writer thread, under the write lock.
+
+        A delete or rename that waited for the lock before this write has
+        taken the reference out of the tree; writing its blob anyway would
+        bring the deleted file back after a restart.
+        """
+        if any(r is file_ref for r in self.files):
+            self._create_placeholder(path, message)
+
+    async def _put_file_ref_patiently(
+        self, file_ref: TGFSFileRef, file_path: str, message: str
+    ) -> None:
+        for attempt in range(DEFERRED_PUT_ATTEMPTS):
+            try:
+                await self._ghc.write(
+                    self._create_placeholder_if_present, file_ref, file_path, message
+                )
+            except Exception as ex:
+                if _is_sha_missing(ex) or (
+                    attempt > 0 and getattr(ex, "status", None) == 422
+                ):
+                    # An earlier attempt got through although its answer was
+                    # lost: after a transient failure, any 422 means the blob
+                    # is there rather than a fresh validation error.
+                    return
+                if attempt == DEFERRED_PUT_ATTEMPTS - 1 or not _is_transient(ex):
+                    self._file_ref_not_created(file_ref, ex)
+                    return
+                logger.warning(
+                    f"Creating file reference {file_ref.name} failed ({ex}); "
+                    "trying again"
+                )
+                await asyncio.sleep(DEFERRED_PUT_RETRY_DELAY * (attempt + 1))
+            else:
+                logger.info(
+                    f"Created file reference {file_ref.name} in "
+                    f"{self._ghc.repo_name} at {file_path}"
+                )
+                return
 
     def _file_ref_not_created(self, file_ref: TGFSFileRef, ex: Exception) -> None:
         logger.error(
