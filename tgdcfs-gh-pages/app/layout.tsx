@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { GeistMono } from "geist/font/mono";
 import { GeistSans } from "geist/font/sans";
 import "./globals.css";
+import { AppearanceProvider } from "./appearance/AppearanceProvider";
 import { ThemeProvider } from "./theme-provider";
 
 export const metadata: Metadata = {
@@ -20,7 +21,9 @@ export default function RootLayout({
         className={`${GeistSans.variable} ${GeistMono.variable} antialiased`}
       >
         <ThemeProvider>
-          {children}
+          <AppearanceProvider>
+            {children}
+          </AppearanceProvider>
         </ThemeProvider>
       </body>
     </html>

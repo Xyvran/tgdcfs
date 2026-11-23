@@ -49,6 +49,11 @@ jobs:
       - name: Build with Next.js
         run: npm run build
         working-directory: ./tgdcfs-gh-pages
+        # next.config.ts derives the Docker images and the Pages URL shown in
+        # the config generator and the guides from these.
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4

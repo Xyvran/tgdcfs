@@ -17,6 +17,8 @@ import {
 } from "@mui/material";
 import Link from "next/link";
 import { useState, useEffect } from "react";
+import { DOCKERHUB_IMAGE } from "../lib/coordinates";
+import { CustomizePanel } from "../appearance/CustomizePanel";
 
 export default function GettingStarted() {
   const [activeStep, setActiveStep] = useState(0);
@@ -46,17 +48,17 @@ export default function GettingStarted() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800">
+    <div className="dcfs-page">
       <div className="container mx-auto px-6 py-12 max-w-4xl">
         <header className="text-center mb-12">
           <Link
             href="/"
-            className="inline-flex items-center text-slate-400 hover:text-white mb-6 transition-colors"
+            className="dcfs-pill mb-6"
           >
             <ArrowBack className="w-5 h-5 mr-2" />
             Back to Home
           </Link>
-          <h1 className="text-4xl font-bold text-white mb-4">
+          <h1 className="text-4xl font-bold text-white mb-4 dcfs-gradient-text">
             Getting Started with TGDCFS
           </h1>
           <p className="text-xl text-slate-300">
@@ -65,7 +67,7 @@ export default function GettingStarted() {
           </p>
         </header>
 
-        <div className="bg-slate-800 rounded-xl p-8 shadow-lg border border-slate-700">
+        <div className="dcfs-glass dcfs-fade-in p-8">
           <Stepper activeStep={activeStep} orientation="vertical">
             <Step>
               <StepLabel
@@ -97,7 +99,7 @@ export default function GettingStarted() {
                       href="https://my.telegram.org/apps"
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-blue-500 hover:text-blue-600 underline"
+                      className="dcfs-link underline"
                     >
                       https://my.telegram.org/apps
                     </a>
@@ -154,7 +156,7 @@ export default function GettingStarted() {
                     href="https://discord.com/developers/applications"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-blue-500 hover:text-blue-600 underline"
+                    className="dcfs-link underline"
                   >
                     discord.com/developers
                   </a>
@@ -208,14 +210,14 @@ export default function GettingStarted() {
                       href="https://t.me/botfather"
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center px-3 py-1 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors text-sm"
+                      className="dcfs-chip text-sm"
                     >
                       @BotFather
                     </a>
                   </li>
                   <li style={{ marginBottom: "12px" }}>
                     Send{" "}
-                    <code className="bg-slate-700 px-2 py-1 rounded">
+                    <code className="px-2 py-1 rounded">
                       /newbot
                     </code>{" "}
                     to create a new bot
@@ -280,7 +282,7 @@ export default function GettingStarted() {
                     href="/config-generator"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                    className="dcfs-chip"
                   >
                     <Settings className="w-5 h-5 mr-2" />
                     Open Config Generator
@@ -427,7 +429,7 @@ export default function GettingStarted() {
                   </Box>
                 </Box>
                 <div
-                  className="bg-slate-700 rounded-lg p-4"
+                  className="dcfs-codeblock p-4"
                   style={{ marginBottom: "24px" }}
                 >
                   <code className="text-sm text-slate-300 block break-all">
@@ -437,7 +439,7 @@ export default function GettingStarted() {
                     {dockerConfig.sftpEnabled
                       ? ` -p ${dockerConfig.sftpPort}:${dockerConfig.sftpPort}`
                       : ""}{" "}
-                    xyvran/tgdcfs
+                    {DOCKERHUB_IMAGE}
                   </code>
                 </div>
 
@@ -525,7 +527,7 @@ export default function GettingStarted() {
                 <div style={{ marginBottom: "24px" }}>
                   <Link
                     href="https://t.me/tgdcfsprdbot/manager"
-                    className="inline-flex items-center px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+                    className="dcfs-chip"
                   >
                     <Apps className="w-5 h-5 mr-2" />
                     Try Mini App
@@ -536,6 +538,7 @@ export default function GettingStarted() {
           </Stepper>
         </div>
       </div>
+      <CustomizePanel />
     </div>
   );
 }

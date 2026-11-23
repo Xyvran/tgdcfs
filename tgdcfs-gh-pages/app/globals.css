@@ -3,6 +3,8 @@
 :root {
   --background: #0a0a0a;
   --foreground: #ededed;
+  --dcfs-accent: #2aabee;
+  --dcfs-accent-rgb: 42, 171, 238;
   color-scheme: dark;
 }
 
@@ -30,4 +32,245 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* ---------------------------------------------------------------------------
+ * Appearance system
+ *
+ * The appearance customizer (app/appearance) drives everything below through
+ * two CSS variables on <html>: --dcfs-accent (hex) and --dcfs-accent-rgb
+ * (comma triplet for rgba()). data-bg picks a page background style and
+ * data-effects turns the glow/blur/animation layer off.
+ * ------------------------------------------------------------------------- */
+
+.dcfs-page {
+  min-height: 100vh;
+  color: #e2e8f0;
+  background-color: #0b1220;
+}
+
+html[data-bg="aurora"] .dcfs-page {
+  background:
+    radial-gradient(60rem 40rem at 85% -10%, rgba(var(--dcfs-accent-rgb), 0.16), transparent 60%),
+    radial-gradient(50rem 35rem at -10% 25%, rgba(var(--dcfs-accent-rgb), 0.09), transparent 55%),
+    linear-gradient(160deg, #0b1220 0%, #101a2e 55%, #0b1220 100%);
+}
+
+html[data-bg="midnight"] .dcfs-page {
+  background:
+    radial-gradient(70rem 30rem at 50% -20%, rgba(var(--dcfs-accent-rgb), 0.14), transparent 60%),
+    #070b14;
+}
+
+html[data-bg="solid"] .dcfs-page {
+  background: #0b1220;
+}
+
+html[data-effects="off"] .dcfs-page {
+  background: #0b1220;
+}
+
+.dcfs-page .dcfs-glass {
+  background: rgba(13, 20, 36, 0.66);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(var(--dcfs-accent-rgb), 0.18);
+  border-radius: 20px;
+  box-shadow: 0 20px 60px rgba(2, 6, 23, 0.55);
+}
+
+html[data-effects="off"] .dcfs-glass {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+  background: #101828;
+}
+
+.dcfs-page .dcfs-gradient-text {
+  background: linear-gradient(120deg, #f8fafc 25%, rgb(var(--dcfs-accent-rgb)) 80%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.dcfs-page .dcfs-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(255, 255, 255, 0.04);
+  color: #94a3b8;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.dcfs-page .dcfs-pill:hover {
+  color: #fff;
+  border-color: rgba(var(--dcfs-accent-rgb), 0.5);
+  background: rgba(var(--dcfs-accent-rgb), 0.08);
+}
+
+.dcfs-page .dcfs-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 0.75rem;
+  background: linear-gradient(
+    135deg,
+    rgb(var(--dcfs-accent-rgb)),
+    rgba(var(--dcfs-accent-rgb), 0.75)
+  );
+  color: #fff;
+  font-weight: 500;
+  transition: filter 0.15s ease;
+}
+
+.dcfs-page .dcfs-chip:hover {
+  filter: brightness(1.1);
+}
+
+.dcfs-page .dcfs-codeblock {
+  background: rgba(10, 16, 30, 0.8);
+  border: 1px solid rgba(var(--dcfs-accent-rgb), 0.25);
+  border-radius: 14px;
+}
+
+html[data-effects="off"] .dcfs-page .dcfs-codeblock {
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+.dcfs-link {
+  color: var(--dcfs-accent);
+  text-decoration: none;
+  transition: filter 0.15s ease;
+}
+
+.dcfs-link:hover {
+  filter: brightness(1.2);
+  text-decoration: underline;
+}
+
+@keyframes dcfs-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+html[data-effects="on"] .dcfs-fade-in {
+  animation: dcfs-fade-up 0.5s ease both;
+}
+
+/* --- MUI scopes for the dark pages -------------------------------------- */
+
+.dcfs-page .MuiPaper-root {
+  background-color: rgba(13, 20, 36, 0.66);
+}
+
+.dcfs-page .MuiOutlinedInput-root {
+  background: rgba(10, 16, 30, 0.55);
+  border-radius: 10px;
+}
+
+.dcfs-page .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+  border-color: rgba(var(--dcfs-accent-rgb), 0.55);
+}
+
+.dcfs-page .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiInputLabel-root.Mui-focused {
+  color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiButton-contained {
+  background: linear-gradient(
+    135deg,
+    rgb(var(--dcfs-accent-rgb)),
+    rgba(var(--dcfs-accent-rgb), 0.75)
+  );
+  color: #fff;
+}
+
+.dcfs-page .MuiButton-contained:hover {
+  filter: brightness(1.1);
+}
+
+.dcfs-page .MuiButton-outlined {
+  border-color: rgba(var(--dcfs-accent-rgb), 0.45);
+  color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiButton-outlined:hover {
+  border-color: rgba(var(--dcfs-accent-rgb), 0.7);
+  background-color: rgba(var(--dcfs-accent-rgb), 0.08);
+}
+
+.dcfs-page .MuiToggleButton-root {
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+.dcfs-page .MuiToggleButton-root.Mui-selected {
+  color: #fff;
+  background-color: rgba(var(--dcfs-accent-rgb), 0.35);
+}
+
+.dcfs-page .MuiToggleButton-root.Mui-selected:hover {
+  background-color: rgba(var(--dcfs-accent-rgb), 0.45);
+}
+
+.dcfs-page .MuiCheckbox-root.Mui-checked,
+.dcfs-page .MuiRadio-root.Mui-checked {
+  color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiSwitch-switchBase.Mui-checked {
+  color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track {
+  background-color: rgba(var(--dcfs-accent-rgb), 0.6);
+}
+
+.dcfs-page .MuiAlert-root {
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+.dcfs-page .MuiDivider-root {
+  border-color: rgba(148, 163, 184, 0.15);
+}
+
+.dcfs-page .MuiStepIcon-root {
+  color: rgba(148, 163, 184, 0.4);
+}
+
+.dcfs-page .MuiStepIcon-root.Mui-active,
+.dcfs-page .MuiStepIcon-root.Mui-completed {
+  color: rgb(var(--dcfs-accent-rgb));
+}
+
+.dcfs-page .MuiStepConnector-line,
+.dcfs-page .MuiStepContent-root {
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+.dcfs-page :not(pre) > code {
+  background: rgba(10, 16, 30, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-family: var(--font-geist-mono), monospace;
+}
+
+.dcfs-page a {
+  color: var(--dcfs-accent);
 }
