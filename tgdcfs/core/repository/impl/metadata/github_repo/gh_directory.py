@@ -33,6 +33,9 @@ class GithubConfig:
     # Where the directory dates come from. ``None`` leaves every loaded
     # directory on the ``now()`` default, as it was before the cache existed.
     timestamps: Optional[DirTimestampStore] = None
+    # How many directories the truncated-tree fallback reads in parallel
+    # (one request per directory; see ``_walk_tree``).
+    tree_fetch_concurrency: int = 8
     # Every commit this process makes on the branch goes through this lock.
     # Two commits made at once race for the branch head and the loser is
     # refused (409 from the Contents API, 422 "not a fast forward" from a

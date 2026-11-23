@@ -5,11 +5,11 @@ import hashlib
 import json
 import logging
 import time
-from typing import Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable, NamedTuple, Optional, Sequence
 
 from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
-from github.GitTreeElement import GitTreeElement
 
 from tgdcfs.config import GithubRepoConfig, expand_path
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSMetadata
@@ -26,6 +26,15 @@ from .gh_directory import GithubConfig, GithubDirectory
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
 
 logger = logging.getLogger(__name__)
+
+
+class _TreeEntry(NamedTuple):
+    """The part of a git tree entry the tree builder reads: a full storage
+    path, ``"tree"`` or ``"blob"``, and the object's sha."""
+
+    path: str
+    type: str
+    sha: str
 
 
 # How often a stats commit is tried when the branch moved under it, and
@@ -66,6 +75,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             commit=config.commit,
             name_key=name_key,
             timestamps=self._timestamps,
+            tree_fetch_concurrency=config.tree_fetch_concurrency,
         )
 
     async def push(self) -> None:
@@ -233,7 +243,9 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # One call to read the repo head plus at most one to diff it against
         # the cached one. Off the event loop because PyGithub is synchronous.
         await asyncio.to_thread(self._timestamps.load)
-        root_dir = self._build_directory_structure()
+        # Off the loop too: with a large repo the walk is a request per
+        # directory. The structure is built fresh, so nothing is shared.
+        root_dir = await asyncio.to_thread(self._build_directory_structure)
         return TGFSMetadata(dir=root_dir)
 
     def _build_directory_structure(self) -> GithubDirectory:
@@ -254,7 +266,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
         return root
 
-    def _read_tree(self) -> Optional[list[GitTreeElement]]:
+    def _read_tree(self) -> Optional[Sequence[_TreeEntry]]:
         """The whole repo tree in one request, or ``None`` if it is unusable.
 
         ``get_contents`` lists exactly one directory, so walking the tree with
@@ -263,28 +275,80 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         and subtree at once instead, which makes the load independent of how
         many folders the repo holds.
 
-        GitHub truncates the response for very large trees. That would silently
-        hide whole folders, so a truncated tree is refused and the caller walks
-        the old way rather than serving an incomplete filesystem.
+        GitHub truncates the response for very large trees (over 100,000
+        entries or 7 MB, which a few tens of thousands of encrypted file
+        names reach). That would silently hide whole folders, so the tree is
+        then read one directory at a time instead.
         """
         try:
             tree = self._ghc.repo.get_git_tree(self._ghc.commit, recursive=True)
-            if tree.truncated:
-                logger.warning(
-                    f"Tree of {self._ghc.repo_name}@{self._ghc.commit} came back "
-                    "truncated; falling back to a directory-by-directory walk"
-                )
-                return None
-            return list(tree.tree)
+            if not tree.truncated:
+                return [_TreeEntry(e.path, e.type, e.sha) for e in tree.tree]
+            logger.warning(
+                f"Tree of {self._ghc.repo_name}@{self._ghc.commit} came back "
+                "truncated; reading it one directory at a time"
+            )
         except Exception as ex:
             logger.warning(
                 f"Could not read the tree of {self._ghc.repo_name}@{self._ghc.commit}, "
                 f"falling back to a directory-by-directory walk: {ex}"
             )
             return None
+        try:
+            return self._walk_tree()
+        except Exception as ex:
+            logger.warning(
+                f"Could not walk the tree of {self._ghc.repo_name}@{self._ghc.commit}, "
+                f"falling back to the contents API: {ex}"
+            )
+            return None
+
+    def _walk_tree(self) -> list[_TreeEntry]:
+        """Every entry of the repo, one (non-recursive) tree per directory.
+
+        One request per directory, like the contents API, but a tree lists
+        all of a directory's entries where the contents API stops at 1000:
+        a folder of 20k files came back with 1000 of them. Directories are
+        read level by level, ``tree_fetch_concurrency`` requests at a time,
+        so a big repo does not pay one round trip after another. Raises
+        when a single directory's tree is truncated too.
+        """
+        started = time.monotonic()
+        entries: list[_TreeEntry] = []
+        read = 0
+        pending: list[tuple[str, str]] = [("", self._ghc.commit)]
+        with ThreadPoolExecutor(
+            max_workers=self._ghc.tree_fetch_concurrency,
+            thread_name_prefix="github-tree",
+        ) as pool:
+            while pending:
+                batch, pending = (
+                    pending[: self._ghc.tree_fetch_concurrency],
+                    pending[self._ghc.tree_fetch_concurrency :],
+                )
+                trees = list(
+                    pool.map(lambda item: self._ghc.repo.get_git_tree(item[1]), batch)
+                )
+                for (prefix, _), t in zip(batch, trees):
+                    read += 1
+                    if t.truncated:
+                        raise TechnicalError(
+                            f"The tree of '{prefix or '/'}' is truncated"
+                        )
+                    for e in t.tree:
+                        path = f"{prefix}{e.path}"
+                        entries.append(_TreeEntry(path, e.type, e.sha))
+                        if e.type == "tree":
+                            pending.append((f"{path}/", e.sha))
+        logger.info(
+            f"Rebuilt the tree of {self._ghc.repo_name}@{self._ghc.commit} "
+            f"directory by directory: {read} directories in "
+            f"{time.monotonic() - started:.1f}s"
+        )
+        return entries
 
     def _build_from_tree(
-        self, entries: list[GitTreeElement], root: GithubDirectory
+        self, entries: Sequence[_TreeEntry], root: GithubDirectory
     ) -> None:
         """Materialise the in-memory tree from one flat list of tree entries.
 

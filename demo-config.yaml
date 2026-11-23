@@ -88,6 +88,11 @@ filesystems:
         repo: 'tgdcfs-demo/tgdcfs-demo'
         commit: 'master'
         access_token: hidden
+        # How many directories the startup reads in parallel when the
+        # metadata repo is too big for one recursive tree call (default
+        # 8). Higher is faster but bursts harder against GitHub's rate
+        # limit.
+        # tree_fetch_concurrency: 8
 
 tgdcfs:
   users:

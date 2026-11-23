@@ -163,16 +163,32 @@ class EncryptionConfig:
 
 @dataclass
 class GithubRepoConfig:
+    # How many directories the truncated-tree fallback reads in parallel.
+    # More is faster on a big metadata repo but bursts harder against
+    # GitHub's rate limit; 8 turns a 300-directory rebuild from ~30 s of
+    # one-at-a-time round trips into a few seconds.
+    DEFAULT_TREE_FETCH_CONCURRENCY = 8
+
     repo: str
     commit: str
     access_token: str
+    tree_fetch_concurrency: int = DEFAULT_TREE_FETCH_CONCURRENCY
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
+        concurrency = int(
+            data.get("tree_fetch_concurrency", cls.DEFAULT_TREE_FETCH_CONCURRENCY)
+        )
+        if concurrency <= 0:
+            raise ValueError(
+                "metadata.github_repo.tree_fetch_concurrency must be "
+                f"positive, got {concurrency}"
+            )
         return cls(
             repo=data["repo"],
             commit=data["commit"],
             access_token=data["access_token"],
+            tree_fetch_concurrency=concurrency,
         )
 
 

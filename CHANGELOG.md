@@ -116,6 +116,13 @@ the fact on the commits that shipped them.
   "Update is not a fast forward".
 - With encryption, the size of a file just written is known without
   reading its header back from the store.
+- Large folders (issue #8) no longer come back with only 1000 files. When
+  GitHub truncates the recursive tree of a big metadata repository, the
+  fallback now reads one git tree per directory, which lists every entry of
+  a directory (the contents API stops at 1000), and reads them
+  `metadata.github_repo.tree_fetch_concurrency` (default 8) at a time
+  instead of one by one. If that walk fails too, the contents API is the
+  last resort.
 
 ### Security
 
