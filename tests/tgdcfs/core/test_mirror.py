@@ -99,7 +99,13 @@ class TestModelMirrors:
     def test_bare_keys_are_read_as_telegram_keys(self):
         # Metadata written by tgfs keys mirrors by bare channel id.
         fv = TGFSFileVersion.from_dict(
-            {"type": "FV", "id": "v1", "updatedAt": 0, "messageIds": [1], "mirrors": {"999": [11]}}  # type: ignore[arg-type]
+            {
+                "type": "FV",
+                "id": "v1",
+                "updatedAt": 0,
+                "messageIds": [1],
+                "mirrors": {"999": [11]},
+            }  # type: ignore[arg-type]
         )
         assert fv.mirrors == {"tg:999": [11]}
         assert fv.to_dict()["mirrors"] == {"tg:999": [11]}
@@ -833,9 +839,7 @@ class TestBackfillVersions:
         assert fd.get_version("old").mirrors == {"tg:999": [11]}
 
     @pytest.mark.asyncio
-    async def test_older_versions_are_still_copied_into_a_new_primary(
-        self, mocker
-    ):
+    async def test_older_versions_are_still_copied_into_a_new_primary(self, mocker):
         """Promotion is not mirroring: after a primary swap every version
         needs its copy in the new primary, or it is lost with the old one."""
         group, _, mirror_api = make_group(mocker)
