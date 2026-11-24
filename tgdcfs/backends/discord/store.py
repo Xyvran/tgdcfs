@@ -35,7 +35,12 @@ from typing import (
 
 from lru import LRU  # type: ignore
 
-from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
+from tgdcfs.backends.base import (
+    IStore,
+    StoreCapabilities,
+    attach_sent_parts,
+    make_store_key,
+)
 from tgdcfs.errors import MessageNotFound, TechnicalError
 from tgdcfs.reqres import (
     DownloadFileResp,
@@ -409,12 +414,17 @@ class DiscordStore(IStore):
                 if (size >= 0 and remaining <= 0) or len(data) < self._max_part_bytes:
                     break
             return list(await asyncio.gather(*tasks))
-        except BaseException:
-            for task in tasks:
-                task.cancel()
+        except BaseException as ex:
+            if not isinstance(ex, Exception):
+                for task in tasks:
+                    task.cancel()
+            # On a failure the parts already on their way are let land, so
+            # every message this upload created is known and the caller can
+            # delete them; a cancelled part may or may not have been posted.
             await asyncio.gather(*tasks, return_exceptions=True)
             for _ in range(unstarted[0]):
                 self._upload_slots.release()
+            attach_sent_parts(ex, tasks)
             raise
         finally:
             await file_msg.close()

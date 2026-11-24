@@ -22,7 +22,12 @@ from typing import (
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from telethon.errors import MessageNotModifiedError, RPCError
 
-from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
+from tgdcfs.backends.base import (
+    IStore,
+    StoreCapabilities,
+    attach_sent_parts,
+    make_store_key,
+)
 from tgdcfs.config import TransferConfig, get_config
 from tgdcfs.errors import (
     MessageNotFound,
@@ -466,10 +471,11 @@ class TelegramStore(MessageBroker, IStore):
             tasks = [asyncio.create_task(send(i)) for i in range(len(parts))]
             try:
                 return list(await asyncio.gather(*tasks))
-            except BaseException:
+            except BaseException as ex:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                attach_sent_parts(ex, tasks)
                 raise
 
         sends: List[asyncio.Task[SentFileMessage]] = []
@@ -487,10 +493,11 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 file_msg.next_part(part)
             return list(await asyncio.gather(*sends))
-        except BaseException:
+        except BaseException as ex:
             for task in sends:
                 task.cancel()
             await asyncio.gather(*sends, return_exceptions=True)
+            attach_sent_parts(ex, sends)
             raise
 
     async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int:

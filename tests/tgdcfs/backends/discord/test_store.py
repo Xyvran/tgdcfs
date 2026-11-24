@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import discord
 import pytest
 
+from tgdcfs.backends.base import sent_parts_of
 from tgdcfs.backends.discord.client import DiscordBotAPI, SentMessage
 from tgdcfs.backends.discord.store import (
     MAX_TEXT_CHARS,
@@ -461,6 +462,25 @@ class TestUpload:
         with pytest.raises(Forbidden):
             await store.upload(FileMessageFromBuffer.new(buffer=b"data", name="f"))
         assert bot.calls.count("send_file") == 1
+
+    async def test_a_failed_upload_names_the_parts_it_sent(self, store, bot):
+        """The parts posted before the source failed are listed on the
+        error, so the caller can delete them."""
+
+        async def source():
+            yield b"0123456789"
+            yield b"abcdefghij"
+            raise RuntimeError("source broke")
+
+        file_msg = FileMessageFromStream.new(stream=source(), size=30, name="s")
+        with pytest.raises(RuntimeError) as info:
+            await store.upload(file_msg)
+
+        sent = sent_parts_of(info.value)
+        assert [s.size for s in sent] == [10, 10]
+        assert {s.message_id for s in sent} == {
+            mid for mid, m in bot.messages.items() if m["data"] is not None
+        }
 
     async def test_gives_up_after_max_retries(self, store, bot):
         bot.fail_next["send_file"] = [RateLimited()] * 5

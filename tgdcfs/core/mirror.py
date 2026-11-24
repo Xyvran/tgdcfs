@@ -36,12 +36,13 @@ error propagates.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional, Set
 
-from tgdcfs.backends.base import IStore
+from tgdcfs.backends.base import IStore, sent_parts_of
 from tgdcfs.core.tee import TeeBranch, TeeFileMessage, TeeUpload
 from tgdcfs.errors import MessageNotFound, TechnicalError
 from tgdcfs.reqres import (
@@ -133,6 +134,8 @@ class MirrorGroup:
         self._strict = strict
         self._by_key = {ch.key: ch for ch in stores}
         self._primary_dead_until = 0.0
+        # Clean-ups of cancelled copies, which run on after the copy.
+        self._discards: Set[asyncio.Task] = set()
 
     @property
     def primary(self) -> IStore:
@@ -261,14 +264,16 @@ class MirrorGroup:
             async def run(branch: TeeBranch) -> Replica:
                 stream = branch.stream()
                 try:
-                    sent = await ch.store.upload(
+                    sent = await self._upload_or_discard(
+                        ch,
                         FileMessageFromStream.new(
                             stream=stream, size=size, name=f"replica-{name}"
-                        )
+                        ),
+                        name,
                     )
                 finally:
                     await stream.aclose()
-                return checked_replica(ch.key, sent, size, name)
+                return await self._checked_or_discard(ch, sent, size, name)
 
             return run
 
@@ -300,8 +305,10 @@ class MirrorGroup:
         a replica, independent of the primary (write-back distribution)."""
         from tgdcfs.core.local_cache import FileMessageFromCache
 
-        sent = await target.store.upload(FileMessageFromCache.new(local, name))
-        return checked_replica(target.key, sent, local.size, name)
+        sent = await self._upload_or_discard(
+            target, FileMessageFromCache.new(local, name), name
+        )
+        return await self._checked_or_discard(target, sent, local.size, name)
 
     async def copy_into_primary(self, version: "TGFSFileVersion") -> bool:
         """Copy a version that lives in a former primary into the current one.
@@ -394,10 +401,19 @@ class MirrorGroup:
             for i, size in enumerate(part_sizes):
                 offsets[i] = (local, begin, begin + size - 1)
                 begin += size
-        return [
-            await self._reupload_one(target, source, mid, local_range)
-            for mid, local_range in zip(message_ids, offsets)
-        ]
+        copied: List[int] = []
+        try:
+            for mid, local_range in zip(message_ids, offsets):
+                copied.append(
+                    await self._reupload_one(target, source, mid, local_range)
+                )
+        except BaseException as ex:
+            # The parts copied so far belong to no recorded copy.
+            await self._discard_after(
+                ex, target, copied, f"the parts of message {message_ids[0]}"
+            )
+            raise
+        return copied
 
     async def _reupload_one(
         self,
@@ -423,21 +439,28 @@ class MirrorGroup:
                 raise MessageNotFound(message_id=message_id)
             size = message.document.size
             chunks = (await source.download_file(message_id, 0, size - 1)).chunks
-        sent = await target.store.upload(
+        what = f"part {message_id}"
+        sent = await self._upload_or_discard(
+            target,
             FileMessageFromStream.new(
                 stream=chunks, size=size, name=f"part-{message_id}"
-            )
+            ),
+            what,
         )
+        error: Optional[TechnicalError] = None
         if len(sent) != 1:
-            raise TechnicalError(
+            error = TechnicalError(
                 f"Store {target.key} split the {size}-byte part {message_id} into "
                 f"{len(sent)} messages although it reported room for it"
             )
-        if sent[0].size != size:
-            raise SizeMismatch(
+        elif sent[0].size != size:
+            error = SizeMismatch(
                 f"The copy of part {message_id} in store {target.key} has "
                 f"{sent[0].size} bytes instead of {size}; it is not recorded"
             )
+        if error is not None:
+            await self._discard(target, [m.message_id for m in sent], what, error)
+            raise error
         return sent[0].message_id
 
     async def _replicate(
@@ -499,10 +522,12 @@ class MirrorGroup:
 
         stream = content()
         try:
-            sent = await target.store.upload(
+            sent = await self._upload_or_discard(
+                target,
                 FileMessageFromStream.new(
                     stream=stream, size=total, name=f"replica-{message_ids[0]}"
-                )
+                ),
+                what,
             )
         finally:
             # The target reads exactly ``total`` bytes and leaves the
@@ -510,9 +535,97 @@ class MirrorGroup:
             await stream.aclose()
             if filler is not None:
                 await filler.close()
-        if streamed[0] < total:
-            raise short(source.key)
-        return checked_replica(target.key, sent, total, what)
+        return await self._checked_or_discard(
+            target,
+            sent,
+            total,
+            what,
+            short(source.key) if streamed[0] < total else None,
+        )
+
+    # -- clean-up of aborted copies -----------------------------------------
+
+    async def _upload_or_discard(
+        self, target: MirrorStore, file_msg: UploadableFileMessage, what: str
+    ) -> List[SentFileMessage]:
+        """``target.store.upload`` that deletes the parts a failed upload
+        already sent: no descriptor will ever point at them."""
+        try:
+            return await target.store.upload(file_msg)
+        except BaseException as ex:
+            parts = [m.message_id for m in sent_parts_of(ex)]
+            await self._discard_after(ex, target, parts, what)
+            raise
+
+    async def _checked_or_discard(
+        self,
+        target: MirrorStore,
+        sent: List[SentFileMessage],
+        expected: int,
+        what: str,
+        error: Optional[SizeMismatch] = None,
+    ) -> Replica:
+        """The replica made of ``sent`` (see :func:`checked_replica`); a
+        copy that is refused is deleted from ``target`` again."""
+        try:
+            if error is not None:
+                raise error
+            return checked_replica(target.key, sent, expected, what)
+        except SizeMismatch as ex:
+            await self._discard(target, [m.message_id for m in sent], what, ex)
+            raise
+
+    async def _discard_after(
+        self, ex: BaseException, target: MirrorStore, message_ids: List[int], what: str
+    ) -> None:
+        """Discard ``message_ids`` after ``ex`` ended their copy. A copy
+        that was cancelled is cleaned up in the background, so the
+        cancellation is not held up by the deletes."""
+        if not message_ids:
+            return
+        if isinstance(ex, Exception):
+            await self._discard(target, message_ids, what, ex)
+            return
+        task = asyncio.ensure_future(self._discard(target, message_ids, what, ex))
+        self._discards.add(task)
+        task.add_done_callback(self._discards.discard)
+
+    async def _discard(
+        self,
+        target: MirrorStore,
+        message_ids: List[int],
+        what: str,
+        reason: BaseException,
+    ) -> None:
+        """Best-effort delete of the parts an aborted copy left in
+        ``target``.
+
+        Only ever called with ids this attempt uploaded itself and before
+        they are recorded anywhere, so a recorded copy is never touched.
+        The deletes go through the store and are paced like every other
+        request of it. A failure is logged, not raised: the copy has
+        already failed for its own reason.
+        """
+        ids = [mid for mid in message_ids if mid > 0]
+        if not ids:
+            return
+        cause = str(reason) or type(reason).__name__
+        logger.warning(
+            f"Deleting {len(ids)} parts of the aborted copy of {what} from store "
+            f"{target.key} ({cause}): {ids}"
+        )
+        try:
+            await target.store.delete_messages(ids, force=True)
+        except Exception as ex:
+            logger.warning(
+                f"Could not delete the parts {ids} of the aborted copy of {what} "
+                f"from store {target.key}: {ex}"
+            )
+            return
+        logger.info(
+            f"Deleted {len(ids)} parts of the aborted copy of {what} from store "
+            f"{target.key}"
+        )
 
     # -- file descriptors --------------------------------------------------
 

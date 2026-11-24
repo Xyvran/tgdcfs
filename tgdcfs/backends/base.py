@@ -17,6 +17,7 @@ and written back with the prefix from the first write on.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
@@ -33,6 +34,39 @@ from tgdcfs.reqres import (
 # and always meant Telegram.
 DEFAULT_PREFIX = "tg"
 KEY_SEPARATOR = ":"
+
+
+# Attribute of an upload's exception that lists the parts which had
+# already become messages when the upload failed.
+SENT_PARTS_ATTR = "tgdcfs_sent_parts"
+
+
+def attach_sent_parts(ex: BaseException, tasks: Iterable["asyncio.Task"]) -> None:
+    """Record on ``ex`` the parts the finished ``tasks`` sent, so whoever
+    gives up on the upload can delete them instead of leaving them behind."""
+    record_sent_parts(
+        ex,
+        [
+            task.result()
+            for task in tasks
+            if task.done() and not task.cancelled() and task.exception() is None
+        ],
+    )
+
+
+def record_sent_parts(ex: BaseException, sent: Iterable[SentFileMessage]) -> None:
+    """Add ``sent`` to the parts recorded on ``ex``."""
+    parts = [m for m in sent if isinstance(m, SentFileMessage)]
+    try:
+        setattr(ex, SENT_PARTS_ATTR, sent_parts_of(ex) + parts)
+    except AttributeError:  # pragma: no cover - exceptions without a __dict__
+        pass
+
+
+def sent_parts_of(ex: BaseException) -> List[SentFileMessage]:
+    """The parts a failed upload left behind as messages (see
+    :func:`attach_sent_parts`); empty when the store did not say."""
+    return list(getattr(ex, SENT_PARTS_ATTR, None) or [])
 
 
 def make_store_key(prefix: str, channel: str) -> str:

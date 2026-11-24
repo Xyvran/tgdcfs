@@ -18,6 +18,15 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Parts an aborted mirror attempt already sent are deleted again
+  (best effort): a replica or re-uploaded copy that fails half way, is
+  refused by the size check or is cancelled no longer leaves orphaned
+  messages in the mirror. The deletes go through the store and its
+  pacing, are logged with the message ids, and a failing delete is
+  logged without hiding the original error. Only the parts of the
+  attempt itself are deleted, never those of a recorded copy. A Discord
+  upload that fails now lets the parts already in flight finish, so every
+  message it posted is known.
 - This changelog, SemVer release tags and GitHub releases. A pushed tag
   `vX.Y.Z` publishes the release notes from this file and adds the version
   tags to the Docker images of that commit.

@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set
 
-from tgdcfs.backends.base import IStore, StoreCapabilities
+from tgdcfs.backends.base import IStore, StoreCapabilities, record_sent_parts
 from tgdcfs.errors import MessageNotFound, NoPinnedMessage, TechnicalError
 from tgdcfs.reqres import (
     Document,
@@ -123,6 +123,16 @@ class FakeStore(IStore):
         await file_msg.open()
         size = file_msg.get_size()
         res: List[SentFileMessage] = []
+        try:
+            return await self._upload_parts(file_msg, size, res)
+        except BaseException as ex:
+            # Like the real stores: say which parts became messages.
+            record_sent_parts(ex, res)
+            raise
+
+    async def _upload_parts(
+        self, file_msg: UploadableFileMessage, size: int, res: List[SentFileMessage]
+    ) -> List[SentFileMessage]:
         remaining = size
         part = 0
         while remaining > 0 or not res:
