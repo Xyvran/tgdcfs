@@ -108,6 +108,20 @@ def versions_to_mirror(fd: TGFSFileDesc) -> List[TGFSFileVersion]:
     return versions if mirror_old_versions() else versions[:1]
 
 
+def size_mismatch(version: TGFSFileVersion) -> Optional[str]:
+    """Why the primary parts of ``version`` do not make up the file the
+    descriptor recorded, or ``None`` when they do (or nothing was recorded)."""
+    if version.recorded_size < 0 or not version.part_sizes:
+        return None
+    total = sum(version.part_sizes)
+    if total == version.recorded_size:
+        return None
+    return (
+        f"its {len(version.part_sizes)} parts add up to {total} bytes, "
+        f"the descriptor records {version.recorded_size}"
+    )
+
+
 def _collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
     refs = list(directory.find_files())
     for child in directory.find_dirs():
@@ -324,6 +338,13 @@ async def backfill_file(
         if not version.owned_by(mirror_group.primary.key):
             # No primary copy to mirror from yet; the next run retries.
             continue
+        if (mismatch := size_mismatch(version)) is not None:
+            # The source itself is incomplete: a copy of it would be just
+            # as short, and recording it would make it look complete.
+            message = f"{fr.name}@{version.id}: {mismatch}; not mirrored"
+            logger.error(message)
+            report.failures.append(message)
+            continue
         logger.info(
             f"Mirroring {fr.name}@{version.id} ({version.size} bytes, "
             f"{len(version.message_ids)} parts) to {', '.join(missing)}"
@@ -340,9 +361,12 @@ async def backfill_file(
             changed = True
         still_missing = [key for key in missing if key not in copies.store_keys]
         if still_missing:
+            reasons = [
+                f"{key} ({copies.errors[key]})" if key in copies.errors else key
+                for key in still_missing
+            ]
             report.failures.append(
-                f"{fr.name}@{version.id}: could not mirror to "
-                f"{', '.join(still_missing)}"
+                f"{fr.name}@{version.id}: could not mirror to {', '.join(reasons)}"
             )
         elif cache is not None:
             # Every mirror has its copy: the staged bytes are no longer

@@ -44,7 +44,12 @@ from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.tee import TeeBranch, TeeFileMessage, TeeUpload
 from tgdcfs.errors import MessageNotFound, TechnicalError
-from tgdcfs.reqres import FileMessageFromStream, Replica, UploadableFileMessage
+from tgdcfs.reqres import (
+    FileMessageFromStream,
+    Replica,
+    SentFileMessage,
+    UploadableFileMessage,
+)
 
 if TYPE_CHECKING:
     from tgdcfs.core.local_cache import VersionBytes, VersionCache
@@ -68,6 +73,30 @@ class MirrorStore:
     store: IStore
 
 
+class SizeMismatch(TechnicalError):
+    """A copy whose parts do not add up to the size of the version it
+    copies. Such a copy is never recorded: a reader would get a file of the
+    wrong length from it."""
+
+
+def checked_replica(
+    store_key: str, sent: List[SentFileMessage], expected: int, what: str
+) -> Replica:
+    """The replica made of ``sent``, once its parts add up to ``expected``
+    bytes; :class:`SizeMismatch` otherwise."""
+    replica = Replica(
+        message_ids=[m.message_id for m in sent],
+        part_sizes=[m.size for m in sent],
+    )
+    if replica.size != expected:
+        raise SizeMismatch(
+            f"The replica of {what} in store {store_key} has {len(sent)} parts "
+            f"adding up to {replica.size} bytes instead of {expected}; it is "
+            f"not recorded"
+        )
+    return replica
+
+
 @dataclass
 class MirrorResult:
     """Copies made by one ``mirror_parts`` call, per store key."""
@@ -76,6 +105,8 @@ class MirrorResult:
     mirrors: Dict[str, List[int]] = field(default_factory=dict)
     # Re-partitioned copies with their own layout.
     replicas: Dict[str, Replica] = field(default_factory=dict)
+    # Why a store got no copy, for the stores that failed.
+    errors: Dict[str, str] = field(default_factory=dict)
 
     @property
     def store_keys(self) -> List[str]:
@@ -180,6 +211,7 @@ class MirrorGroup:
                         ch, source, message_ids, sizes, cache
                     )
             except Exception as ex:
+                res.errors[ch.key] = str(ex)
                 self._handle_write_error(ch.key, "content parts", ex)
         return res
 
@@ -236,10 +268,7 @@ class MirrorGroup:
                     )
                 finally:
                     await stream.aclose()
-                return Replica(
-                    message_ids=[m.message_id for m in sent],
-                    part_sizes=[m.size for m in sent],
-                )
+                return checked_replica(ch.key, sent, size, name)
 
             return run
 
@@ -272,10 +301,7 @@ class MirrorGroup:
         from tgdcfs.core.local_cache import FileMessageFromCache
 
         sent = await target.store.upload(FileMessageFromCache.new(local, name))
-        return Replica(
-            message_ids=[m.message_id for m in sent],
-            part_sizes=[m.size for m in sent],
-        )
+        return checked_replica(target.key, sent, local.size, name)
 
     async def copy_into_primary(self, version: "TGFSFileVersion") -> bool:
         """Copy a version that lives in a former primary into the current one.
@@ -407,6 +433,11 @@ class MirrorGroup:
                 f"Store {target.key} split the {size}-byte part {message_id} into "
                 f"{len(sent)} messages although it reported room for it"
             )
+        if sent[0].size != size:
+            raise SizeMismatch(
+                f"The copy of part {message_id} in store {target.key} has "
+                f"{sent[0].size} bytes instead of {size}; it is not recorded"
+            )
         return sent[0].message_id
 
     async def _replicate(
@@ -427,24 +458,44 @@ class MirrorGroup:
         total = sum(part_sizes)
         local = cache.local() if cache is not None else None
         filler = cache.filler() if cache is not None and local is None else None
+        streamed = [0]
+        what = f"message {message_ids[0]}"
+
+        def short(origin: str) -> SizeMismatch:
+            # Raised from inside the stream, so the upload stops at once
+            # instead of cutting a short last part the target would take
+            # for the end of the file.
+            return SizeMismatch(
+                f"The replica of {what} in store {target.key} received "
+                f"{streamed[0]} of {total} bytes from {origin}; it is not "
+                f"recorded"
+            )
 
         async def content() -> AsyncGenerator[bytes, None]:
             if local is not None:
                 async for chunk in local.read(0, total - 1):
+                    streamed[0] += len(chunk)
                     yield chunk
+                if streamed[0] < total:
+                    raise short("the local cache")
                 return
+            expected = 0
             for mid, size in zip(message_ids, part_sizes):
                 if size <= 0:
                     continue
+                expected += size
                 resp = await source.download_file(mid, 0, size - 1)
                 try:
                     async for chunk in resp.chunks:
                         if filler is not None:
                             await filler.write(chunk)
+                        streamed[0] += len(chunk)
                         yield chunk
                 finally:
                     if (aclose := getattr(resp.chunks, "aclose", None)) is not None:
                         await aclose()
+                if streamed[0] < expected:
+                    raise short(f"{source.key} (part {mid})")
 
         stream = content()
         try:
@@ -459,10 +510,9 @@ class MirrorGroup:
             await stream.aclose()
             if filler is not None:
                 await filler.close()
-        return Replica(
-            message_ids=[m.message_id for m in sent],
-            part_sizes=[m.size for m in sent],
-        )
+        if streamed[0] < total:
+            raise short(source.key)
+        return checked_replica(target.key, sent, total, what)
 
     # -- file descriptors --------------------------------------------------
 

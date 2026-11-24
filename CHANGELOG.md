@@ -81,6 +81,14 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A mirror copy is only recorded when its parts add up to the size of the
+  version it copies. A source that delivers fewer bytes than its parts
+  promise used to leave Discord with a replica that looked complete but
+  served a truncated file; the copy now fails with an error naming the
+  store, the byte counts and the part, and nothing is written to the
+  descriptor. The backfill also refuses to mirror a version whose primary
+  parts do not add up to the size its descriptor records, and a backfill
+  failure now says why a store got no copy.
 - Telegram downloads no longer start most of their pieces twice. A
   download took the file's document -- including its file reference --
   from the message cache that all bots share, so a piece on any bot other
