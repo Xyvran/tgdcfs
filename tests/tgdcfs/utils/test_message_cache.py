@@ -1,5 +1,6 @@
 import pytest
 
+from tgdcfs.reqres import Document, MessageResp
 from tgdcfs.utils import message_cache
 from tgdcfs.utils.message_cache import (
     MessageCache,
@@ -102,3 +103,40 @@ class TestMessageCacheSize:
     def test_rejects_an_empty_cache(self):
         with pytest.raises(ValueError):
             set_message_cache_size(0)
+
+    def test_resizes_the_per_client_document_caches(self):
+        documents = channel_cache(-444444).documents_of("bot0")
+
+        set_message_cache_size(4000)
+
+        assert documents._lru.get_size() == 4000
+        assert channel_cache(-444444).documents_of("bot1")._lru.get_size() == 4000
+
+
+def _doc(reference: bytes) -> Document:
+    return Document(
+        size=1, id=1, access_hash=1, file_reference=reference, mime_type=None
+    )
+
+
+class TestPerClientDocuments:
+    def test_each_client_has_its_own_documents(self):
+        cache = channel_cache(-454545)
+        cache.documents_of("bot0")[7] = _doc(b"bot0")
+
+        assert cache.documents_of("bot0").get(7) == _doc(b"bot0")
+        assert cache.documents_of("bot1").get(7) is None
+
+    def test_forget_drops_the_message_for_every_client(self):
+        cache = channel_cache(-464646)
+        cache.id[7] = MessageResp(message_id=7, text="", document=None)
+        cache.documents_of("bot0")[7] = _doc(b"bot0")
+        cache.documents_of("bot1")[7] = _doc(b"bot1")
+        cache.documents_of("bot1")[8] = _doc(b"other")
+
+        cache.forget(7)
+
+        assert cache.id.get(7) is None
+        assert cache.documents_of("bot0").get(7) is None
+        assert cache.documents_of("bot1").get(7) is None
+        assert cache.documents_of("bot1").get(8) == _doc(b"other")

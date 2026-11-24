@@ -72,6 +72,14 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Telegram downloads no longer start most of their pieces twice. A
+  download took the file's document -- including its file reference --
+  from the message cache that all bots share, so a piece on any bot other
+  than the one that had fetched the message was refused with
+  `FILE_REFERENCE_EXPIRED` and started again after fetching the message
+  itself. With three bots that was about two thirds of all pieces. Every
+  bot now keeps the documents it resolved itself and downloads with
+  those; listings and the batched message requests are unchanged.
 - Descriptors were sent to Telegram with Markdown parsing on, which
   removed every `__` pair from the JSON. Packed Discord replica ids
   (files with more than 100 parts) could then not be decoded, and the

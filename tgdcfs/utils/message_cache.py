@@ -1,10 +1,20 @@
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import DefaultDict, Generic, Iterable, List, Optional, Tuple, TypeVar
+from dataclasses import dataclass, field
+from typing import (
+    DefaultDict,
+    Dict,
+    Generic,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 from lru import LRU  # type: ignore
 
-from tgdcfs.reqres import MessageResp
+from tgdcfs.reqres import Document, MessageResp
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -48,6 +58,28 @@ class MessageCache(Generic[K, V]):
 class ChannelMessageCache:
     id: MessageCache[int, Optional[MessageResp]]
     search: MessageCache[str, Tuple[MessageResp, ...]]
+    # Documents as resolved by one client (a bot or the account), keyed by
+    # that client. The shared ``id`` cache is filled by whichever bot
+    # happened to fetch a message, but a document's file reference and
+    # access hash are only valid for the client that fetched it: a download
+    # on another bot with them fails with FILE_REFERENCE_EXPIRED and has to
+    # start over. Downloads therefore read their document from here.
+    documents: Dict[Hashable, MessageCache[int, Optional[Document]]] = field(
+        default_factory=dict
+    )
+
+    def documents_of(self, owner: Hashable) -> MessageCache[int, Optional[Document]]:
+        if (cache := self.documents.get(owner)) is None:
+            cache = MessageCache[int, Optional[Document]](_id_cache_size)
+            self.documents[owner] = cache
+        return cache
+
+    def forget(self, message_id: int) -> None:
+        """Drop a message from the shared cache and from every client's
+        document cache, after it was edited or deleted."""
+        self.id[message_id] = None
+        for cache in self.documents.values():
+            cache[message_id] = None
 
 
 global_message_cache: DefaultDict[int, ChannelMessageCache] = defaultdict(
@@ -70,3 +102,5 @@ def set_message_cache_size(size: int) -> None:
     _id_cache_size = size
     for cache in global_message_cache.values():
         cache.id.set_size(size)
+        for documents in cache.documents.values():
+            documents.set_size(size)

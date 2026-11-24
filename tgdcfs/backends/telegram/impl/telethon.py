@@ -124,8 +124,12 @@ class TelethonAPI(ITDLibClient):
                 entity=PeerChannel(channel_id=req.chat), ids=message_id_to_fetch
             )
 
+            documents = channel_cache(req.chat).documents_of(id(self))
             for message in exclude_none(self._transform_messages(fetched_messages)):
                 cache[message.message_id] = message
+                # Fetched by this client, so its file reference is valid
+                # for this client's downloads.
+                documents[message.message_id] = message.document
 
         return GetMessagesResp(cache.gets(req.message_ids))
 
@@ -138,7 +142,7 @@ class TelethonAPI(ITDLibClient):
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
-        channel_cache(req.chat).id[req.message_id] = None
+        channel_cache(req.chat).forget(req.message_id)
         chunk_cache().invalidate(req.chat, req.message_id)
         message = await self._client.edit_message(
             entity=PeerChannel(channel_id=req.chat),
@@ -149,7 +153,7 @@ class TelethonAPI(ITDLibClient):
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_media(self, req: EditMessageMediaReq) -> Message:
-        channel_cache(req.chat).id[req.message_id] = None
+        channel_cache(req.chat).forget(req.message_id)
         chunk_cache().invalidate(req.chat, req.message_id)
         message = await self._client.edit_message(
             entity=PeerChannel(channel_id=req.chat),
@@ -267,25 +271,34 @@ class TelethonAPI(ITDLibClient):
     async def _document_for(
         self, chat: int, message_id: int, refresh: bool = False
     ) -> Document:
-        """Resolve the document of a file message through the message cache.
+        """Resolve the document of a file message as this client sees it.
 
         A range request only needs the document's id, access hash and file
         reference, so resolving the message again for every request costs a
-        round trip that the cache already paid for. ``refresh`` drops the
-        cached entry first, which is how an expired file reference is
-        recovered -- Telegram lets those go stale, and the cached copy would
-        otherwise keep failing.
+        round trip that the cache already paid for. The document comes from
+        this client's own cache, never from the shared message cache: that
+        one holds whatever bot fetched the message last, and its file
+        reference is refused for any other bot -- which made most download
+        pieces fail on their first request and start a second time.
+        ``refresh`` drops the cached entry first, which is how an expired
+        file reference is recovered -- Telegram lets those go stale, and the
+        cached copy would otherwise keep failing.
         """
-        if refresh:
-            channel_cache(chat).id[message_id] = None
+        documents = channel_cache(chat).documents_of(id(self))
+        if not refresh and (document := documents.get(message_id)) is not None:
+            return document
 
-        messages = await self.get_messages(
-            GetMessagesReq(chat=chat, message_ids=(message_id,))
+        messages = await self.__get_messages(
+            entity=PeerChannel(channel_id=chat), ids=[message_id]
         )
-
-        if not (message := messages[0]) or not message.document:
+        message = list(exclude_none(self._transform_messages(messages)))
+        if not message or not (document := message[0].document):
             raise UnDownloadableMessage(message_id)
-        return message.document
+        documents[message_id] = document
+        # The shared cache gets the fresh copy too; its readers only use the
+        # text and the size.
+        channel_cache(chat).id[message_id] = message[0]
+        return document
 
     async def download_file(self, req: DownloadFileReq) -> DownloadFileResp:
         document = await self._document_for(req.chat, req.message_id)
@@ -376,9 +389,9 @@ class TelethonAPI(ITDLibClient):
     async def delete_messages(self, req: DeleteMessagesReq) -> None:
         if not req.message_ids:
             return
-        cache = channel_cache(req.chat).id
+        cache = channel_cache(req.chat)
         for mid in req.message_ids:
-            cache[mid] = None
+            cache.forget(mid)
             chunk_cache().invalidate(req.chat, mid)
         await self._client.delete_messages(
             entity=PeerChannel(channel_id=req.chat),

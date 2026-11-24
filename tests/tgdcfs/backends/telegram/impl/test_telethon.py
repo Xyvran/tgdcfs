@@ -132,6 +132,7 @@ class TestTelethonAPI:
         )
         mock_cache_instance = mocker.Mock()
         mock_cache_instance.id = mock_cache
+        mock_cache_instance.documents_of.return_value = mocker.MagicMock()
         mock_channel_cache.return_value = mock_cache_instance
 
         result = await telethon_api.get_messages(req)
@@ -260,7 +261,7 @@ class TestTelethonAPI:
             text="Updated text",
             parse_mode="",
         )
-        mock_cache.__setitem__.assert_called_once_with(12345, None)
+        mock_cache_instance.forget.assert_called_once_with(12345)
         assert result.message_id == 88888
 
     @pytest.mark.asyncio
@@ -288,7 +289,7 @@ class TestTelethonAPI:
         assert call_args[1]["entity"] == tlt.PeerChannel(mock_chat)
         assert call_args[1]["message"] == 12345
         assert isinstance(call_args[1]["file"], tlt.InputFile)
-        mock_cache.__setitem__.assert_called_once_with(12345, None)
+        mock_cache_instance.forget.assert_called_once_with(12345)
         assert result.message_id == 77777
 
     @pytest.mark.asyncio
@@ -372,7 +373,7 @@ class TestTelethonAPI:
         telethon_api._client.delete_messages.assert_called_once_with(
             entity=tlt.PeerChannel(channel_id=mock_chat), message_ids=[11, 22, 33]
         )
-        assert mock_cache.__setitem__.call_count == 3
+        assert mock_cache_instance.forget.call_count == 3
 
     @pytest.mark.asyncio
     async def test_delete_messages_empty_is_noop(self, telethon_api, mock_chat):
@@ -1455,3 +1456,122 @@ class TestChunkCacheInvalidation:
         assert not cache.contains((5, 1, 0))
         assert not cache.contains((5, 2, 0))
         assert cache.contains((5, 3, 0))
+
+
+class TestPerBotDocuments:
+    """A document's file reference is only valid for the bot that fetched
+    the message. The shared message cache holds whichever bot fetched it,
+    so a download must not take its document from there -- doing so made
+    about two out of three download pieces fail on their first request and
+    start again."""
+
+    CHAT = 5
+    MESSAGE_ID = 42
+
+    @pytest.fixture(autouse=True)
+    def clean_message_cache(self):
+        global_message_cache.clear()
+        yield
+        global_message_cache.clear()
+
+    @staticmethod
+    def _message(file_reference: bytes, mocker):
+        document = mocker.Mock(spec=tlt.Document)
+        document.size = 6
+        document.id = 98765
+        document.access_hash = 111
+        document.file_reference = file_reference
+        document.mime_type = "application/octet-stream"
+        media = mocker.Mock(spec=tlt.MessageMediaDocument)
+        media.document = document
+        message = mocker.Mock(spec=tlt.Message)
+        message.id = TestPerBotDocuments.MESSAGE_ID
+        message.message = ""
+        message.media = media
+        return message
+
+    def _bot(self, file_reference: bytes, mocker):
+        """A bot whose view of the message carries ``file_reference`` and
+        whose downloads only accept that reference."""
+        client = mocker.AsyncMock(spec=TelegramClient)
+        client.get_messages = mocker.AsyncMock(
+            return_value=TotalList([self._message(file_reference, mocker)])
+        )
+        used = []
+
+        def iter_download(*_args, **kwargs):
+            used.append(kwargs["file"].file_reference)
+
+            async def gen():
+                if kwargs["file"].file_reference != file_reference:
+                    raise FileReferenceExpiredError(request=None)
+                yield b"abcdef"
+
+            return gen()
+
+        client.iter_download = iter_download
+        return TelethonAPI(client), used
+
+    async def _download(self, api) -> bytes:
+        resp = await api.download_file(
+            DownloadFileReq(chat=self.CHAT, message_id=self.MESSAGE_ID, begin=0, end=5)
+        )
+        return b"".join([chunk async for chunk in resp.chunks])
+
+    @pytest.mark.asyncio
+    async def test_a_download_uses_its_own_bots_file_reference(self, mocker):
+        broker_bot, _ = self._bot(b"ref-A", mocker)
+        piece_bot, used = self._bot(b"ref-B", mocker)
+
+        # The broker resolved the message on bot A, as it does for listings.
+        await broker_bot.get_messages(
+            GetMessagesReq(chat=self.CHAT, message_ids=(self.MESSAGE_ID,))
+        )
+
+        assert await self._download(piece_bot) == b"abcdef"
+        # One request, with B's own reference: no expired first attempt.
+        assert used == [b"ref-B"]
+
+    @pytest.mark.asyncio
+    async def test_downloads_alternating_between_bots_never_restart(self, mocker):
+        bot_a, used_a = self._bot(b"ref-A", mocker)
+        bot_b, used_b = self._bot(b"ref-B", mocker)
+
+        for bot in (bot_a, bot_b, bot_a, bot_b):
+            assert await self._download(bot) == b"abcdef"
+
+        assert used_a == [b"ref-A"] * 2
+        assert used_b == [b"ref-B"] * 2
+        # Each bot resolves the message once and reuses it afterwards.
+        assert bot_a._client.get_messages.call_count == 1
+        assert bot_b._client.get_messages.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bots_own_fetch_feeds_its_downloads(self, mocker):
+        bot, used = self._bot(b"ref-A", mocker)
+        await bot.get_messages(
+            GetMessagesReq(chat=self.CHAT, message_ids=(self.MESSAGE_ID,))
+        )
+
+        assert await self._download(bot) == b"abcdef"
+        assert bot._client.get_messages.call_count == 1
+        assert used == [b"ref-A"]
+
+    @pytest.mark.asyncio
+    async def test_editing_drops_the_document_of_every_bot(self, mocker):
+        bot_a, _ = self._bot(b"ref-A", mocker)
+        bot_b, _ = self._bot(b"ref-B", mocker)
+        await self._download(bot_a)
+        await self._download(bot_b)
+
+        await bot_a.edit_message_media(
+            EditMessageMediaReq(
+                chat=self.CHAT,
+                message_id=self.MESSAGE_ID,
+                file=UploadedFile(id=1, parts=1, name="f"),
+            )
+        )
+        await self._download(bot_b)
+
+        # B resolves the replaced document again instead of reusing its copy.
+        assert bot_b._client.get_messages.call_count == 2
