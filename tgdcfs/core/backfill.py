@@ -22,13 +22,15 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 
 from tgdcfs.config import get_config
 from tgdcfs.core.local_cache import version_cache_for
-from tgdcfs.core.mirror import MirrorStore
+from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
-from tgdcfs.core.repository.interface import FDRepositoryResp
+from tgdcfs.core.progress import RunProgress, format_bytes, progress_registry
+from tgdcfs.core.repository.interface import FDRepositoryResp, IFDRepository
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import Replica, SentFileMessage
 from tgdcfs.tasks import task_store
@@ -42,8 +44,10 @@ logger = logging.getLogger(__name__)
 
 # A single store call that takes longer than this is logged while it waits.
 HEARTBEAT_SECONDS = 60.0
-# The descriptor scan logs its progress at most this often.
+# The descriptor scan and the mirroring log their progress at most this
+# often.
 SCAN_PROGRESS_SECONDS = 30.0
+MIRROR_PROGRESS_SECONDS = 30.0
 
 
 @dataclass
@@ -55,6 +59,12 @@ class BackfillReport:
     # Write-back uploads moved from the local cache into the primary.
     versions_distributed: int = 0
     fds_mirrored: int = 0
+    # Bytes and messages written into the mirror stores (a version copied
+    # into two stores counts twice).
+    bytes_mirrored: int = 0
+    parts_mirrored: int = 0
+    # Bytes the run set out to copy, from the descriptor scan.
+    bytes_planned: int = 0
     failures: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -64,6 +74,9 @@ class BackfillReport:
             "versions_mirrored": self.versions_mirrored,
             "versions_promoted": self.versions_promoted,
             "fds_mirrored": self.fds_mirrored,
+            "bytes_mirrored": self.bytes_mirrored,
+            "parts_mirrored": self.parts_mirrored,
+            "bytes_planned": self.bytes_planned,
             "failures": self.failures,
         }
 
@@ -119,6 +132,16 @@ def size_mismatch(version: TGFSFileVersion) -> Optional[str]:
     return (
         f"its {len(version.part_sizes)} parts add up to {total} bytes, "
         f"the descriptor records {version.recorded_size}"
+    )
+
+
+def planned_bytes(group: MirrorGroup, fd: TGFSFileDesc) -> int:
+    """Bytes the backfill still has to copy for ``fd``: the size of each
+    version it mirrors, once per store that has no copy of it."""
+    return sum(
+        version.size * len(group.missing_stores(version))
+        for version in versions_to_mirror(fd)
+        if version.size > 0 and size_mismatch(version) is None
     )
 
 
@@ -258,10 +281,15 @@ async def _distribute_pending(
 
 @background_work
 async def backfill_file(
-    client: "Client", fr: TGFSFileRef, verify: bool, report: BackfillReport
+    client: "Client",
+    fr: TGFSFileRef,
+    verify: bool,
+    report: BackfillReport,
+    progress: Optional[RunProgress] = None,
 ) -> None:
     """Bring one file's copies up to date: the unit of work of both the
-    backfill task and the replication queue."""
+    backfill task and the replication queue. ``progress`` follows the
+    bytes and parts of each copy."""
     mirror_group = client.mirror_group
     fd_repo = client.fd_repo
     if fd_repo is None:
@@ -346,7 +374,7 @@ async def backfill_file(
             report.failures.append(message)
             continue
         logger.info(
-            f"Mirroring {fr.name}@{version.id} ({version.size} bytes, "
+            f"Mirroring {fr.name}@{version.id} ({format_bytes(version.size)}, "
             f"{len(version.message_ids)} parts) to {', '.join(missing)}"
         )
         copies = await mirror_group.mirror_parts(
@@ -354,10 +382,17 @@ async def backfill_file(
             version.part_sizes or None,
             only_stores=missing,
             cache=cache,
+            progress=(
+                partial(progress.start_copy, fr.name, version.id)
+                if progress is not None
+                else None
+            ),
         )
         if copies.store_keys:
             copies.apply_to(version)
             report.versions_mirrored += 1
+            report.bytes_mirrored += version.size * len(copies.store_keys)
+            report.parts_mirrored += copies.parts_written
             changed = True
         still_missing = [key for key in missing if key not in copies.store_keys]
         if still_missing:
@@ -421,14 +456,46 @@ async def backfill_mirrors(
     total = len(refs)
     logger.info(f"Backfill for '{client.name}': reading {total} descriptors")
 
-    # Newest first: load descriptors to know each file's timestamp.
-    dated: List[Tuple[TGFSFileRef, int]] = []
+    progress = progress_registry.register(
+        RunProgress(kind="backfill", filesystem=client.name, phase="scanning")
+    )
+    try:
+        return await _backfill(
+            client,
+            client.mirror_group,
+            client.fd_repo,
+            verify,
+            task_id,
+            report,
+            refs,
+            progress,
+        )
+    finally:
+        progress_registry.unregister(progress)
+
+
+async def _backfill(
+    client: "Client",
+    group: MirrorGroup,
+    fd_repo: IFDRepository,
+    verify: bool,
+    task_id: Optional[str],
+    report: BackfillReport,
+    refs: List[TGFSFileRef],
+    progress: RunProgress,
+) -> BackfillReport:
+    total = len(refs)
+    # Newest first: load descriptors to know each file's timestamp, and
+    # how many bytes each one still has to copy.
+    dated: List[Tuple[TGFSFileRef, int, int]] = []
     scan_started = last_progress = time.monotonic()
+    progress.files_total = total
     for index, fr in enumerate(refs, 1):
+        progress.files_done = index - 1
         try:
             async with _heartbeat(f"the descriptor of {fr.name} ({index}/{total})"):
-                fd = await client.fd_repo.get(fr)
-            dated.append((fr, fd.updated_at_timestamp))
+                fd = await fd_repo.get(fr)
+            dated.append((fr, fd.updated_at_timestamp, planned_bytes(group, fd)))
         except Exception as ex:
             report.failures.append(f"{fr.name}: cannot read descriptor ({ex})")
             logger.warning(f"Backfill: cannot read the descriptor of {fr.name}: {ex}")
@@ -439,35 +506,61 @@ async def backfill_mirrors(
                 f"Backfill for '{client.name}': read {index}/{total} descriptors "
                 f"in {now - scan_started:.0f}s, {len(report.failures)} unreadable"
             )
-    dated.sort(key=lambda pair: pair[1], reverse=True)
+    dated.sort(key=lambda item: item[1], reverse=True)
+    report.bytes_planned = sum(planned for _, _, planned in dated)
+    progress.files_total = len(dated)
+    progress.files_done = 0
+    progress.bytes_total = report.bytes_planned
+    progress.phase = "mirroring"
 
     if task_id:
         await task_store.update_task_progress(task_id, status=TaskStatus.IN_PROGRESS)
-    logger.info(f"Backfill for '{client.name}': mirroring {len(dated)} files")
+    logger.info(
+        f"Backfill for '{client.name}': mirroring {len(dated)} files, "
+        f"{format_bytes(report.bytes_planned)} to copy"
+    )
 
+    async def log_progress() -> None:
+        while True:
+            await asyncio.sleep(MIRROR_PROGRESS_SECONDS)
+            logger.info(f"Backfill for '{client.name}': {progress.describe()}")
+
+    progress_log = asyncio.create_task(log_progress())
     metadata_dirty = False
-    for index, (fr, _) in enumerate(dated, 1):
-        before = (fr.message_id, dict(fr.mirrors), fr.store)
-        mirrored = report.versions_mirrored
-        failed = len(report.failures)
-        file_started = time.monotonic()
-        try:
-            async with _heartbeat(f"{fr.name} ({index}/{len(dated)})"):
-                await backfill_file(client, fr, verify, report)
-        except Exception as ex:
-            report.failures.append(f"{fr.name}: {ex}")
-            logger.error(f"Backfill failed for {fr.name}: {ex}")
-        if before != (fr.message_id, fr.mirrors, fr.store):
-            metadata_dirty = True
-        report.files_scanned += 1
-        logger.info(
-            f"Backfill [{index}/{len(dated)}] {fr.name}: "
-            f"{report.versions_mirrored - mirrored} versions mirrored, "
-            f"{len(report.failures) - failed} failures, "
-            f"{time.monotonic() - file_started:.1f}s"
-        )
-        if task_id:
-            await task_store.update_task_progress(task_id, size_delta=1)
+    try:
+        for index, (fr, _, planned) in enumerate(dated, 1):
+            before = (fr.message_id, dict(fr.mirrors), fr.store)
+            mirrored = report.versions_mirrored
+            copied = report.bytes_mirrored
+            parts = report.parts_mirrored
+            failed = len(report.failures)
+            file_started = time.monotonic()
+            progress.start_file(planned)
+            try:
+                async with _heartbeat(f"{fr.name} ({index}/{len(dated)})"):
+                    await backfill_file(client, fr, verify, report, progress)
+            except Exception as ex:
+                report.failures.append(f"{fr.name}: {ex}")
+                logger.error(f"Backfill failed for {fr.name}: {ex}")
+            if before != (fr.message_id, fr.mirrors, fr.store):
+                metadata_dirty = True
+            report.files_scanned += 1
+            progress.finish_file(failed=len(report.failures) > failed)
+            logger.info(
+                f"Backfill [{index}/{len(dated)}] {fr.name}: "
+                f"{report.versions_mirrored - mirrored} versions mirrored "
+                f"({format_bytes(report.bytes_mirrored - copied)} in "
+                f"{report.parts_mirrored - parts} parts), "
+                f"{len(report.failures) - failed} failures, "
+                f"{time.monotonic() - file_started:.1f}s; run at "
+                f"{format_bytes(progress.bytes_done)}/"
+                f"{format_bytes(progress.bytes_total)}"
+            )
+            if task_id:
+                await task_store.update_task_progress(task_id, size_delta=1)
+    finally:
+        progress_log.cancel()
+    progress.phase = "finishing"
 
     if metadata_dirty and client.metadata_api:
         await client.metadata_api.push()
@@ -482,7 +575,8 @@ async def backfill_mirrors(
     logger.info(
         f"Backfill for '{client.name}' finished: "
         f"{report.versions_mirrored}/{report.versions_checked} versions "
-        f"mirrored, {len(report.failures)} failures"
+        f"mirrored ({format_bytes(report.bytes_mirrored)} in "
+        f"{report.parts_mirrored} parts), {len(report.failures)} failures"
     )
     return report
 

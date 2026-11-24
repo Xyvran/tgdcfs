@@ -137,6 +137,43 @@ class TestManagerApp:
             },
         }
 
+    def test_progress_endpoint(self, mock_clients, mock_config):
+        from tgdcfs.core.progress import RunProgress, progress_registry
+
+        run = progress_registry.register(
+            RunProgress(
+                kind="backfill",
+                filesystem="Test-Channel",
+                phase="mirroring",
+                files_total=4,
+                bytes_total=300,
+            )
+        )
+        try:
+            run.start_file(200)
+            run.start_copy("a.bin", "v1", "dc:9", [100, 100]).advance(120)
+            client = TestClient(create_manager_app(mock_clients, mock_config))
+
+            response = client.get("/replication/progress")
+        finally:
+            progress_registry.unregister(run)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["replication"] == {}
+        backfill = body["backfill"]["Test-Channel"]
+        assert backfill["phase"] == "mirroring"
+        assert (backfill["files_done"], backfill["files_total"]) == (0, 4)
+        assert (backfill["bytes_done"], backfill["bytes_total"]) == (120, 300)
+        current = backfill["current"]
+        assert (current["file"], current["version"], current["store"]) == (
+            "a.bin",
+            "v1",
+            "dc:9",
+        )
+        assert (current["part"], current["parts"]) == (2, 2)
+        assert (current["bytes_done"], current["bytes_total"]) == (120, 200)
+
     def test_replication_endpoints_without_a_queue(self, mock_clients, mock_config):
         client = TestClient(create_manager_app(mock_clients, mock_config))
         assert client.get("/replication/queue").json() == {}

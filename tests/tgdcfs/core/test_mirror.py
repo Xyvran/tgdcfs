@@ -724,10 +724,13 @@ class TestBackfill:
         assert any(
             m.startswith("Backfill for 'test': read 1/1 descriptors") for m in messages
         )
-        assert "Backfill for 'test': mirroring 1 files" in messages
+        assert "Backfill for 'test': mirroring 1 files, 7 B to copy" in messages
         assert any(m.startswith("Mirroring a.txt@") for m in messages)
         assert any(
-            m.startswith("Backfill [1/1] a.txt: 1 versions mirrored, 0 failures")
+            m.startswith(
+                "Backfill [1/1] a.txt: 1 versions mirrored (7 B in 1 parts), 0 failures"
+            )
+            and m.endswith("run at 7 B/7 B")
             for m in messages
         )
 

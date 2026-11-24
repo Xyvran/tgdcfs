@@ -13,6 +13,7 @@ from tgdcfs.core import Clients
 from tgdcfs.core.backfill import backfill_mirrors, count_files, create_backfill_task
 from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.ops import Ops
+from tgdcfs.core.progress import progress_registry
 from tgdcfs.core.replication import ReplicationQueue
 from tgdcfs.reqres import MessageRespWithDocument
 from tgdcfs.tasks import task_store
@@ -143,6 +144,12 @@ def create_manager_app(
         """Background request budget per bot, and whether foreground
         transfers are holding the background back."""
         return throttle.snapshot()
+
+    @app.get("/replication/progress")
+    async def get_replication_progress():
+        """What the running backfills and replication workers are copying,
+        per file system: files, bytes done/total and the current part."""
+        return progress_registry.snapshot()
 
     @app.post("/replication/retry")
     async def retry_replication(

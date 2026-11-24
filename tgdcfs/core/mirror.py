@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Literal, Optional, Set
 
 from tgdcfs.backends.base import IStore, sent_parts_of
+from tgdcfs.core.progress import CopyProgress, CopyStarter
 from tgdcfs.core.tee import TeeBranch, TeeFileMessage, TeeUpload
 from tgdcfs.errors import MessageNotFound, TechnicalError
 from tgdcfs.reqres import (
@@ -113,6 +114,13 @@ class MirrorResult:
     def store_keys(self) -> List[str]:
         return list(self.mirrors) + list(self.replicas)
 
+    @property
+    def parts_written(self) -> int:
+        """Messages the copies consist of, over all stores."""
+        return sum(len(ids) for ids in self.mirrors.values()) + sum(
+            len(replica.message_ids) for replica in self.replicas.values()
+        )
+
     def apply_to(self, version: "TGFSFileVersion") -> None:
         version.mirrors.update(self.mirrors)
         version.replicas.update(self.replicas)
@@ -181,6 +189,7 @@ class MirrorGroup:
         only_stores: Optional[List[str]] = None,
         source: Optional[IStore] = None,
         cache: Optional["VersionCache"] = None,
+        progress: Optional[CopyStarter] = None,
     ) -> MirrorResult:
         """Copy the given parts into the mirror stores.
 
@@ -189,8 +198,9 @@ class MirrorGroup:
         or a replica; when omitted they are looked up from the source.
         With ``cache`` the bytes come from the local copy of the version
         when there is one, and a download that has to happen anyway fills
-        the cache for the stores that follow. Returns the copies per
-        store that succeeded.
+        the cache for the stores that follow. ``progress`` is called once
+        per store and counts the bytes of that copy as they pass. Returns
+        the copies per store that succeeded.
         """
         res = MirrorResult()
         if not message_ids:
@@ -205,13 +215,14 @@ class MirrorGroup:
             try:
                 if sizes is None or len(sizes) != len(message_ids):
                     sizes = await self._part_sizes(source, message_ids)
+                copy = progress(ch.key, sizes) if progress is not None else None
                 if self._fits_aligned(ch.store, source, sizes):
                     res.mirrors[ch.key] = await self._copy_to(
-                        ch, source, message_ids, sizes, cache
+                        ch, source, message_ids, sizes, cache, copy
                     )
                 else:
                     res.replicas[ch.key] = await self._replicate(
-                        ch, source, message_ids, sizes, cache
+                        ch, source, message_ids, sizes, cache, copy
                     )
             except Exception as ex:
                 res.errors[ch.key] = str(ex)
@@ -368,6 +379,7 @@ class MirrorGroup:
         message_ids: List[int],
         part_sizes: Optional[List[int]] = None,
         cache: Optional["VersionCache"] = None,
+        progress: Optional[CopyProgress] = None,
     ) -> List[int]:
         """Aligned copy of ``source`` messages into ``target`` per ``mode``."""
         if not message_ids:
@@ -384,6 +396,8 @@ class MirrorGroup:
                 )
                 ids = None
             if ids is not None:
+                if progress is not None:
+                    progress.complete()
                 return ids
             if self._mode == "forward":
                 raise TechnicalError(
@@ -405,7 +419,7 @@ class MirrorGroup:
         try:
             for mid, local_range in zip(message_ids, offsets):
                 copied.append(
-                    await self._reupload_one(target, source, mid, local_range)
+                    await self._reupload_one(target, source, mid, local_range, progress)
                 )
         except BaseException as ex:
             # The parts copied so far belong to no recorded copy.
@@ -421,6 +435,7 @@ class MirrorGroup:
         source: IStore,
         message_id: int,
         local_range: Optional[tuple["VersionBytes", int, int]] = None,
+        progress: Optional[CopyProgress] = None,
     ) -> int:
         """Bandwidth-bound aligned copy: stream one part down and up again.
 
@@ -439,14 +454,22 @@ class MirrorGroup:
                 raise MessageNotFound(message_id=message_id)
             size = message.document.size
             chunks = (await source.download_file(message_id, 0, size - 1)).chunks
+        if progress is not None:
+            chunks = progress.track(chunks)
         what = f"part {message_id}"
-        sent = await self._upload_or_discard(
-            target,
-            FileMessageFromStream.new(
-                stream=chunks, size=size, name=f"part-{message_id}"
-            ),
-            what,
-        )
+        try:
+            sent = await self._upload_or_discard(
+                target,
+                FileMessageFromStream.new(
+                    stream=chunks, size=size, name=f"part-{message_id}"
+                ),
+                what,
+            )
+        finally:
+            # The target reads exactly ``size`` bytes and may leave the
+            # stream suspended; close it so the download is released.
+            if (aclose := getattr(chunks, "aclose", None)) is not None:
+                await aclose()
         error: Optional[TechnicalError] = None
         if len(sent) != 1:
             error = TechnicalError(
@@ -470,6 +493,7 @@ class MirrorGroup:
         message_ids: List[int],
         part_sizes: List[int],
         cache: Optional["VersionCache"] = None,
+        progress: Optional[CopyProgress] = None,
     ) -> Replica:
         """Re-partitioned copy: stream the whole version through the target.
 
@@ -484,6 +508,11 @@ class MirrorGroup:
         streamed = [0]
         what = f"message {message_ids[0]}"
 
+        def passed(chunk: bytes) -> None:
+            streamed[0] += len(chunk)
+            if progress is not None:
+                progress.advance(len(chunk))
+
         def short(origin: str) -> SizeMismatch:
             # Raised from inside the stream, so the upload stops at once
             # instead of cutting a short last part the target would take
@@ -497,7 +526,7 @@ class MirrorGroup:
         async def content() -> AsyncGenerator[bytes, None]:
             if local is not None:
                 async for chunk in local.read(0, total - 1):
-                    streamed[0] += len(chunk)
+                    passed(chunk)
                     yield chunk
                 if streamed[0] < total:
                     raise short("the local cache")
@@ -512,7 +541,7 @@ class MirrorGroup:
                     async for chunk in resp.chunks:
                         if filler is not None:
                             await filler.write(chunk)
-                        streamed[0] += len(chunk)
+                        passed(chunk)
                         yield chunk
                 finally:
                     if (aclose := getattr(resp.chunks, "aclose", None)) is not None:

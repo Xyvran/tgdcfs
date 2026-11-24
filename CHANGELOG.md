@@ -18,6 +18,12 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Backfill and replication progress in bytes and parts. The backfill
+  plans the bytes to copy while it reads the descriptors and logs files,
+  bytes done/total and the copy in flight (store, source part k/n) every
+  30 seconds; the per-file and final logs and the report name the bytes
+  and parts written. `GET /api/replication/progress` returns the same per
+  file system for running backfills and replication workers.
 - Parts an aborted mirror attempt already sent are deleted again
   (best effort): a replica or re-uploaded copy that fails half way, is
   refused by the size check or is cancelled no longer leaves orphaned

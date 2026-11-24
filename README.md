@@ -343,7 +343,11 @@ in each of them:
 * **Pre-existing files are covered by the backfill task**
   (`POST /api/redundancy/backfill/<filesystem>`, progress via the
   regular `/api/tasks` endpoints; add `?verify=true` to also re-mirror
-  copies that were manually deleted). It mirrors the current version of
+  copies that were manually deleted).
+  `GET /api/replication/progress` shows each running backfill and
+  replication worker in files and bytes (done/total) together with the
+  copy in flight: file, version, store and source part k/n; the backfill
+  logs the same every 30 seconds. It mirrors the current version of
   each file; older versions only with
   `tgdcfs.transfer.background.mirror_old_versions: true`. Between Telegram stores backfill
   forwards server-side as well, so mirroring a multi-terabyte library

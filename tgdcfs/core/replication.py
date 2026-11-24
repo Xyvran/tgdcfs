@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 from tgdcfs.core.backfill import BackfillReport, backfill_file
 from tgdcfs.core.model import TGFSDirectory, TGFSFileRef
+from tgdcfs.core.progress import RunProgress, format_bytes, progress_registry
 
 if TYPE_CHECKING:
     from tgdcfs.core.client import Client
@@ -186,6 +187,11 @@ class ReplicationWorker:
         self._queue = queue
         self._task: Optional[asyncio.Task[None]] = None
         self.last_report: Optional[BackfillReport] = None
+        # Files and bytes since the worker started; the queue learns its
+        # work one file at a time, so there is no byte total.
+        self.progress = RunProgress(
+            kind="replication", filesystem=client.name, phase="idle"
+        )
 
     @property
     def name(self) -> str:
@@ -193,6 +199,7 @@ class ReplicationWorker:
 
     def start(self) -> None:
         if self._task is None:
+            progress_registry.register(self.progress)
             self._task = asyncio.get_running_loop().create_task(self.run())
 
     async def stop(self) -> None:
@@ -203,6 +210,7 @@ class ReplicationWorker:
             except asyncio.CancelledError:
                 pass
             self._task = None
+            progress_registry.unregister(self.progress)
 
     async def process_one(self, path: str) -> bool:
         """Replicate one queued file; returns whether it is done."""
@@ -212,17 +220,33 @@ class ReplicationWorker:
             self._queue.done(self.name, path)
             return True
         report = BackfillReport()
+        progress = self.progress
+        progress.phase = "replicating"
+        progress.files_total = progress.files_done + len(self._queue.pending(self.name))
+        progress.start_file()
         try:
-            await backfill_file(self._client, fr, verify=False, report=report)
+            await backfill_file(
+                self._client, fr, verify=False, report=report, progress=progress
+            )
             if report.failures:
                 raise RuntimeError("; ".join(report.failures))
             if self._client.metadata_api:
                 await self._client.metadata_api.push()
         except Exception as ex:
+            progress.finish_file(failed=True)
             logger.warning(f"Replication of {path} in '{self.name}' failed: {ex}")
             self._queue.failed(self.name, path, str(ex))
             return False
+        finally:
+            progress.phase = "idle"
+        progress.finish_file()
         self.last_report = report
+        if report.bytes_mirrored:
+            logger.info(
+                f"Replicated {path} in '{self.name}': {report.versions_mirrored} "
+                f"versions ({format_bytes(report.bytes_mirrored)} in "
+                f"{report.parts_mirrored} parts)"
+            )
         self._queue.done(self.name, path)
         return True
 
