@@ -162,6 +162,7 @@ class TestMain:
         mock_config.tgdcfs.cache.enabled = False
         mock_config.tgdcfs.listing.message_cache_size = 1024
         mock_config.replication_queue_file = None
+        mock_config.backfill_state_file = None
 
         mock_clients = mocker.Mock()
         stats = mocker.Mock()
@@ -185,5 +186,6 @@ class TestMain:
         assert mock_create_clients.call_args.args[0] is mock_config
         mock_create_app.assert_called_once()
         assert mock_create_app.call_args.args[:2] == (mock_clients, mock_config)
+        assert mock_create_app.call_args.kwargs["backfill_state"].runs() == []
         mock_run_server.assert_called_once_with(mock_app, "0.0.0.0", 9000, "TGDCFS")
         stats.close.assert_awaited_once()

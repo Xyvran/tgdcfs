@@ -76,10 +76,20 @@ class TestRunProgress:
         assert run.to_dict()["current"]["part"] == 2
         run.finish_file()
         # A file counts with its planned bytes once done, copied or not.
-        run.start_file(100)
-        run.finish_file(failed=True)
-        assert (run.bytes_done, run.files_done, run.failures) == (300, 2, 1)
+        assert (run.bytes_done, run.files_done) == (200, 1)
         assert run.current is None
+
+    def test_a_failed_file_stays_ahead_until_its_retry(self):
+        run = RunProgress(kind="backfill", filesystem="fs", bytes_total=300)
+        run.count_done(1, 200)
+        run.start_file(100)
+        run.start_copy("b.bin", "v", "dc:9", [100]).advance(40)
+        run.finish_file(failed=True)
+        assert (run.bytes_done, run.files_done, run.failures) == (200, 1, 1)
+        run.start_file(100, retry=True)
+        assert run.failures == 0
+        run.finish_file()
+        assert (run.bytes_done, run.files_done, run.failures) == (300, 2, 0)
 
     def test_unplanned_bytes_still_count(self):
         run = RunProgress(kind="replication", filesystem="fs")

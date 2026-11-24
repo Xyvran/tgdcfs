@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from tgdcfs.auth import auth_basic, auth_bearer
 from tgdcfs.auth import login as login_bearer
 from tgdcfs.config import Config
+from tgdcfs.core.backfill_state import BackfillState
 from tgdcfs.core.client import Clients
 from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.replication import ReplicationQueue
@@ -37,6 +38,7 @@ def create_app(
     config: Config,
     replication: Optional[ReplicationQueue] = None,
     cache: Optional[LocalCache] = None,
+    backfill_state: Optional[BackfillState] = None,
 ) -> FastAPI:
     app = FastAPI()
     cors(app)
@@ -103,7 +105,13 @@ def create_app(
             return UNAUTHORIZED(str(e))
 
     manager_app = cors(
-        create_manager_app(clients, config, replication=replication, cache=cache)
+        create_manager_app(
+            clients,
+            config,
+            replication=replication,
+            cache=cache,
+            backfill_state=backfill_state,
+        )
     )
     app.mount("/api", manager_app)
 

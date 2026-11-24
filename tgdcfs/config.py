@@ -1298,6 +1298,10 @@ class Config:
         return expand_path("replication_queue.json")
 
     @property
+    def backfill_state_file(self) -> str:
+        return expand_path("backfill_state.json")
+
+    @property
     def uses_backend(self) -> Dict[str, bool]:
         return {
             name: any(store.backend == name for store in self.stores.values())

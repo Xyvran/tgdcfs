@@ -12,7 +12,9 @@ The job is idempotent and resumable for free: a version is skipped when
 its ``mirrors`` map already covers every configured store, and the FD
 edit that records the map is the commit point of each unit of work. A
 crash between forward and commit merely leaves an orphaned copy in the
-mirror store, which is harmless.
+mirror store, which is harmless. The outcome of every file is kept in
+:mod:`tgdcfs.core.backfill_state`, so a restart resumes the run instead
+of reading every descriptor again.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, Dict, List, Mapping, Optional, Set
 
 from tgdcfs.config import get_config
+from tgdcfs.core.backfill_state import BackfillRun, BackfillState, FileEntry
 from tgdcfs.core.local_cache import version_cache_for
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
@@ -48,6 +51,9 @@ HEARTBEAT_SECONDS = 60.0
 # often.
 SCAN_PROGRESS_SECONDS = 30.0
 MIRROR_PROGRESS_SECONDS = 30.0
+# The mirroring pushes the metadata and saves its state at most this
+# often; a restart repeats at most this much work.
+CHECKPOINT_SECONDS = 60.0
 
 
 @dataclass
@@ -437,12 +443,20 @@ async def backfill_mirrors(
     client: "Client",
     verify: bool = False,
     task_id: Optional[str] = None,
+    state: Optional[BackfillState] = None,
+    rescan: bool = False,
 ) -> BackfillReport:
     """Mirror every unmirrored file version of ``client``'s file system.
 
     Files are processed newest first so the most recent data is
-    protected earliest. Failures are recorded and skipped -- rerunning
-    the job retries exactly the missing pieces.
+    protected earliest. A file that fails is tried again with a backoff
+    while the run goes on with the others; what still fails after the
+    last attempt is reported.
+
+    ``state`` keeps the run across restarts: an unfinished run of the
+    file system is resumed (only the descriptors it has not read yet are
+    read, the files it finished are skipped) unless ``rescan`` starts
+    over. Without a ``state`` the run makes one pass and keeps nothing.
     """
     report = BackfillReport()
 
@@ -452,9 +466,24 @@ async def backfill_mirrors(
         )
         return report
 
-    refs = _collect_file_refs(client.dir_api.root)
-    total = len(refs)
-    logger.info(f"Backfill for '{client.name}': reading {total} descriptors")
+    if state is None:
+        state = BackfillState(None, max_attempts=1)
+    run = state.get(client.name)
+    if run is not None and not rescan:
+        run.verify = verify
+        for entry in run.files.values():
+            if entry.state == "failed":
+                # A restart is a fresh chance for what failed before.
+                entry.state = "pending"
+                entry.attempts = 0
+                entry.not_before = 0.0
+        logger.info(
+            f"Backfill for '{client.name}': resuming the run started "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(run.started_at))}, "
+            f"{run.count('done')}/{len(run.files)} files done"
+        )
+    else:
+        run = state.begin(client.name, verify)
 
     progress = progress_registry.register(
         RunProgress(kind="backfill", filesystem=client.name, phase="scanning")
@@ -464,61 +493,165 @@ async def backfill_mirrors(
             client,
             client.mirror_group,
             client.fd_repo,
-            verify,
+            state,
+            run,
             task_id,
             report,
-            refs,
             progress,
         )
     finally:
         progress_registry.unregister(progress)
 
 
-async def _backfill(
+async def _scan(
     client: "Client",
     group: MirrorGroup,
     fd_repo: IFDRepository,
-    verify: bool,
-    task_id: Optional[str],
+    state: BackfillState,
+    run: BackfillRun,
     report: BackfillReport,
-    refs: List[TGFSFileRef],
     progress: RunProgress,
-) -> BackfillReport:
-    total = len(refs)
+) -> Dict[str, TGFSFileRef]:
+    """Read the descriptors the run has no entry for yet; returns every
+    file of the file system by path."""
+    from tgdcfs.core.replication import file_path
+
+    paths = {file_path(fr): fr for fr in _collect_file_refs(client.dir_api.root)}
+    to_read = [(path, fr) for path, fr in paths.items() if path not in run.files]
+    total = len(to_read)
+    known = f" ({len(run.files)} already read)" if run.files else ""
+    logger.info(f"Backfill for '{client.name}': reading {total} descriptors{known}")
+
     # Newest first: load descriptors to know each file's timestamp, and
     # how many bytes each one still has to copy.
-    dated: List[Tuple[TGFSFileRef, int, int]] = []
+    run.unreadable = []
     scan_started = last_progress = time.monotonic()
     progress.files_total = total
-    for index, fr in enumerate(refs, 1):
+    for index, (path, fr) in enumerate(to_read, 1):
         progress.files_done = index - 1
         try:
             async with _heartbeat(f"the descriptor of {fr.name} ({index}/{total})"):
                 fd = await fd_repo.get(fr)
-            dated.append((fr, fd.updated_at_timestamp, planned_bytes(group, fd)))
+            run.files[path] = FileEntry(
+                path=path,
+                updated_at=fd.updated_at_timestamp,
+                bytes=planned_bytes(group, fd),
+            )
         except Exception as ex:
+            run.unreadable.append(path)
             report.failures.append(f"{fr.name}: cannot read descriptor ({ex})")
             logger.warning(f"Backfill: cannot read the descriptor of {fr.name}: {ex}")
         now = time.monotonic()
         if now - last_progress >= SCAN_PROGRESS_SECONDS or index == total:
             last_progress = now
+            # What has been read so far survives a restart.
+            state.save()
             logger.info(
                 f"Backfill for '{client.name}': read {index}/{total} descriptors "
-                f"in {now - scan_started:.0f}s, {len(report.failures)} unreadable"
+                f"in {now - scan_started:.0f}s, {len(run.unreadable)} unreadable"
             )
-    dated.sort(key=lambda item: item[1], reverse=True)
-    report.bytes_planned = sum(planned for _, _, planned in dated)
-    progress.files_total = len(dated)
+    run.scanned = True
+    state.save()
+    return paths
+
+
+async def _backfill(
+    client: "Client",
+    group: MirrorGroup,
+    fd_repo: IFDRepository,
+    state: BackfillState,
+    run: BackfillRun,
+    task_id: Optional[str],
+    report: BackfillReport,
+    progress: RunProgress,
+) -> BackfillReport:
+    paths = await _scan(client, group, fd_repo, state, run, report, progress)
+
+    done = [entry for entry in run.files.values() if entry.state == "done"]
+    report.bytes_planned = sum(entry.bytes for entry in run.files.values())
+    progress.files_total = len(run.files)
     progress.files_done = 0
+    progress.count_done(len(done), sum(entry.bytes for entry in done))
     progress.bytes_total = report.bytes_planned
     progress.phase = "mirroring"
 
     if task_id:
-        await task_store.update_task_progress(task_id, status=TaskStatus.IN_PROGRESS)
+        await task_store.update_task_progress(
+            task_id, status=TaskStatus.IN_PROGRESS, size_delta=len(done)
+        )
+    pending = [entry for entry in run.ordered() if entry.state == "pending"]
     logger.info(
-        f"Backfill for '{client.name}': mirroring {len(dated)} files, "
-        f"{format_bytes(report.bytes_planned)} to copy"
+        f"Backfill for '{client.name}': mirroring {len(pending)} files, "
+        f"{format_bytes(progress.bytes_total - progress.bytes_done)} to copy"
     )
+
+    # Files finished since the last metadata push: they are saved as done
+    # only once their copies are recorded in the pushed metadata.
+    unpushed: List[FileEntry] = []
+    metadata_dirty = False
+    last_checkpoint = time.monotonic()
+
+    async def checkpoint() -> None:
+        nonlocal metadata_dirty, last_checkpoint
+        if metadata_dirty and client.metadata_api:
+            await client.metadata_api.push()
+        metadata_dirty = False
+        unpushed.clear()
+        state.save()
+        last_checkpoint = time.monotonic()
+
+    async def process(entry: FileEntry, label: str) -> None:
+        nonlocal metadata_dirty
+        retry = entry.state == "failed"
+        if (fr := paths.get(entry.path)) is None:
+            # Removed or renamed since the scan: nothing left to copy here.
+            state.done(entry)
+            progress.start_file(entry.bytes, retry=retry)
+            progress.finish_file()
+            if task_id and not retry:
+                await task_store.update_task_progress(task_id, size_delta=1)
+            return
+        before = (fr.message_id, dict(fr.mirrors), fr.store)
+        mirrored = report.versions_mirrored
+        copied = report.bytes_mirrored
+        parts = report.parts_mirrored
+        failed = len(report.failures)
+        file_started = time.monotonic()
+        progress.start_file(entry.bytes, retry=retry)
+        try:
+            async with _heartbeat(f"{fr.name} ({label})"):
+                await backfill_file(client, fr, run.verify, report, progress)
+        except Exception as ex:
+            report.failures.append(f"{fr.name}: {ex}")
+            logger.error(f"Backfill failed for {fr.name}: {ex}")
+        if before != (fr.message_id, fr.mirrors, fr.store):
+            metadata_dirty = True
+        # The failures of a file belong to its entry until the run ends:
+        # a later attempt may still succeed.
+        failures = report.failures[failed:]
+        del report.failures[failed:]
+        if failures:
+            state.failed(entry, failures)
+        else:
+            state.done(entry)
+            unpushed.append(entry)
+        progress.finish_file(failed=bool(failures))
+        if not retry:
+            report.files_scanned += 1
+        logger.info(
+            f"Backfill [{label}] {fr.name}: "
+            f"{report.versions_mirrored - mirrored} versions mirrored "
+            f"({format_bytes(report.bytes_mirrored - copied)} in "
+            f"{report.parts_mirrored - parts} parts), "
+            f"{len(failures)} failures, "
+            f"{time.monotonic() - file_started:.1f}s; run at "
+            f"{format_bytes(progress.bytes_done)}/"
+            f"{format_bytes(progress.bytes_total)}"
+        )
+        if task_id and not retry:
+            await task_store.update_task_progress(task_id, size_delta=1)
+        if time.monotonic() - last_checkpoint >= CHECKPOINT_SECONDS:
+            await checkpoint()
 
     async def log_progress() -> None:
         while True:
@@ -526,44 +659,48 @@ async def _backfill(
             logger.info(f"Backfill for '{client.name}': {progress.describe()}")
 
     progress_log = asyncio.create_task(log_progress())
-    metadata_dirty = False
+    finished = False
     try:
-        for index, (fr, _, planned) in enumerate(dated, 1):
-            before = (fr.message_id, dict(fr.mirrors), fr.store)
-            mirrored = report.versions_mirrored
-            copied = report.bytes_mirrored
-            parts = report.parts_mirrored
-            failed = len(report.failures)
-            file_started = time.monotonic()
-            progress.start_file(planned)
-            try:
-                async with _heartbeat(f"{fr.name} ({index}/{len(dated)})"):
-                    await backfill_file(client, fr, verify, report, progress)
-            except Exception as ex:
-                report.failures.append(f"{fr.name}: {ex}")
-                logger.error(f"Backfill failed for {fr.name}: {ex}")
-            if before != (fr.message_id, fr.mirrors, fr.store):
-                metadata_dirty = True
-            report.files_scanned += 1
-            progress.finish_file(failed=len(report.failures) > failed)
-            logger.info(
-                f"Backfill [{index}/{len(dated)}] {fr.name}: "
-                f"{report.versions_mirrored - mirrored} versions mirrored "
-                f"({format_bytes(report.bytes_mirrored - copied)} in "
-                f"{report.parts_mirrored - parts} parts), "
-                f"{len(report.failures) - failed} failures, "
-                f"{time.monotonic() - file_started:.1f}s; run at "
-                f"{format_bytes(progress.bytes_done)}/"
-                f"{format_bytes(progress.bytes_total)}"
-            )
-            if task_id:
-                await task_store.update_task_progress(task_id, size_delta=1)
+        for index, entry in enumerate(pending, len(done) + 1):
+            await process(entry, f"{index}/{len(run.files)}")
+
+        # Failed files get their next attempts once the others are done,
+        # each after its backoff.
+        while retryable := [e for e in run.ordered() if state.retryable(e)]:
+            wait = min(entry.not_before for entry in retryable) - time.time()
+            if wait > 0:
+                progress.phase = "retrying"
+                await checkpoint()
+                logger.info(
+                    f"Backfill for '{client.name}': {len(retryable)} files "
+                    f"failed, next attempt in {wait:.0f}s"
+                )
+                await asyncio.sleep(wait)
+                progress.phase = "mirroring"
+            now = time.time()
+            for entry in retryable:
+                if entry.not_before <= now:
+                    await process(
+                        entry,
+                        f"attempt {entry.attempts + 1}/{state.max_attempts}",
+                    )
+
+        progress.phase = "finishing"
+        await checkpoint()
+        finished = True
     finally:
         progress_log.cancel()
-    progress.phase = "finishing"
+        if not finished:
+            # Interrupted before their copies were pushed: done again on
+            # the next run, which finds the copies that did make it.
+            for entry in unpushed:
+                entry.state = "pending"
+            state.save()
 
-    if metadata_dirty and client.metadata_api:
-        await client.metadata_api.push()
+    for entry in run.ordered():
+        if entry.state == "failed":
+            report.failures.extend(entry.failures)
+    state.finish(client.name)
 
     if task_id:
         await task_store.update_task_progress(
@@ -592,3 +729,71 @@ async def create_backfill_task(client: "Client", total_files: int) -> str:
 
 def count_files(client: "Client") -> int:
     return len(_collect_file_refs(client.dir_api.root))
+
+
+class BackfillRunning(Exception):
+    """A backfill of the file system is already going on."""
+
+
+# File systems with a backfill going on, and the tasks that run them.
+_running: Set[str] = set()
+_tasks: Set["asyncio.Task[None]"] = set()
+
+
+def backfill_running(name: str) -> bool:
+    return name in _running
+
+
+async def start_backfill(
+    client: "Client",
+    state: Optional[BackfillState] = None,
+    verify: bool = False,
+    rescan: bool = False,
+) -> str:
+    """Run :func:`backfill_mirrors` in the background; returns its task id.
+
+    Raises :class:`BackfillRunning` when ``client`` already has a run
+    going on: two runs would race on the same files and state.
+    """
+    if client.name in _running:
+        raise BackfillRunning(f"A backfill of '{client.name}' is already running")
+    _running.add(client.name)
+    try:
+        task_id = await create_backfill_task(client, count_files(client))
+    except BaseException:
+        _running.discard(client.name)
+        raise
+
+    async def run() -> None:
+        try:
+            await backfill_mirrors(
+                client, verify=verify, task_id=task_id, state=state, rescan=rescan
+            )
+        except Exception:
+            logger.exception(f"Mirror backfill for '{client.name}' crashed")
+        finally:
+            _running.discard(client.name)
+
+    task = asyncio.get_running_loop().create_task(run())
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    return task_id
+
+
+async def resume_backfills(
+    clients: Mapping[str, "Client"], state: BackfillState
+) -> List[str]:
+    """Resume the runs a restart interrupted; returns their task ids."""
+    task_ids = []
+    for run in state.runs():
+        client = clients.get(run.filesystem)
+        if client is None or client.mirror_group is None:
+            # Kept: the file system may come back with its mirrors.
+            logger.warning(
+                f"Not resuming the backfill of '{run.filesystem}': "
+                "no such file system with mirror stores"
+            )
+            continue
+        logger.info(f"Resuming the interrupted backfill of '{run.filesystem}'")
+        task_ids.append(await start_backfill(client, state, verify=run.verify))
+    return task_ids

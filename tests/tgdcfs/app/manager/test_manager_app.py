@@ -174,6 +174,39 @@ class TestManagerApp:
         assert (current["part"], current["parts"]) == (2, 2)
         assert (current["bytes_done"], current["bytes_total"]) == (120, 200)
 
+    def test_backfill_endpoints(self, mock_client, mock_clients, mock_config, mocker):
+        from tgdcfs.core.backfill import BackfillRunning
+        from tgdcfs.core.backfill_state import BackfillState, FileEntry
+
+        state = BackfillState(None)
+        run = state.begin("Test-Channel", verify=False)
+        run.files["/a.bin"] = FileEntry(path="/a.bin")
+        state.failed(run.files["/a.bin"], ["a.bin@v: boom"])
+        mock_client.mirror_group = mocker.Mock()
+        start = mocker.patch(
+            "tgdcfs.app.manager.app.start_backfill",
+            mocker.AsyncMock(return_value="t-1"),
+        )
+        client = TestClient(
+            create_manager_app(mock_clients, mock_config, backfill_state=state)
+        )
+
+        summary = client.get("/redundancy/backfill").json()["Test-Channel"]
+        assert (summary["files"], summary["failed"], summary["running"]) == (
+            1,
+            1,
+            False,
+        )
+        assert summary["failures"][0]["last_error"] == "a.bin@v: boom"
+
+        response = client.post("/redundancy/backfill/Test-Channel?rescan=true")
+        assert response.json() == {"task_id": "t-1"}
+        start.assert_awaited_once_with(mock_client, state, verify=False, rescan=True)
+
+        start.side_effect = BackfillRunning("already running")
+        assert client.post("/redundancy/backfill/Test-Channel").status_code == 409
+        assert client.post("/redundancy/backfill/nope").status_code == 404
+
     def test_replication_endpoints_without_a_queue(self, mock_clients, mock_config):
         client = TestClient(create_manager_app(mock_clients, mock_config))
         assert client.get("/replication/queue").json() == {}

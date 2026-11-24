@@ -23,6 +23,8 @@ from tgdcfs.backends.discord import factory as discord
 from tgdcfs.backends.telegram import factory as telegram
 from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
+from tgdcfs.core.backfill import resume_backfills
+from tgdcfs.core.backfill_state import BackfillState
 from tgdcfs.core.client import StoreFactory
 from tgdcfs.core.local_cache import CacheSweeper, LocalCache
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
@@ -135,8 +137,17 @@ async def main():
     clients = await create_clients(config, replication, cache)
     workers = start_replication_workers(clients, config, replication)
 
-    app = create_app(clients, config, replication=replication, cache=cache)
+    backfill_state = BackfillState(config.backfill_state_file)
+    app = create_app(
+        clients,
+        config,
+        replication=replication,
+        cache=cache,
+        backfill_state=backfill_state,
+    )
     sweeper = start_cache_sweeper(cache, replication)
+    # Backfills a restart interrupted go on where they stopped.
+    await resume_backfills(clients, backfill_state)
 
     try:
         sftp_acceptor = await start_sftp_server(clients, config)

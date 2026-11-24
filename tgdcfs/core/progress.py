@@ -128,19 +128,30 @@ class RunProgress:
             current = min(current, self._file_planned)
         return self._bytes_finished + current
 
-    def start_file(self, planned_bytes: int = 0) -> None:
+    def start_file(self, planned_bytes: int = 0, retry: bool = False) -> None:
+        """``retry``: the file failed before and is counted in ``failures``
+        until this attempt is finished."""
         self._file_planned = max(0, planned_bytes)
         self._file_bytes = 0
+        if retry and self.failures > 0:
+            self.failures -= 1
 
     def finish_file(self, failed: bool = False) -> None:
-        """Count the file as done, whether it was copied, skipped or failed:
-        its bytes are no longer ahead of the run."""
-        self._bytes_finished += max(self._file_planned, self._file_bytes)
-        self._file_planned = self._file_bytes = 0
-        self.files_done += 1
+        """Count the file as done, copied or skipped: its bytes are no
+        longer ahead of the run. A failed file is counted in ``failures``
+        instead and keeps its bytes ahead, since it is tried again."""
         if failed:
             self.failures += 1
+        else:
+            self._bytes_finished += max(self._file_planned, self._file_bytes)
+            self.files_done += 1
+        self._file_planned = self._file_bytes = 0
         self.current = None
+
+    def count_done(self, files: int, size: int) -> None:
+        """Files a resumed run finished before it was interrupted."""
+        self.files_done += files
+        self._bytes_finished += size
 
     def start_copy(
         self, file: str, version: str, store: str, part_sizes: List[int]

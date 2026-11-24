@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 from typing import List, Optional
@@ -10,7 +9,8 @@ from tgdcfs.app.fs_cache import gfc
 from tgdcfs.app.utils import split_global_path
 from tgdcfs.config import Config
 from tgdcfs.core import Clients
-from tgdcfs.core.backfill import backfill_mirrors, count_files, create_backfill_task
+from tgdcfs.core.backfill import BackfillRunning, backfill_running, start_backfill
+from tgdcfs.core.backfill_state import BackfillState
 from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.ops import Ops
 from tgdcfs.core.progress import progress_registry
@@ -27,6 +27,7 @@ def create_manager_app(
     config: Config,
     replication: Optional[ReplicationQueue] = None,
     cache: Optional[LocalCache] = None,
+    backfill_state: Optional[BackfillState] = None,
 ) -> FastAPI:
     ops = {name: Ops(client) for name, client in clients.items()}
 
@@ -198,14 +199,28 @@ def create_manager_app(
             for name, client in clients.items()
         }
 
+    @app.get("/redundancy/backfill")
+    async def get_backfills():
+        """The unfinished backfill runs, per file system: how many files
+        are done, pending and failed, and why the failed ones failed."""
+        runs = backfill_state.to_dict() if backfill_state is not None else {}
+        return {
+            name: {**summary, "running": backfill_running(name)}
+            for name, summary in runs.items()
+        }
+
     @app.post("/redundancy/backfill/{client_name}")
-    async def start_backfill(client_name: str, verify: bool = Query(False)):
+    async def post_backfill(
+        client_name: str, verify: bool = Query(False), rescan: bool = Query(False)
+    ):
         """Mirror all pre-existing, unmirrored data of one client.
 
         Runs in the background; progress is reported through the regular
         /tasks endpoints (type ``mirror_backfill``). ``verify=true``
         additionally checks that recorded mirror copies still exist and
-        re-mirrors any that were deleted.
+        re-mirrors any that were deleted. An unfinished run is resumed
+        unless ``rescan=true`` starts over with a fresh descriptor scan.
+        A second run while one is going on is refused with 409.
         """
         if (client := clients.get(client_name)) is None:
             raise HTTPException(status_code=404, detail="Unknown client")
@@ -215,15 +230,12 @@ def create_manager_app(
                 detail=f"No mirror stores configured for '{client_name}'",
             )
 
-        task_id = await create_backfill_task(client, count_files(client))
-
-        async def run() -> None:
-            try:
-                await backfill_mirrors(client, verify=verify, task_id=task_id)
-            except Exception:
-                logger.exception(f"Mirror backfill for '{client_name}' crashed")
-
-        asyncio.get_running_loop().create_task(run())
+        try:
+            task_id = await start_backfill(
+                client, backfill_state, verify=verify, rescan=rescan
+            )
+        except BackfillRunning as ex:
+            raise HTTPException(status_code=409, detail=str(ex))
         return {"task_id": task_id}
 
     async def get_message(channel_id: int, message_id: int) -> MessageRespWithDocument:

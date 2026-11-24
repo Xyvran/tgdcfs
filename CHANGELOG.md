@@ -18,6 +18,19 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Backfill runs survive a restart. The run is kept in
+  `backfill_state.json` in the data directory (written atomically, like
+  the replication queue): the descriptors it has read and the outcome of
+  every file, which counts as done only once the metadata recording its
+  copies has been pushed (checkpoint every 60 seconds). At startup an
+  interrupted run resumes on its own, without reading the descriptors
+  again; `POST /api/redundancy/backfill/<fs>?rescan=true` starts over. A
+  file that fails no longer has to wait for the next run: it is tried
+  again after the others, up to four attempts with a backoff from one
+  minute to one hour, and only what still fails is reported.
+  `GET /api/redundancy/backfill` lists the unfinished runs with their
+  done, pending and failed files; a second backfill of a file system
+  while one is running is refused with 409.
 - Backfill and replication progress in bytes and parts. The backfill
   plans the bytes to copy while it reads the descriptors and logs files,
   bytes done/total and the copy in flight (store, source part k/n) every

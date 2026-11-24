@@ -352,6 +352,13 @@ in each of them:
   `tgdcfs.transfer.background.mirror_old_versions: true`. Between Telegram stores backfill
   forwards server-side as well, so mirroring a multi-terabyte library
   costs API calls, not bandwidth.
+  A run is kept in `backfill_state.json` in the data directory: after a
+  restart it resumes on its own, without reading every descriptor again
+  and skipping the files it finished (add `?rescan=true` to start over).
+  A file that fails is tried again after the others, up to four times
+  with a backoff from one minute; `GET /api/redundancy/backfill` lists
+  the unfinished runs with their failed files. One run per file system
+  at a time: a second request gets 409.
 * **Works with encryption**: mirrors receive the ciphertext messages
   including the inline header, so files remain decryptable from a mirror
   alone.
