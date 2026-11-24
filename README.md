@@ -16,6 +16,10 @@ design is described in
 the Discord backend, cross-backend mirroring in both directions and
 background replication are in.
 
+Documentation for users, operators and developers is published with the
+web frontend on GitHub Pages: <https://xyvran.github.io/tgdcfs/docs/>. Its
+sources are in [docusaurus/](docusaurus/).
+
 Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
 for creating the original tgfs project this repository is built upon.
 

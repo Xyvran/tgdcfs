@@ -1,5 +1,7 @@
 name: docker-build-push
 
+# Images land on GHCR (with the workflow's own GITHUB_TOKEN, no secrets
+# needed) and, when the Docker Hub secrets are set, on Docker Hub as well.
 on:
   workflow_run:
     workflows: ["Test and Coverage"]
@@ -9,23 +11,68 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   docker:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, not the
+      # upstream one. A fork that wants a different Docker Hub namespace can
+      # set the repository variable DOCKERHUB_NAMESPACE.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: xyvran/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: xyvran/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
-        
+
+      # Ubuntu 26.04 runners stack the docker-default AppArmor profile
+      # (docker-default//&unconfined), which denies signals between processes
+      # inside a container. `next build` kills its build workers, so the
+      # frontend image fails with "Error: kill EACCES" (moby/moby#54099).
+      # Runners are single-use VMs, so relaxing the sysctl here is safe.
+      - name: Allow signals inside build containers
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+
+      # Docker Hub namespaces are lowercase, but github.repository_owner keeps
+      # the case of the GitHub account name (VulcanoSoftware). Docker reads a
+      # first path component with capitals as a registry host name and tries
+      # to push to https://VulcanoSoftware/, so lowercase it for later steps.
+      - name: Lowercase the Docker Hub namespace
+        run: echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE,,}" >> "$GITHUB_ENV"
+
+      # GHCR package paths are lowercase too, and github.repository keeps the
+      # case of the owner and repository names.
+      - name: Lowercase the GHCR repository
+        run: echo "GHCR_REPOSITORY=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Compute the image tags
+        id: tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          tags="${GHCR_REPOSITORY}/${{ matrix.name }}:latest,${GHCR_REPOSITORY}/${{ matrix.name }}:${{ github.sha }}"
+          # Docker Hub publishing needs both secrets; a fork without them
+          # still ships its images to GHCR.
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            tags="${DOCKERHUB_NAMESPACE}/${{ matrix.name }}:latest,${DOCKERHUB_NAMESPACE}/${{ matrix.name }}:${{ github.sha }},${tags}"
+          fi
+          {
+            echo "tags=${tags}"
+            echo "dockerhub=$([ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker
         uses: docker/setup-docker-action@v5
         with:
@@ -38,10 +85,18 @@ jobs:
             }
 
       - name: Login to Docker Hub
+        if: steps.tags.outputs.dockerhub == 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -53,6 +108,9 @@ jobs:
           file: ./${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ matrix.repository }}:latest
-            ${{ matrix.repository }}:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.tags }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}

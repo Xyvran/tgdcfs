@@ -180,9 +180,23 @@ jobs:
     needs: tags
     if: needs.tags.outputs.tags != ''
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, never
+      # the upstream one. Override with the repository variable
+      # DOCKERHUB_NAMESPACE when the Docker Hub namespace differs from the
+      # GitHub username.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
+      # GHCR publishing uses the workflow's own GITHUB_TOKEN, so a fork
+      # without Docker Hub secrets still gets its version tags.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     strategy:
       matrix:
-        repository: [xyvran/tgdcfs, xyvran/tgdcfs-fe]
+        image: [tgdcfs, tgdcfs-fe]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -193,10 +207,18 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Login to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # For a new release the image of its commit may still be building (it is
       # pushed only after the tests on master pass), so wait for it up to an
@@ -205,35 +227,47 @@ jobs:
         env:
           TAGS: ${{ needs.tags.outputs.tags }}
           WAIT: ${{ needs.tags.outputs.wait }}
-          REPOSITORY: ${{ matrix.repository }}
+          IMAGE: ${{ matrix.image }}
         run: |
+          # Docker Hub namespaces are lowercase; the GitHub owner may not be.
+          # GHCR package paths are lowercase on both counts.
+          REPOSITORY="${DOCKERHUB_NAMESPACE,,}/${IMAGE}"
+          GHCR_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}/${IMAGE}"
+          registries=("${GHCR_REPOSITORY}")
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            registries+=("${REPOSITORY}")
+          else
+            echo "::warning::no Docker Hub secrets, ${REPOSITORY} gets no version tags"
+          fi
           if [ "${WAIT}" = true ]; then attempts=60; else attempts=1; fi
           for tag in ${TAGS}; do
             sha="$(git rev-list -n 1 "${tag}")"
             version="${tag#v}"
             minor="${version%.*}"
-            source="${REPOSITORY}:${sha}"
-            found=false
-            for attempt in $(seq "${attempts}"); do
-              if docker buildx imagetools inspect "${source}" > /dev/null 2>&1; then
-                found=true
-                break
-              fi
-              if [ "${attempt}" -lt "${attempts}" ]; then sleep 60; fi
-            done
-            if [ "${found}" != true ]; then
-              if [ "${WAIT}" = true ]; then
-                echo "::error::${source} did not appear on Docker Hub"
-                exit 1
-              fi
-              echo "::warning::${source} does not exist, ${tag} gets no Docker tags"
-              continue
-            fi
             # X.Y follows the newest patch release of that line only, so
             # republishing an older patch does not move it backwards.
             newest="$(git tag --list "v${minor}.*" --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)"
-            targets=(--tag "${REPOSITORY}:${version}")
-            if [ "${newest}" = "${tag}" ]; then targets+=(--tag "${REPOSITORY}:${minor}"); fi
-            docker buildx imagetools create "${targets[@]}" "${source}"
-            echo "Tagged ${source} as ${targets[*]}"
+            for repository in "${registries[@]}"; do
+              source="${repository}:${sha}"
+              found=false
+              for attempt in $(seq "${attempts}"); do
+                if docker buildx imagetools inspect "${source}" > /dev/null 2>&1; then
+                  found=true
+                  break
+                fi
+                if [ "${attempt}" -lt "${attempts}" ]; then sleep 60; fi
+              done
+              if [ "${found}" != true ]; then
+                if [ "${WAIT}" = true ]; then
+                  echo "::error::${source} did not appear in its registry"
+                  exit 1
+                fi
+                echo "::warning::${source} does not exist, ${tag} gets no Docker tags"
+                continue
+              fi
+              targets=(--tag "${repository}:${version}")
+              if [ "${newest}" = "${tag}" ]; then targets+=(--tag "${repository}:${minor}"); fi
+              docker buildx imagetools create "${targets[@]}" "${source}"
+              echo "Tagged ${source} as ${targets[*]}"
+            done
           done

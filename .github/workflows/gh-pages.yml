@@ -1,4 +1,8 @@
-name: Deploy Next.js to GitHub Pages
+name: Deploy site to GitHub Pages
+
+# One Pages site per repository: the Next.js web frontend at /tgdcfs/ and
+# the Docusaurus documentation at /tgdcfs/docs/, assembled into a single
+# artifact below.
 
 on:
   push:
@@ -26,7 +30,9 @@ jobs:
         with:
           node-version: '24'
           cache: 'npm'
-          cache-dependency-path: './tgdcfs-gh-pages/package-lock.json'
+          cache-dependency-path: |
+            ./tgdcfs-gh-pages/package-lock.json
+            ./docusaurus/package-lock.json
 
       - name: Setup Pages
         uses: actions/configure-pages@v6
@@ -49,11 +55,33 @@ jobs:
       - name: Build with Next.js
         run: npm run build
         working-directory: ./tgdcfs-gh-pages
+        # next.config.ts derives the Docker images and the Pages URL shown in
+        # the config generator and the guides from these.
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+
+      - name: Install documentation dependencies
+        run: npm ci
+        working-directory: ./docusaurus
+
+      - name: Build the documentation
+        run: npm run build
+        working-directory: ./docusaurus
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+
+      - name: Assemble the Pages artifact
+        run: |
+          mkdir -p site
+          cp -r tgdcfs-gh-pages/out/. site/
+          cp -r docusaurus/build/. site/docs/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: ./tgdcfs-gh-pages/out
+          path: ./site
 
   deploy:
     environment:
