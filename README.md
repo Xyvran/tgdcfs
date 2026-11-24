@@ -343,7 +343,9 @@ in each of them:
 * **Pre-existing files are covered by the backfill task**
   (`POST /api/redundancy/backfill/<filesystem>`, progress via the
   regular `/api/tasks` endpoints; add `?verify=true` to also re-mirror
-  copies that were manually deleted). Between Telegram stores backfill
+  copies that were manually deleted). It mirrors the current version of
+  each file; older versions only with
+  `tgdcfs.transfer.background.mirror_old_versions: true`. Between Telegram stores backfill
   forwards server-side as well, so mirroring a multi-terabyte library
   costs API calls, not bandwidth.
 * **Works with encryption**: mirrors receive the ciphertext messages
@@ -791,6 +793,7 @@ tgdcfs:
       foreground_cooldown_seconds: 30
       stall_timeout_seconds: 120
       stall_restarts: 3
+      mirror_old_versions: false
 ```
 
 **Downloads** are cut into pieces and several are fetched at once. Bytes
@@ -850,6 +853,16 @@ A Telegram download that receives nothing for `stall_timeout_seconds` is
 restarted at the byte it had reached, at most `stall_restarts` times
 before it fails. A request can hang without ever failing, and a backfill
 would otherwise wait on it forever. This applies to every download.
+
+`mirror_old_versions` (default `false`) decides which versions the
+backfill and the replication queue copy to the mirrors. By default only
+the current version of each file is mirrored -- the newest one that is
+still readable, which is what every read serves. Older versions keep the
+copies they already have and stay readable from the primary. Set it to
+`true` to mirror every version the descriptor still lists; on a mirror
+that re-uploads (Discord) each old version costs as much as the current
+one. Copying versions into a new primary after a promotion is not
+affected and always covers every version.
 
 `scripts/measure_transfer.py` shows what the piece-level parallelism is
 worth against a simulated link, without needing a channel.

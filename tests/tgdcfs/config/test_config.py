@@ -352,6 +352,11 @@ class TestBackgroundTransferConfig:
         assert background == BackgroundTransferConfig()
         assert background.start_rate == 2.0
         assert background.stall_restarts == 3
+        assert background.mirror_old_versions is False
+
+    def test_mirror_old_versions_can_be_enabled(self):
+        background = BackgroundTransferConfig.from_dict({"mirror_old_versions": True})
+        assert background.mirror_old_versions is True
 
     def test_overrides(self):
         background = TransferConfig.from_dict(

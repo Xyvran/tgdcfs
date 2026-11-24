@@ -770,6 +770,99 @@ class TestBackfill:
         )
 
 
+class TestBackfillVersions:
+    """Only a file's current version is mirrored unless
+    ``transfer.background.mirror_old_versions`` asks for all of them."""
+
+    @staticmethod
+    def _fd_with_two_versions() -> TGFSFileDesc:
+        fd = TGFSFileDesc(name="a.txt")
+        now = datetime.datetime.now()
+        fd.add_version(
+            TGFSFileVersion(
+                id="old",
+                updated_at=now - datetime.timedelta(days=1),
+                message_ids=[1],
+                part_sizes=[7],
+            )
+        )
+        fd.add_version(
+            TGFSFileVersion(id="new", updated_at=now, message_ids=[2], part_sizes=[9])
+        )
+        return fd
+
+    def _client(self, mocker, group, fd):
+        root = TGFSDirectory.root_dir()
+        root.create_file_ref("a.txt", 5)
+        return SimpleNamespace(
+            name="test",
+            mirror_group=group,
+            fd_repo=FakeFDRepo(fd),
+            metadata_api=mocker.AsyncMock(),
+            dir_api=SimpleNamespace(root=root),
+        )
+
+    @pytest.mark.asyncio
+    async def test_only_the_current_version_by_default(self, mocker):
+        group, primary, mirror_api = make_group(mocker)
+        mirror_api.copy_from.return_value = [12]
+        fd = self._fd_with_two_versions()
+
+        report = await backfill_mirrors(self._client(mocker, group, fd))  # type: ignore[arg-type]
+
+        mirror_api.copy_from.assert_awaited_once_with(primary, [2])
+        assert report.versions_checked == 1
+        assert report.versions_mirrored == 1
+        assert fd.get_version("new").mirrors == {"tg:999": [12]}
+        assert fd.get_version("old").mirrors == {}
+
+    @pytest.mark.asyncio
+    async def test_every_version_when_enabled(self, mocker):
+        mocker.patch("tgdcfs.core.backfill.mirror_old_versions", return_value=True)
+        group, primary, mirror_api = make_group(mocker)
+        mirror_api.copy_from.side_effect = lambda _src, ids: [ids[0] + 10]
+        fd = self._fd_with_two_versions()
+
+        report = await backfill_mirrors(self._client(mocker, group, fd))  # type: ignore[arg-type]
+
+        assert report.versions_mirrored == 2
+        assert fd.get_version("new").mirrors == {"tg:999": [12]}
+        assert fd.get_version("old").mirrors == {"tg:999": [11]}
+
+    @pytest.mark.asyncio
+    async def test_older_versions_are_still_copied_into_a_new_primary(
+        self, mocker
+    ):
+        """Promotion is not mirroring: after a primary swap every version
+        needs its copy in the new primary, or it is lost with the old one."""
+        group, _, mirror_api = make_group(mocker)
+        mirror_api.copy_from.return_value = [12]
+        promote = mocker.patch.object(
+            group, "copy_into_primary", mocker.AsyncMock(return_value=True)
+        )
+        fd = self._fd_with_two_versions()
+        fd.get_version("old").store = "tg:gone"
+
+        report = await backfill_mirrors(self._client(mocker, group, fd))  # type: ignore[arg-type]
+
+        promote.assert_awaited_once_with(fd.get_version("old"))
+        assert report.versions_promoted == 1
+        assert report.versions_mirrored == 1
+
+    @pytest.mark.asyncio
+    async def test_the_newest_valid_version_counts_as_current(self, mocker):
+        """A newest version whose parts are gone is not what a read serves."""
+        group, primary, mirror_api = make_group(mocker)
+        mirror_api.copy_from.return_value = [11]
+        fd = self._fd_with_two_versions()
+        fd.get_version("new").set_invalid()
+
+        await backfill_mirrors(self._client(mocker, group, fd))  # type: ignore[arg-type]
+
+        mirror_api.copy_from.assert_awaited_once_with(primary, [1])
+        assert fd.get_version("old").mirrors == {"tg:999": [11]}
+
+
 class TestSaveMirrorsParts:
     @pytest.mark.asyncio
     async def test_save_records_mirror_ids_on_sent_messages(self, mocker):

@@ -169,7 +169,9 @@ tgdcfs:
   #   # bot (Telegram bots, the account, Discord bots). Halved on a flood
   #   # wait or 429, raised after quiet intervals, held at min_rate while
   #   # foreground transfers run. Downloads that receive nothing for
-  #   # stall_timeout_seconds restart at the same byte.
+  #   # stall_timeout_seconds restart at the same byte. The backfill and
+  #   # the queue mirror only the current version of each file unless
+  #   # mirror_old_versions is true.
   #   background:
   #     start_rate: 2.0             # requests/s per bot
   #     min_rate: 0.2
@@ -179,6 +181,7 @@ tgdcfs:
   #     foreground_cooldown_seconds: 30
   #     stall_timeout_seconds: 120
   #     stall_restarts: 3
+  #     mirror_old_versions: false
 
   # ---------------------------------------------------------------------------
   # Optional local cache, off by default. See the README, "Local cache".

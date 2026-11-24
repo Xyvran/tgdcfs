@@ -63,6 +63,15 @@ the fact on the commits that shipped them.
   used to stall a backfill indefinitely.
 ### Changed
 
+- The backfill and the `sync: background` replication queue mirror only
+  the current version of each file -- the newest readable one, which is
+  what reads serve. They used to copy every version a descriptor still
+  lists, so a file overwritten a few times was re-uploaded to Discord
+  once per version. New option
+  `tgdcfs.transfer.background.mirror_old_versions` (default `false`)
+  restores the old behaviour. Copying versions into a new primary after a
+  promotion still covers every version. Older versions that are already
+  mirrored keep their copies.
 - WebDAV listings report a file's creation date as the date of its oldest
   version. It used to be the time of the listing.
 

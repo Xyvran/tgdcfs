@@ -4,7 +4,9 @@ When redundancy is enabled on an existing installation, nothing that is
 already in the primary store has a mirror copy. This module walks the metadata
 tree (the authoritative work list -- everything TGDCFS serves is reachable
 from it), finds file versions without a complete mirror set, and copies
-them using the same primitives as the live write path.
+them using the same primitives as the live write path. Only the current
+version of each file is mirrored unless
+``tgdcfs.transfer.background.mirror_old_versions`` is set.
 
 The job is idempotent and resumable for free: a version is skipped when
 its ``mirrors`` map already covers every configured store, and the FD
@@ -22,6 +24,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 
+from tgdcfs.config import get_config
 from tgdcfs.core.local_cache import version_cache_for
 from tgdcfs.core.mirror import MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
@@ -87,6 +90,22 @@ async def _heartbeat(label: str) -> AsyncIterator[None]:
         yield
     finally:
         task.cancel()
+
+
+def mirror_old_versions() -> bool:
+    """Whether versions other than a file's current one are mirrored;
+    ``tgdcfs.transfer.background.mirror_old_versions``."""
+    return get_config().tgdcfs.transfer.background.mirror_old_versions
+
+
+def versions_to_mirror(fd: TGFSFileDesc) -> List[TGFSFileVersion]:
+    """The versions of ``fd`` the backfill brings up to date, newest first.
+
+    By default only the current version: the newest valid one, which is
+    the one a read serves. Older versions keep whatever copies they have.
+    """
+    versions = fd.get_versions(sort=True, exclude_invalid=True)
+    return versions if mirror_old_versions() else versions[:1]
 
 
 def _collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
@@ -266,11 +285,12 @@ async def backfill_file(
         await _verify_mirrors(client, fd)
 
     changed = False
+    to_mirror = {version.id for version in versions_to_mirror(fd)}
     for version in fd.get_versions(exclude_invalid=True):
-        report.versions_checked += 1
-
         # A version that still lives in a former primary gets its copy in
         # the current primary first; that copy becomes its primary layout.
+        # Every version, not only the mirrored ones: after a promotion the
+        # old primary may be gone for good.
         if not version.owned_by(mirror_group.primary.key):
             try:
                 if await mirror_group.copy_into_primary(version):
@@ -288,6 +308,14 @@ async def backfill_file(
         cache = version_cache_for(
             getattr(client, "cache", None), client.name, version.id, version.size
         )
+        if version.id not in to_mirror:
+            # An older version is not mirrored, so no mirror waits for its
+            # staged bytes any more.
+            if cache is not None:
+                cache.release()
+            continue
+        report.versions_checked += 1
+
         missing = mirror_group.missing_stores(version)
         if not missing:
             if cache is not None:

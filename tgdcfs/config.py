@@ -327,6 +327,12 @@ class BackgroundTransferConfig:
     ``stall_timeout_seconds`` is restarted at the same offset, at most
     ``stall_restarts`` times before it fails. This applies to every
     download, foreground included.
+
+    ``mirror_old_versions`` decides what the backfill and the replication
+    queue copy to the mirrors: only the current version of each file (the
+    default) or every version the descriptor still lists. Older versions
+    are rarely read, and on a mirror that re-uploads each one costs as much
+    as the current one.
     """
 
     start_rate: float = 2.0
@@ -337,6 +343,7 @@ class BackgroundTransferConfig:
     foreground_cooldown_seconds: float = 30.0
     stall_timeout_seconds: float = 120.0
     stall_restarts: int = 3
+    mirror_old_versions: bool = False
 
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> "BackgroundTransferConfig":
@@ -368,6 +375,9 @@ class BackgroundTransferConfig:
             foreground_cooldown_seconds=non_negative("foreground_cooldown_seconds"),
             stall_timeout_seconds=positive("stall_timeout_seconds"),
             stall_restarts=int(non_negative("stall_restarts")),
+            mirror_old_versions=bool(
+                data.get("mirror_old_versions", defaults.mirror_old_versions)
+            ),
         )
         if not config.min_rate <= config.start_rate <= config.max_rate:
             raise ValueError(
