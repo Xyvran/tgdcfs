@@ -109,13 +109,13 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
-- Two in-memory lists no longer grow with the uptime. Finished upload
-  and backfill tasks were kept until a restart; they are now dropped after 24 hours,
-  and at most the 500 most recent are kept, so a large backfill cannot
-  pile them up either. Running tasks are never removed. The WebDAV path
-  cache also added an empty entry for every path that was written,
-  moved or deleted and never removed it; resetting a path now only
-  removes what is cached.
+- Two in-memory lists no longer grow with the uptime. Finished upload and
+  backfill tasks were kept until a restart; they are now dropped after 24
+  hours, and at most the 500 most recent are kept, so a large backfill
+  cannot pile them up either. Running tasks are never removed. The WebDAV
+  path cache also added an empty entry for every path that was written,
+  moved or deleted and never removed it; resetting a path now only removes
+  what is cached.
 
 - A mirror copy is only recorded when its parts add up to the size of the
   version it copies. A source that delivers fewer bytes than its parts
