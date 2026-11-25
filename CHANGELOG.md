@@ -109,8 +109,8 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
-- Two in-memory lists no longer grow with the uptime. Finished upload and backfill
-  tasks were kept until a restart; they are now dropped after 24 hours,
+- Two in-memory lists no longer grow with the uptime. Finished upload
+  and backfill tasks were kept until a restart; they are now dropped after 24 hours,
   and at most the 500 most recent are kept, so a large backfill cannot
   pile them up either. Running tasks are never removed. The WebDAV path
   cache also added an empty entry for every path that was written,
