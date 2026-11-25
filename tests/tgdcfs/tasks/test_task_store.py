@@ -330,7 +330,6 @@ class TestTaskStore:
             task_id1, status=TaskStatus.COMPLETED
         )
         task1 = await task_store_instance.get_task(task_id1)
-        task1.updated_at = old_time.isoformat()
 
         # Create recent completed task (less than 24 hours ago)
         recent_time = current_time - datetime.timedelta(hours=1)
@@ -341,7 +340,6 @@ class TestTaskStore:
             task_id2, status=TaskStatus.COMPLETED
         )
         task2 = await task_store_instance.get_task(task_id2)
-        task2.updated_at = recent_time.isoformat()
 
         # Create old failed task (more than 24 hours ago)
         task_id3 = await task_store_instance.add_task(
@@ -351,7 +349,6 @@ class TestTaskStore:
             task_id3, status=TaskStatus.FAILED
         )
         task3 = await task_store_instance.get_task(task_id3)
-        task3.updated_at = old_time.isoformat()
 
         # Create in-progress task (should not be cleaned up regardless of age)
         task_id4 = await task_store_instance.add_task(
@@ -360,6 +357,12 @@ class TestTaskStore:
         await task_store_instance.update_task_progress(
             task_id4, status=TaskStatus.IN_PROGRESS
         )
+
+        # Backdate only once every task exists: adding a task prunes finished
+        # tasks that are already past their age.
+        task1.updated_at = old_time.isoformat()
+        task2.updated_at = recent_time.isoformat()
+        task3.updated_at = old_time.isoformat()
 
         # Cleanup with 24 hour threshold - should remove old completed and failed tasks
         removed_count = await task_store_instance.cleanup_completed_tasks(
@@ -438,3 +441,80 @@ class TestGlobalTaskStore:
         from tgdcfs.tasks.task_store import task_store
 
         assert isinstance(task_store, TaskStore)
+
+
+class TestFinishedTaskPruning:
+    """Finished tasks must not accumulate for the lifetime of the process."""
+
+    @staticmethod
+    async def _finished(store, name, status=TaskStatus.COMPLETED, age_hours=0.0):
+        task_id = await store.add_task(TaskType.UPLOAD, f"/test/{name}", name)
+        await store.update_task_progress(task_id, status=status)
+        task = await store.get_task(task_id)
+        task.updated_at = (
+            utcnow() - datetime.timedelta(hours=age_hours)
+        ).isoformat()
+        return task_id
+
+    @pytest.mark.asyncio
+    async def test_add_task_drops_finished_tasks_past_their_age(self):
+        store = TaskStore()
+        old_done = await self._finished(store, "old.txt", age_hours=25)
+        old_failed = await self._finished(
+            store, "failed.txt", status=TaskStatus.FAILED, age_hours=25
+        )
+        recent = await self._finished(store, "recent.txt", age_hours=1)
+
+        await store.add_task(TaskType.UPLOAD, "/test/new.txt", "new.txt")
+
+        assert await store.get_task(old_done) is None
+        assert await store.get_task(old_failed) is None
+        assert await store.get_task(recent) is not None
+
+    @pytest.mark.asyncio
+    async def test_add_task_caps_the_number_of_finished_tasks(self, mocker):
+        mocker.patch("tgdcfs.tasks.task_store.MAX_FINISHED_TASKS", 3)
+        store = TaskStore()
+        # Oldest first, so the first two are the ones over the cap.
+        ids = [
+            await self._finished(store, f"f{i}.txt", age_hours=5 - i)
+            for i in range(5)
+        ]
+
+        await store.add_task(TaskType.UPLOAD, "/test/new.txt", "new.txt")
+
+        remaining = [await store.get_task(task_id) for task_id in ids]
+        assert [task is not None for task in remaining] == [
+            False,
+            False,
+            True,
+            True,
+            True,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_running_tasks_are_never_pruned(self, mocker):
+        mocker.patch("tgdcfs.tasks.task_store.MAX_FINISHED_TASKS", 0)
+        store = TaskStore()
+        running = await store.add_task(TaskType.UPLOAD, "/test/run.txt", "run.txt")
+        await store.update_task_progress(running, status=TaskStatus.IN_PROGRESS)
+        task = await store.get_task(running)
+        task.updated_at = (utcnow() - datetime.timedelta(hours=48)).isoformat()
+        pending = await store.add_task(TaskType.UPLOAD, "/test/p.txt", "p.txt")
+        done = await self._finished(store, "done.txt")
+
+        await store.add_task(TaskType.UPLOAD, "/test/new.txt", "new.txt")
+
+        assert await store.get_task(running) is not None
+        assert await store.get_task(pending) is not None
+        assert await store.get_task(done) is None
+
+    @pytest.mark.asyncio
+    async def test_many_uploads_stay_bounded(self, mocker):
+        mocker.patch("tgdcfs.tasks.task_store.MAX_FINISHED_TASKS", 10)
+        store = TaskStore()
+        for i in range(100):
+            await self._finished(store, f"f{i}.txt")
+
+        # The cap is applied before each add, so at most one more is left.
+        assert len(await store.get_all_tasks()) <= 11

@@ -6,6 +6,15 @@ from uuid import uuid4
 
 from .models import Task, TaskStatus, TaskType
 
+# Finished tasks are only kept so the manager can show recent transfers.
+# Without a bound every upload and backfilled file would stay in memory
+# until the process restarts, so they are pruned whenever a task is added:
+# by age, and by count so a large backfill cannot pile up within a day.
+FINISHED_TASK_MAX_AGE_HOURS = 24
+MAX_FINISHED_TASKS = 500
+
+_FINISHED = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+
 
 def utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
@@ -24,6 +33,8 @@ class TaskStore:
         size_total: Optional[int] = None,
     ) -> str:
         async with self._lock:
+            self._prune_finished_locked()
+
             task_id = str(uuid4())
             now = utcnow().isoformat()
 
@@ -127,26 +138,55 @@ class TaskStore:
                 return True
             return False
 
-    async def cleanup_completed_tasks(self, max_age_hours: int = 24) -> int:
+    async def cleanup_completed_tasks(
+        self, max_age_hours: int = FINISHED_TASK_MAX_AGE_HOURS
+    ) -> int:
         async with self._lock:
-            cutoff_time = datetime.datetime.now(datetime.UTC).timestamp() - (
-                max_age_hours * 3600
-            )
-            to_remove = []
+            return self._remove_finished_older_than_locked(max_age_hours)
 
-            for task_id, task in self._tasks.items():
-                if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
-                    if task.updated_at:
-                        task_time = datetime.datetime.fromisoformat(
-                            task.updated_at
-                        ).timestamp()
-                        if task_time < cutoff_time:
-                            to_remove.append(task_id)
+    def _remove_finished_older_than_locked(self, max_age_hours: float) -> int:
+        cutoff_time = datetime.datetime.now(datetime.UTC).timestamp() - (
+            max_age_hours * 3600
+        )
+        to_remove = []
 
-            for task_id in to_remove:
+        for task_id, task in self._tasks.items():
+            if task.status in _FINISHED:
+                if task.updated_at:
+                    task_time = datetime.datetime.fromisoformat(
+                        task.updated_at
+                    ).timestamp()
+                    if task_time < cutoff_time:
+                        to_remove.append(task_id)
+
+        for task_id in to_remove:
+            del self._tasks[task_id]
+
+        return len(to_remove)
+
+    def _prune_finished_locked(self) -> int:
+        """Drop finished tasks past their age, then the oldest beyond the cap.
+
+        Tasks that are still pending or running are never touched: a task
+        missing from the store reads as cancelled to its ``TaskTracker``.
+        """
+        removed = self._remove_finished_older_than_locked(FINISHED_TASK_MAX_AGE_HOURS)
+
+        finished = [
+            (task.updated_at or "", task_id)
+            for task_id, task in self._tasks.items()
+            if task.status in _FINISHED
+        ]
+        excess = len(finished) - MAX_FINISHED_TASKS
+        if excess > 0:
+            # ISO timestamps in UTC sort chronologically as strings; a task
+            # without one counts as the oldest.
+            finished.sort()
+            for _, task_id in finished[:excess]:
                 del self._tasks[task_id]
+            removed += excess
 
-            return len(to_remove)
+        return removed
 
 
 # Global task store instance

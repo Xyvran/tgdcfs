@@ -512,3 +512,59 @@ class TestIntegrationScenarios:
             isinstance(remaining_file2_member, MockMember)
             and remaining_file2_member.name == "file2"
         )
+
+
+class TestNoGrowthWithoutSet:
+    """Only ``set`` may add nodes; lookups and resets must not."""
+
+    @staticmethod
+    def _node_count(cache: FSCache) -> int:
+        return sum(
+            1 + TestNoGrowthWithoutSet._node_count(c) for c in cache._cache.values()
+        )
+
+    def test_get_of_unknown_paths_adds_no_nodes(self):
+        cache = FSCache()
+        cache.set("/", MockMember("/", "root"))
+        before = self._node_count(cache)
+
+        for i in range(100):
+            assert cache.get(f"/movies/film{i}/film{i}.nfo") is None
+
+        assert self._node_count(cache) == before
+
+    def test_reset_of_unknown_paths_adds_no_nodes(self):
+        cache = FSCache()
+        cache.set("/", MockMember("/", "root"))
+        before = self._node_count(cache)
+
+        for i in range(100):
+            cache.reset(f"/incoming/new{i}/file.mkv")
+            cache.reset_parent(f"/incoming/new{i}/file.mkv")
+
+        assert self._node_count(cache) == before
+        assert cache.get("/") is not None
+
+    def test_reset_removes_the_subtree(self):
+        cache = FSCache()
+        cache.set("/a", MockMember("/a", "a"))
+        cache.set("/a/b", MockMember("/a/b", "b"))
+        cache.set("/a/b/c", MockMember("/a/b/c", "c"))
+        cache.set("/x", MockMember("/x", "x"))
+
+        cache.reset("/a")
+
+        assert cache.get("/a") is None
+        assert cache.get("/a/b/c") is None
+        assert cache.get("/x") is not None
+        assert "a" not in cache._cache[""]._cache
+
+    def test_reset_parent_of_root_clears_everything(self):
+        cache = FSCache()
+        cache.set("/", MockMember("/", "root"))
+        cache.set("/x", MockMember("/x", "x"))
+
+        cache.reset_parent("/")
+
+        assert cache.get("/") is None
+        assert cache.get("/x") is None
